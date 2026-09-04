@@ -1,0 +1,86 @@
+# gofederation-worker configuration.
+#
+# Anything derivable from Synapse's own config is NOT repeated here: server_name,
+# the federation sender instance list, the signing key, Redis and the retry
+# tuning are all read from homeserver.yaml at every start. That is deliberate --
+# `federation_sender_instances` defines which destinations belong to this worker
+# (the shard is sha256(destination) mod len(instances)), so a stale copy would
+# not fail, it would silently reassign every destination on the server.
+#
+# Unknown keys are a startup error, so a typo is reported rather than ignored.
+
+# Synapse's homeserver.yaml, mounted read-only.
+synapse_config: /etc/synapse/homeserver.yaml
+
+# homeserver.yaml's signing_key_path names a path inside Synapse's container
+# (/data/aguiarvieira.pt.signing.key). This worker mounts the same file
+# elsewhere, so it says where.
+signing_key_path: /data/signing.key
+
+shadow:
+  # true = dry-run. The full pipeline runs -- destinations resolved, shard
+  # applied, transaction assembled and SIGNED -- and is then logged instead of
+  # sent. Nothing is written to any Synapse table and nothing is published to
+  # Redis.
+  #
+  # Setting this to false makes the worker send real federation traffic to real
+  # homeservers. It is the promotion decision, made from the difflog, and it is
+  # the only switch that does that. Defaults to true if omitted.
+  enabled: true
+
+  # The federation sender whose shard we take. Must be one of the names in
+  # homeserver.yaml's federation_sender_instances -- startup fails otherwise,
+  # because a name that is not in the list owns no destinations at all and the
+  # worker would run perfectly while doing nothing.
+  #
+  # While shadowing, this is an EXISTING sender, so our decisions are directly
+  # comparable with that container's logs.
+  instance: av-federation-sender-worker-1
+
+  # The persisted comparison record. These counters survive restarts because
+  # the promotion gate is measured in weeks, not in one afternoon's uptime.
+  difflog_dir: /data/difflog
+
+database:
+  # Synapse's database, read-only. libpq keyword form, not a URI.
+  # host=/var/sockets is the direct unix socket with peer auth as uid 991; the
+  # Go workers deliberately bypass the pgcat pooler that homeserver.yaml uses.
+  dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+  max_conns: 16
+  connect_timeout_seconds: 10
+  # Refuse to start if the role can write to Synapse's tables. Off by default so
+  # a scratch database works for development; turn it ON in production.
+  require_read_only: true
+
+state:
+  # Our own cursors -- the only thing this worker writes anywhere. A separate
+  # role with access to exactly one table. See deploy/readonly-role.sql.
+  dsn: "host=/var/sockets user=gofed_state dbname=synapse-db"
+  table: gofederation.stream_positions
+
+replication:
+  enabled: true
+  # Omit to use homeserver.yaml's redis block, which is the normal case.
+  # address: /var/sockets/keydb
+  # The channel is named after server_name and there is no prefix setting in
+  # Synapse. Only override it against a scratch bus.
+  # channel: aguiarvieira.pt
+
+queue:
+  # One goroutine per destination is the point of this worker; this only stops
+  # unbounded from being a way to fall over.
+  max_concurrent_destinations: 2000
+  # Synapse's own limits. Do not change these while shadowing -- a different
+  # batch size produces different transactions and the comparison stops meaning
+  # anything.
+  max_pdus_per_transaction: 50
+  max_edus_per_transaction: 100
+  event_batch_limit: 100
+
+metrics:
+  # 9099 is Synapse main, 9101 the Python workers, 9200 gopro, 9201 gosync.
+  addr: ":9202"
+
+log:
+  level: info
+  pretty: false
