@@ -110,5 +110,5 @@ func (h *handler) OnRemoteServerUp(server string) {
 		return
 	}
 	h.log.Debug().Str("destination", server).Msg("remote server is up; waking its queue")
-	h.worker.queues.Wake(context.Background(), q)
+	h.worker.queues.Wake(q)
 }

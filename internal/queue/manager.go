@@ -36,6 +36,17 @@ type Manager struct {
 
 	mu    sync.RWMutex
 	dests map[string]*Destination
+
+	// base is the context transmission loops run under.
+	//
+	// It MUST outlive whatever fed the queue. An earlier version passed the
+	// caller's context straight through, and the caller was an errgroup whose
+	// context is cancelled the moment its batch finishes -- so a loop spawned
+	// near the end of a batch raced that cancellation and, when it lost,
+	// returned without sending anything. Nothing logged it, because exiting on
+	// a cancelled context is exactly what the loop is supposed to do. Found by
+	// watching a real message fail to be delivered.
+	base context.Context
 }
 
 // ManagerConfig builds a Manager.
@@ -64,7 +75,21 @@ func NewManager(cfg ManagerConfig) *Manager {
 		sem:       make(chan struct{}, maxConcurrent),
 		onSuccess: cfg.OnSuccess,
 		dests:     map[string]*Destination{},
+		base:      context.Background(),
 	}
+}
+
+// Start binds the manager to the worker's lifetime.
+//
+// Called once, with a context that lives as long as the process. Everything a
+// transmission loop does -- waiting for a concurrency slot, building a
+// transaction, waiting on a remote server to answer -- outlives the batch that
+// queued the work, so the batch's context is the wrong one and its cancellation
+// silently drops the send.
+func (m *Manager) Start(ctx context.Context) {
+	m.mu.Lock()
+	m.base = ctx
+	m.mu.Unlock()
 }
 
 // Get returns a destination's queue, creating it if needed.
@@ -125,13 +150,21 @@ func (m *Manager) Names() []string {
 // Run. Taking the slot before spawning would bound nothing, since Run is where
 // the time goes.
 //
+// It deliberately takes no context. The loop runs under the manager's base
+// context, not the caller's: the caller is a batch, and a batch ends long
+// before the servers it queued work for have answered.
+//
 // A destination that loses TryStart is already sending; that loop will see the
 // newData flag TryStart set and go round again, so nothing is dropped and no
 // goroutine is spawned to wait for it.
-func (m *Manager) Wake(ctx context.Context, d *Destination) {
+func (m *Manager) Wake(d *Destination) {
 	if !d.TryStart() {
 		return
 	}
+	m.mu.RLock()
+	ctx := m.base
+	m.mu.RUnlock()
+
 	go func() {
 		select {
 		case m.sem <- struct{}{}:

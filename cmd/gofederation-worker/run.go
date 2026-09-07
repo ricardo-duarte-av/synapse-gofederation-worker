@@ -63,6 +63,11 @@ func (w *worker) run(ctx context.Context) error {
 				"every other destination is still dry-run")
 	}
 
+	// Bind the queues to the WORKER's lifetime, not to any batch's. A
+	// transmission loop waits on remote servers long after the batch that
+	// queued its work has finished.
+	w.queues.Start(ctx)
+
 	g, gctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {

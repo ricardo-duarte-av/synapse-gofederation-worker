@@ -120,7 +120,7 @@ func (d *Devices) toDeviceFor(ctx context.Context, server string, current int64)
 			Content: json.RawMessage(m.MessagesJSON),
 		})
 	}
-	d.queues.Wake(ctx, q)
+	d.queues.Wake(q)
 
 	// The cursor advances on the READ, not on delivery. That is a real
 	// divergence from Synapse, which deletes the rows only after a successful
@@ -195,7 +195,7 @@ func (d *Devices) deviceListsFor(ctx context.Context, server string, current int
 			highest = p.StreamID
 		}
 	}
-	d.queues.Wake(ctx, q)
+	d.queues.Wake(q)
 
 	return d.cursors.Set(ctx, name, highest)
 }

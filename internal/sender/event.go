@@ -116,7 +116,7 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 	for _, d := range due {
 		q := s.cfg.Queues.Get(d)
 		q.EnqueuePDU(p)
-		s.cfg.Queues.Wake(ctx, q)
+		s.cfg.Queues.Wake(q)
 	}
 	return len(due) > 0, nil
 }

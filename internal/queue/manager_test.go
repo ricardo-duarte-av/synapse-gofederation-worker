@@ -52,13 +52,12 @@ func TestGetIsIdempotentUnderConcurrency(t *testing.T) {
 func TestManagerFansOutToManyDestinations(t *testing.T) {
 	s := &recordingSink{}
 	m := testManager(t, s, 100)
-	ctx := context.Background()
 
 	const n = 200
 	for i := 0; i < n; i++ {
 		d := m.Get(destName(i))
 		d.EnqueuePDU(pdu("$e", 1))
-		m.Wake(ctx, d)
+		m.Wake(d)
 	}
 
 	waitFor(t, "every destination to drain", func() bool {
@@ -79,12 +78,11 @@ func TestManagerFansOutToManyDestinations(t *testing.T) {
 func TestWakeRespectsTheConcurrencyBound(t *testing.T) {
 	s := &recordingSink{block: make(chan struct{})}
 	m := testManager(t, s, 3)
-	ctx := context.Background()
 
 	for i := 0; i < 50; i++ {
 		d := m.Get(destName(i))
 		d.EnqueuePDU(pdu("$e", 1))
-		m.Wake(ctx, d)
+		m.Wake(d)
 	}
 
 	// Let the permitted ones pile up against the block, then check nobody
@@ -110,7 +108,6 @@ func TestWakeDoesNotBlockTheCaller(t *testing.T) {
 	s := &recordingSink{block: make(chan struct{})}
 	defer close(s.block)
 	m := testManager(t, s, 1)
-	ctx := context.Background()
 
 	done := make(chan struct{})
 	go func() {
@@ -118,7 +115,7 @@ func TestWakeDoesNotBlockTheCaller(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			d := m.Get(destName(i))
 			d.EnqueuePDU(pdu("$e", 1))
-			m.Wake(ctx, d)
+			m.Wake(d)
 		}
 	}()
 
@@ -129,8 +126,8 @@ func TestWakeDoesNotBlockTheCaller(t *testing.T) {
 	}
 }
 
-// A cancelled context must not leave a destination marked as sending, or it
-// would never send again -- a deadlock of one server, which on a homeserver
+// A cancelled base context must not leave a destination marked as sending, or
+// it would never send again -- a deadlock of one server, which on a homeserver
 // talking to thousands would go unnoticed.
 func TestCancelledWakeReleasesTheClaim(t *testing.T) {
 	s := &recordingSink{block: make(chan struct{})}
@@ -140,13 +137,14 @@ func TestCancelledWakeReleasesTheClaim(t *testing.T) {
 	// Fill the single slot with a send that will not finish.
 	blocker := m.Get("blocker.example")
 	blocker.EnqueuePDU(pdu("$e", 1))
-	m.Wake(context.Background(), blocker)
+	m.Wake(blocker)
 	waitFor(t, "the slot to be taken", func() bool { return s.inFlight.Load() == 1 })
 
 	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
 	d := m.Get("b.example")
 	d.EnqueuePDU(pdu("$e", 1))
-	m.Wake(ctx, d)
+	m.Wake(d)
 	cancel()
 
 	waitFor(t, "the claim to be released", func() bool { return !d.isRunning() })
@@ -171,4 +169,63 @@ func TestPendingTotals(t *testing.T) {
 
 func destName(i int) string {
 	return string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + ".example"
+}
+
+// The regression test for the bug that a live send found.
+//
+// Wake used to take the caller's context and run the transmission loop under
+// it. The caller is a batch -- an errgroup whose context is cancelled the
+// moment the batch finishes -- so a loop spawned near the end of one raced that
+// cancellation and, when it lost, returned without sending. Nothing logged it,
+// because returning on a cancelled context is exactly what the loop is meant to
+// do; the only symptom was a message that never arrived.
+//
+// Here the caller's context is cancelled IMMEDIATELY after Wake, as a finished
+// batch's would be. The transaction must still be sent.
+func TestSendSurvivesTheCallersContextEnding(t *testing.T) {
+	s := &recordingSink{}
+	m := testManager(t, s, 8)
+	m.Start(context.Background())
+
+	// Exactly the shape of processBatch: an errgroup whose context dies with
+	// the batch.
+	batchCtx, cancelBatch := context.WithCancel(context.Background())
+	d := m.Get("b.example")
+	d.EnqueuePDU(pdu("$a", 1))
+	m.Wake(d)
+	// The batch is over.
+	cancelBatch()
+	_ = batchCtx
+
+	waitFor(t, "the transaction to be sent anyway", func() bool { return len(s.sent()) == 1 })
+	if p, _ := d.Pending(); p != 0 {
+		t.Errorf("%d pdus left queued after the batch ended", p)
+	}
+}
+
+// And the same under repetition, since the original failure was a race that
+// sometimes went the right way.
+func TestSendSurvivesTheCallersContextEndingRepeatedly(t *testing.T) {
+	s := &recordingSink{}
+	m := testManager(t, s, 16)
+	m.Start(context.Background())
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := m.Get(destName(i))
+		d.EnqueuePDU(pdu("$e", int64(i+1)))
+		m.Wake(d)
+		cancel()
+		_ = ctx
+	}
+
+	waitFor(t, "every destination to drain", func() bool {
+		_, pdus, _ := m.PendingTotals()
+		return pdus == 0
+	})
+	if got := len(s.sent()); got != n {
+		t.Errorf("%d transactions sent, want %d; the caller's context is still "+
+			"reaching the transmission loop", got, n)
+	}
 }
