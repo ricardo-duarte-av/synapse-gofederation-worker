@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
 )
 
 // Config is the whole file.
@@ -167,6 +169,19 @@ type QueueConfig struct {
 
 	// EventBatchLimit is the `limit` of the event pickup query, Synapse's 100.
 	EventBatchLimit int `yaml:"event_batch_limit"`
+
+	// TransactionIDPrefix namespaces our transaction ids away from Synapse's.
+	//
+	// A receiving Synapse deduplicates on (origin, transaction_id) and returns
+	// the cached response for a repeat, so if this worker and one of Synapse's
+	// own senders ever pick the same id for the same destination, the second
+	// transaction's events are silently discarded. Both seed from
+	// milliseconds-since-epoch and increment, so their ranges drift into each
+	// other. The prefix removes the possibility.
+	//
+	// Only safe to set empty once no other sender delivers to any destination
+	// this worker handles.
+	TransactionIDPrefix *string `yaml:"transaction_id_prefix"`
 }
 
 // MetricsConfig is the Prometheus listener.
@@ -246,6 +261,18 @@ func (c *Config) ShadowEnabled() bool {
 // sender.
 func (c *Config) ReplicationEnabled() bool {
 	return c.Replication.Enabled == nil || *c.Replication.Enabled
+}
+
+// TransactionIDPrefix is the prefix for our transaction ids.
+//
+// A pointer with a nil default, so "the key was absent" and "the key was set to
+// empty" are distinguishable: absent takes the safe default, and only an
+// explicit empty string turns the namespacing off.
+func (c *Config) TransactionIDPrefix() string {
+	if c.Queue.TransactionIDPrefix == nil {
+		return txn.DefaultIDPrefix
+	}
+	return *c.Queue.TransactionIDPrefix
 }
 
 // ConnectTimeout is the database connect timeout.

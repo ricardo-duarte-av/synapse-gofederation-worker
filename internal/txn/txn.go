@@ -68,20 +68,43 @@ const (
 // (transaction_manager.py:75). We match that: the id is not per-destination
 // state, so two destinations in the same batch get different ids, and a restart
 // cannot reuse an id it used before.
+//
+// The prefix is not decoration, and leaving it empty while another sender is
+// also delivering to the same destination is dangerous. A receiving Synapse
+// deduplicates inbound transactions on (origin, transaction_id) and returns the
+// CACHED RESPONSE for a repeat (federation_server.py:400) -- so if two senders
+// from the same origin ever pick the same id, the second transaction's events
+// are silently discarded. Both senders seed from milliseconds-since-epoch and
+// increment by one, so their id ranges are two intervals that drift into each
+// other; over a busy hour a collision is not exotic.
+//
+// A prefix removes the possibility rather than reducing it. transaction_id is
+// an opaque string in the spec and Synapse's route accepts anything without a
+// slash (transport/server/federation.py:80), and it has the useful side effect
+// of making the receiving server's logs say which sender produced a
+// transaction.
 type IDGenerator struct {
-	next atomic.Int64
+	prefix string
+	next   atomic.Int64
 }
 
-// NewIDGenerator seeds the counter from the clock, as Synapse does.
-func NewIDGenerator() *IDGenerator {
-	g := &IDGenerator{}
+// DefaultIDPrefix keeps our transaction ids out of Synapse's id space.
+//
+// Defaulted rather than opt-in because the dangerous configuration -- running
+// alongside Synapse's own senders -- is the one this worker starts life in.
+const DefaultIDPrefix = "gofed-"
+
+// NewIDGenerator seeds the counter from the clock, as Synapse does, and
+// namespaces it with prefix.
+func NewIDGenerator(prefix string) *IDGenerator {
+	g := &IDGenerator{prefix: prefix}
 	g.next.Store(time.Now().UnixMilli())
 	return g
 }
 
 // Next returns the next transaction id.
 func (g *IDGenerator) Next() string {
-	return strconv.FormatInt(g.next.Add(1)-1, 10)
+	return g.prefix + strconv.FormatInt(g.next.Add(1)-1, 10)
 }
 
 // Signer builds signed requests for one homeserver.

@@ -119,6 +119,19 @@ queue:
   max_edus_per_transaction: 100
   event_batch_limit: 100
 
+  # Namespaces our transaction ids away from Synapse's own senders'.
+  #
+  # A receiving Synapse deduplicates on (origin, transaction_id) and returns
+  # the cached response for a repeat, so if this worker and one of Synapse's
+  # senders ever pick the same id for the same destination, the second
+  # transaction's events are silently discarded. Both seed from
+  # milliseconds-since-epoch and increment, so their ranges drift into each
+  # other.
+  #
+  # Defaults to "gofed-". Only set it empty once no other sender delivers to
+  # any destination this worker handles.
+  # transaction_id_prefix: "gofed-"
+
 metrics:
   # 9099 is Synapse main, 9101 the Python workers, 9200 gopro, 9201 gosync.
   addr: ":9202"

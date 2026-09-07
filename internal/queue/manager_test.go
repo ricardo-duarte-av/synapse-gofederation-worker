@@ -18,7 +18,7 @@ func testManager(t *testing.T, s *recordingSink, maxConcurrent int) *Manager {
 		t.Fatal(err)
 	}
 	return NewManager(ManagerConfig{
-		Signer: signer, IDs: txn.NewIDGenerator(), Sink: s,
+		Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix), Sink: s,
 		Log: zerolog.New(io.Discard), MaxConcurrent: maxConcurrent,
 	})
 }

@@ -271,7 +271,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			MaxEDUs: cfg.Queue.MaxEDUsPerTransaction,
 		},
 		Signer:        signer,
-		IDs:           txn.NewIDGenerator(),
+		IDs:           txn.NewIDGenerator(cfg.TransactionIDPrefix()),
 		Sink:          out,
 		Log:           log,
 		MaxConcurrent: cfg.Queue.MaxConcurrentDestinations,

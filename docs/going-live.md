@@ -4,6 +4,57 @@
 federation traffic on the internet. This is how it is arranged so that flipping
 it is a small, reversible step rather than a leap.
 
+## What sending alongside Synapse actually means
+
+The allowlist does **not** stop Synapse sending. Destinations are divided
+between the senders in `federation_sender_instances` by
+`sha256(destination) mod len(instances)`, and nothing this worker does changes
+that: `testing.aguiarvieira.pt` hashes to `av-federation-sender-worker-1`, so
+worker-1 keeps delivering to it whatever we do. Turning on our own sending to
+that destination means it is served by **two** senders at once.
+
+Most of that duplication is harmless, and it is worth knowing exactly which
+parts, because one of them is not.
+
+| | Deduplicated by | Effect of a duplicate |
+|---|---|---|
+| PDUs | `event_id`, on the receiving server | wasted work, nothing else |
+| `m.direct_to_device` | `(origin, message_id)` — `deviceinbox.py:883` | none; the second insert returns early |
+| `m.device_list_update` | stream ids in the body | at worst a redundant device resync |
+| **the transaction itself** | **`(origin, transaction_id)`** | **the second transaction is DISCARDED** |
+
+That last row is the hazard. `federation_server.py:400` looks up
+`(origin, transaction_id)` and, on a repeat, returns the **cached response**
+without reading the body. Both senders share an origin, both seed their counter
+from milliseconds-since-epoch and increment by one, so their id ranges are two
+intervals that drift into each other. A collision does not produce an error --
+it silently drops every event in the losing transaction.
+
+So this worker namespaces its transaction ids: `gofed-1788792203712` rather
+than `1788792203712`. `transaction_id` is an opaque string in the spec and
+Synapse's route accepts anything without a slash
+(`transport/server/federation.py:80`), so the prefix removes the possibility
+rather than reducing it -- and it makes the receiving server's logs say which
+sender produced a transaction.
+
+It is on by default, because the dangerous configuration is the one this worker
+starts life in. `queue.transaction_id_prefix: ""` turns it off, and is only
+safe once no other sender delivers to any destination this worker handles.
+
+### Why duplicate delivery is worth accepting for the test destination
+
+Device EDU **content** cannot be verified while shadowing at all: a real sender
+DELETES the `device_federation_outbox` row once its transaction succeeds, so
+the evidence is destroyed by the act being shadowed
+(see [verification.md](verification.md)). Sending for real to one destination we
+control is the only way to exercise that path -- we read the row ourselves, and
+the receiving server tells us whether the key share was right by decrypting or
+failing to.
+
+The cost is a test homeserver receiving some events twice, deduplicated on
+arrival. That is a reasonable trade for a server whose purpose is to be
+experimented on. It would not be reasonable for a stranger's.
+
 ## One destination at a time
 
 The allowlist is the mechanism:

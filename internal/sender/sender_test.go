@@ -207,7 +207,7 @@ func newHarness(t *testing.T, shouldHandle func(string) bool) *harness {
 	obs := newObserver()
 	dry := sink.NewDryRun(zerolog.New(io.Discard))
 	queues := queue.NewManager(queue.ManagerConfig{
-		Signer: signer, IDs: txn.NewIDGenerator(), Sink: dry,
+		Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix), Sink: dry,
 		Log: zerolog.New(io.Discard), MaxConcurrent: 16,
 	})
 	if shouldHandle == nil {

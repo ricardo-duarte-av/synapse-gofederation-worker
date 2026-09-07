@@ -120,7 +120,7 @@ func newDevices(t *testing.T, st *fakeDeviceStore, shouldHandle func(string) boo
 	// draining before the assertions run.
 	blocked := &blockingSink{}
 	m := queue.NewManager(queue.ManagerConfig{
-		Signer: signer, IDs: txn.NewIDGenerator(), Sink: blocked,
+		Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix), Sink: blocked,
 		Log: zerolog.New(io.Discard), MaxConcurrent: 8,
 	})
 	cur := newCursors()

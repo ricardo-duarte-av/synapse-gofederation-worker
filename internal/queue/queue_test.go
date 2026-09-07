@@ -77,7 +77,7 @@ func testDestination(t *testing.T, s sink.Sink, limits Limits) *Destination {
 	}
 	return NewDestination(Config{
 		Name: "b.example", Limits: limits, Signer: signer,
-		IDs: txn.NewIDGenerator(), Sink: s, Log: zerolog.New(io.Discard),
+		IDs: txn.NewIDGenerator(txn.DefaultIDPrefix), Sink: s, Log: zerolog.New(io.Discard),
 	})
 }
 
@@ -245,7 +245,7 @@ func TestOnSuccessReportsTheHighestStreamOrdering(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := NewDestination(Config{
-		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(),
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
 		Sink: &recordingSink{}, Log: zerolog.New(io.Discard),
 		OnSuccess: func(dest string, order int64) {
 			got.Lock()

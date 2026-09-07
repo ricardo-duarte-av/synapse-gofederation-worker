@@ -156,7 +156,9 @@ func TestTransactionIDIsPathEscaped(t *testing.T) {
 // so two destinations in the same batch get different ids and a restart cannot
 // reuse one (transaction_manager.py:75).
 func TestIDGenerator(t *testing.T) {
-	g := NewIDGenerator()
+	// No prefix here: this is about the counter -- uniqueness, monotonicity and
+	// the clock seed. The prefix has tests of its own.
+	g := NewIDGenerator("")
 	seen := map[string]bool{}
 	var prev int64 = -1
 	for i := 0; i < 1000; i++ {
@@ -195,5 +197,63 @@ func TestNewSignerRejectsBadKeys(t *testing.T) {
 func TestKeyID(t *testing.T) {
 	if got := testSigner(t).KeyID(); got != "ed25519:testkey" {
 		t.Errorf("KeyID = %q", got)
+	}
+}
+
+// The hazard this prefix exists for.
+//
+// A receiving Synapse deduplicates inbound transactions on
+// (origin, transaction_id) and returns the CACHED RESPONSE for a repeat
+// (federation_server.py:400). Two senders from the same origin both seed their
+// counter from milliseconds-since-epoch and increment by one, so their id
+// ranges are intervals that drift into each other -- and a collision means the
+// second transaction's events are silently discarded.
+func TestPrefixKeepsUsOutOfSynapsesIDSpace(t *testing.T) {
+	ours := NewIDGenerator(DefaultIDPrefix)
+	// What Synapse produces: a bare decimal, seeded from the clock.
+	synapse := NewIDGenerator("")
+
+	seen := map[string]bool{}
+	for i := 0; i < 5000; i++ {
+		seen[synapse.Next()] = true
+	}
+	for i := 0; i < 5000; i++ {
+		id := ours.Next()
+		if seen[id] {
+			t.Fatalf("our id %q collides with Synapse's id space", id)
+		}
+		if !strings.HasPrefix(id, DefaultIDPrefix) {
+			t.Fatalf("id %q is not namespaced", id)
+		}
+	}
+}
+
+// The prefix must survive into the URL and therefore into the signature, since
+// the signature covers the path.
+func TestPrefixedIDReachesThePathAndTheSignature(t *testing.T) {
+	s := testSigner(t)
+	req, err := s.Build(DefaultIDPrefix+"12345", "b.example", Transaction{OriginServerTS: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Path != "/_matrix/federation/v1/send/gofed-12345" {
+		t.Errorf("Path = %q", req.Path)
+	}
+	// The path is what was signed, so a differently-prefixed id must produce a
+	// different signature.
+	other, err := s.Build("12345", "b.example", Transaction{OriginServerTS: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.AuthHeader == other.AuthHeader {
+		t.Error("the transaction id does not affect the signature; the path is not covered")
+	}
+}
+
+// Namespacing can be turned off, but only by asking for it explicitly.
+func TestEmptyPrefixProducesSynapseStyleIDs(t *testing.T) {
+	id := NewIDGenerator("").Next()
+	if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+		t.Errorf("id %q is not a bare decimal", id)
 	}
 }

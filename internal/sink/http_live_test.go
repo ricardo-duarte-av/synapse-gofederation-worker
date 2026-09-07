@@ -58,7 +58,7 @@ func TestLiveSendEmptyTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ids := txn.NewIDGenerator()
+	ids := txn.NewIDGenerator(txn.DefaultIDPrefix)
 	req, err := signer.Build(ids.Next(), destination, txn.Transaction{
 		OriginServerTS: time.Now().UnixMilli(),
 	})
