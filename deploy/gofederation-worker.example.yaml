@@ -1,11 +1,15 @@
 # gofederation-worker configuration.
 #
-# Anything derivable from Synapse's own config is NOT repeated here: server_name,
-# the federation sender instance list, the signing key, Redis and the retry
-# tuning are all read from homeserver.yaml at every start. That is deliberate --
-# `federation_sender_instances` defines which destinations belong to this worker
-# (the shard is sha256(destination) mod len(instances)), so a stale copy would
-# not fail, it would silently reassign every destination on the server.
+# Copy to gofederation-worker.yaml next to docker-compose.yaml. The paths below
+# are the ones INSIDE the container, as mounted by that compose file.
+#
+# Anything derivable from Synapse's own config is not repeated here:
+# server_name, the federation sender list, the signing key path, Redis and the
+# retry tuning are read from homeserver.yaml at every start. That is deliberate
+# -- federation_sender_instances is not a value we consume but the value that
+# DEFINES which destinations are ours, since the shard is
+# sha256(destination) mod len(instances). A stale copy would not fail; it would
+# silently reassign every destination on the server.
 #
 # Unknown keys are a startup error, so a typo is reported rather than ignored.
 
@@ -13,16 +17,16 @@
 # are stored under. It must NOT be one of homeserver.yaml's
 # federation_sender_instances -- startup refuses that.
 #
-# This is not the same as shadow.instance below, and the difference is not
-# cosmetic: the bus suppresses a worker's own echo by instance name, so a shadow
-# calling itself by the name of the sender it shadows would discard that
-# sender's rows and process nothing at all, while looking perfectly healthy.
+# Not the same as shadow.instance below, and the difference is not cosmetic:
+# the bus suppresses a worker's own echo by instance name, so a shadow calling
+# itself by the name of the sender it shadows would discard that sender's rows
+# and process nothing at all, while looking perfectly healthy.
 worker_name: av-gofederation-worker-1
 
 # Synapse's homeserver.yaml, mounted read-only.
 synapse_config: /etc/synapse/homeserver.yaml
 
-# homeserver.yaml's signing_key_path names a path inside Synapse's container
+# homeserver.yaml's signing_key_path names a path inside SYNAPSE's container
 # (/data/aguiarvieira.pt.signing.key). This worker mounts the same file
 # elsewhere, so it says where.
 signing_key_path: /data/signing.key
@@ -30,17 +34,37 @@ signing_key_path: /data/signing.key
 shadow:
   # true = dry-run. The full pipeline runs -- destinations resolved, shard
   # applied, transaction assembled and SIGNED -- and is then logged instead of
-  # sent. Nothing is written to any Synapse table and nothing is published to
-  # Redis.
-  #
-  # Setting this to false makes the worker send real federation traffic. It is
-  # the promotion decision, made from the difflog, and it is the only switch
-  # that does that. Defaults to true if omitted.
+  # sent. Nothing is written to any Synapse table, nothing is published to
+  # Redis. Defaults to true if omitted.
   #
   # With enabled: false you MUST also set exactly one of send_only_to or
-  # send_to_all below -- startup is refused otherwise, because it must never be
+  # send_to_all below; startup is refused otherwise, because it must never be
   # unclear whether this process is putting traffic on the internet.
+  # See docs/going-live.md.
   enabled: true
+
+  # The federation sender whose SHARD we take -- which destinations are ours.
+  # Must be one of homeserver.yaml's federation_sender_instances. While
+  # shadowing this is an EXISTING sender, so our decisions are directly
+  # comparable with that container's.
+  instance: av-federation-sender-worker-1
+
+  # The persisted comparison record. These counters survive restarts because
+  # the promotion gate is measured in weeks, not in one afternoon's uptime.
+  difflog_dir: /data/difflog
+
+  # Record complete transactions for these destinations, so they can be
+  # compared byte for byte against what Synapse actually sent to the same
+  # server. The other half is written by fedrecorder; cmd/fedcompare diffs them.
+  #
+  # Meant for ONE low-volume test destination we control. Pointing this at a
+  # real busy server writes every transaction to it to disk -- a lot of disk,
+  # and a lot of other people's message content.
+  #
+  # The name matters: it must hash into the shard named by shadow.instance
+  # above, or the worker produces nothing for it and the capture stays empty.
+  capture_destinations: [testing.aguiarvieira.pt]
+  capture_file: /data/captures/worker.jsonl
 
   # The send allowlist: destinations this worker REALLY sends to. Everything
   # else stays dry-run even when enabled is false, which is how going live
@@ -54,51 +78,27 @@ shadow:
   # traffic by deleting a line. Cannot be combined with send_only_to.
   # send_to_all: false
 
-  # The federation sender whose SHARD we take -- which destinations are ours.
-  # Not our identity; see worker_name above.
-  #
-  # Must be one of the names in
-  # homeserver.yaml's federation_sender_instances -- startup fails otherwise,
-  # because a name that is not in the list owns no destinations at all and the
-  # worker would run perfectly while doing nothing.
-  #
-  # While shadowing, this is an EXISTING sender, so our decisions are directly
-  # comparable with that container's logs.
-  instance: av-federation-sender-worker-1
-
-  # The persisted comparison record. These counters survive restarts because
-  # the promotion gate is measured in weeks, not in one afternoon's uptime.
-  difflog_dir: /data/difflog
-
-  # Record complete transactions for these destinations, so they can be
-  # compared byte for byte against what Synapse actually sent to the same
-  # server (see docs/test-destination.md and cmd/fedrecorder).
-  #
-  # Meant for ONE low-volume test destination we control. Pointing this at a
-  # real busy server writes every transaction to it to disk -- a lot of disk,
-  # and a lot of other people's message content. Leave it empty otherwise.
-  #
-  # The name matters: it must hash into the shard named by shadow.instance
-  # above, or the worker produces nothing for it and the capture stays empty.
-  # capture_destinations: [testing.aguiarvieira.pt]
-  # capture_file: /data/captures/worker.jsonl
-
 database:
   # Synapse's database, read-only. libpq keyword form, not a URI.
   # host=/var/sockets is the direct unix socket with peer auth as uid 991; the
-  # Go workers deliberately bypass the pgcat pooler that homeserver.yaml uses.
+  # Go workers deliberately bypass the pgcat pooler homeserver.yaml uses.
   dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
   max_conns: 16
   connect_timeout_seconds: 10
-  # Refuse to start if the role can write to Synapse's tables. Off by default so
-  # a scratch database works for development; turn it ON in production.
+  # Refuse to start if the role can write to Synapse's tables. Off by default
+  # so a scratch database works for development; ON in production, because
+  # three of the tables this reads are consumed by the real senders.
   require_read_only: true
 
 state:
-  # Our own cursors -- the only thing this worker writes anywhere. A separate
-  # role with access to exactly one table. See deploy/readonly-role.sql.
+  # Our own cursors and routing record -- the only things this worker writes
+  # anywhere. A separate role with access to one schema. See
+  # deploy/state-role.sql.
   dsn: "host=/var/sockets user=gofed_state dbname=synapse-db"
   table: gofederation.stream_positions
+  # Our copy of Synapse's destination_rooms, which the routing comparison
+  # joins against. See docs/verification.md.
+  routes_table: gofederation.destination_rooms
 
 replication:
   enabled: true
@@ -113,8 +113,8 @@ queue:
   # unbounded from being a way to fall over.
   max_concurrent_destinations: 2000
   # Synapse's own limits. Do not change these while shadowing -- a different
-  # batch size produces different transactions and the comparison stops meaning
-  # anything.
+  # batch size produces different transactions and the comparison stops
+  # meaning anything.
   max_pdus_per_transaction: 50
   max_edus_per_transaction: 100
   event_batch_limit: 100

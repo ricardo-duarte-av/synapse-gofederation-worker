@@ -101,28 +101,132 @@ SHARD_PARITY_FILE=py-shards.tsv SHARD_INSTANCES=w1,w2 go test ./internal/shardin
 `internal/sharding/live_test.go` documents how to generate the parity fixture
 from Synapse itself.
 
-## Running it
+## Deploying with Docker Compose
+
+Two images are published from this repository:
+
+| Image | Runs where | Does what |
+|---|---|---|
+| `ghcr.io/ricardo-duarte-av/synapse-gofederation-worker` | beside the **main** Synapse | the sender itself |
+| `ghcr.io/ricardo-duarte-av/synapse-gofederation-worker/fedrecorder` | in front of the **test** homeserver | records what Synapse actually sent |
+
+`docker-compose.yaml` in this repository defines both. They share a host but
+belong to two different places, and the file says which is which; split them
+into separate projects if they ever move apart.
+
+### 1. Database roles
+
+The worker reads Synapse's database through a role that cannot write, and keeps
+its own bookkeeping under a second role that can reach nothing else:
+
+```sh
+psql -h /var/sockets -U synapse -d synapse-db -f deploy/readonly-role.sql
+psql -h /var/sockets -U synapse -d synapse-db -f deploy/state-role.sql
+```
+
+`require_read_only: true` then makes a role with write access to Synapse's
+tables a startup failure rather than a warning. Three of the tables this reads
+are consumed by the real senders — see [docs/shadow-safety.md](docs/shadow-safety.md).
+
+### 2. Configuration
 
 ```sh
 cp deploy/gofederation-worker.example.yaml gofederation-worker.yaml
-psql -h /var/sockets -U synapse -d synapse-db -f deploy/readonly-role.sql
-psql -h /var/sockets -U synapse -d synapse-db -f deploy/state-role.sql
-
-./gofederation-worker -config gofederation-worker.yaml -check   # validate and exit
-./gofederation-worker -config gofederation-worker.yaml
 ```
 
-`worker_name` is this process's own identity and must not be one of Synapse's
-`federation_sender_instances`; `shadow.instance` is the sender whose shard it
-takes. Conflating them makes the bus suppress the shadowed sender's rows as our
-own echo, and the worker processes nothing while looking perfectly healthy —
-which is how that bug was found.
+The paths in it are the ones inside the container, as mounted by the compose
+file. Two fields decide whether it works at all:
 
-Everything derivable from Synapse's config is read from `homeserver.yaml` at
-every start rather than copied. `federation_sender_instances` is not a value we
-consume but the value that *defines* which destinations are ours, since the
-shard is `sha256(destination) mod len(instances)`; a stale copy would silently
-reassign every destination on the server.
+- **`worker_name`** is this process's own identity and must **not** appear in
+  `federation_sender_instances`. Startup refuses that, because the replication
+  bus suppresses a worker's own echo by instance name — a shadow named after the
+  sender it shadows discards that sender's rows and processes nothing while
+  looking perfectly healthy.
+- **`shadow.instance`** is the sender whose *shard* it takes. Different thing.
+
+### 3. Bring it up
+
+```sh
+docker compose up -d gofederation-worker
+docker compose logs -f gofederation-worker
+```
+
+The startup line answers the only question that matters:
+
+```
+INF starting ... shadow=true sink="dry-run (shadow; nothing is sent)"
+INF SHADOW MODE: transactions will be built and signed but never sent, and no Synapse table will be written
+```
+
+`-check` validates the config and every connection without starting the worker,
+which is the right thing to run after an edit:
+
+```sh
+docker compose run --rm gofederation-worker -check
+```
+
+### 4. The recording proxy
+
+`fedrecorder` goes in front of the test homeserver. **Route only the send
+endpoint to it:**
+
+```
+/_matrix/federation/v1/send/   ->  fedrecorder:8449
+everything else                ->  testing-synapse:8008
+```
+
+It is then in the path only for what it records — client traffic, long-polling
+`/sync` and media never touch it, so its uptime and timeouts are irrelevant to
+everything but the comparison. Routing everything through it also works; it
+forwards untouched and records nothing else.
+
+**The proxy must not rewrite the path.** The `X-Matrix` signature covers the
+request URI, so a stripped or rewritten prefix turns every transaction into a
+401 that looks exactly like a signing bug and is not.
+
+```sh
+docker compose up -d fedrecorder
+```
+
+### 5. Compare
+
+Both halves land in `./captures`, side by side. `fedcompare` is a local CLI
+rather than an image — it reads two files and prints a report, so there is
+nothing for a container to add:
+
+```sh
+go build ./cmd/fedcompare
+./fedcompare \
+  -synapse captures/synapse.jsonl \
+  -worker  captures/worker.jsonl \
+  -destination testing.aguiarvieira.pt
+```
+
+Exit status is 0 when the PDUs agree and 1 when they do not, so it drops
+straight into a cron job or a CI step.
+
+See [docs/test-destination.md](docs/test-destination.md) for what the report
+will say that is *not* a fault: transaction counts differ because framing is
+not comparable between two senders, and PDUs are matched on a content hash
+because room version 12 carries no `event_id`.
+
+### Volumes that must persist
+
+`./difflog` and `./captures` are bind mounts on purpose. The difflog is the
+promotion record and is measured in weeks; the captures are half of the
+byte-level comparison and are read long after they are written. A volume that
+reset on redeploy would make the promotion question unanswerable.
+
+### Building the images yourself
+
+```sh
+docker build -t gofederation-worker .
+docker build -f Dockerfile.fedrecorder -t fedrecorder .
+```
+
+CI builds both on every push (`.github/workflows/docker.yml`), gated on
+`go vet`, `go test -race` and `gofmt`, and smoke-tests each image by running
+`-version` and asserting that an unusable configuration exits non-zero.
 
 ## Promotion
 

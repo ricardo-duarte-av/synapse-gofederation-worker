@@ -1,12 +1,21 @@
-# Deployed as its own compose project alongside Synapse's, the way the other Go
-# workers are: /opt/matrix/synapse-gofederation-worker/docker-compose.yaml.
+# Both halves of the shadow rig.
 #
-# Note what is absent. A federation sender has no listeners -- it is driven
-# entirely by Redis and the database -- so there is no socket in
-# /var/sockets/nginx/ and nothing routes to it. The metrics port is scraped by
-# container name.
+# They are in one file because they run on one host, but they belong to two
+# different places and it is worth knowing which is which:
+#
+#   gofederation-worker  reads the MAIN Synapse's database, KeyDB and config.
+#                        It is logically part of that deployment.
+#   fedrecorder          sits in front of the TEST homeserver and records what
+#                        the main Synapse actually sends to it.
+#
+# Split them into separate compose projects if they ever move apart. Nothing
+# here depends on them sharing a file.
+#
+# See docs/test-destination.md for the NPM routing, and docs/going-live.md
+# before changing shadow.enabled.
 
 services:
+  # ---------------------------------------------------------------- worker --
   gofederation-worker:
     image: ghcr.io/ricardo-duarte-av/synapse-gofederation-worker:latest
     container_name: av-gofederation-worker-1
@@ -18,24 +27,25 @@ services:
 
     volumes:
       - ./gofederation-worker.yaml:/data/gofederation-worker.yaml:ro
-      # Synapse's own config is the source of truth for server_name, the sender
-      # instance list, Redis and the retry tuning. Read-only: we never write it.
+      # Synapse's own config is the source of truth for server_name, the
+      # federation sender list, Redis and the retry tuning. Read-only: we never
+      # write it, and federation_sender_instances in particular DEFINES which
+      # destinations are ours, so a stale copy would silently reshard us.
       - /opt/matrix/synapse/synapse/homeserver.yaml:/etc/synapse/homeserver.yaml:ro
       # Unlike the read-only workers, a federation SENDER needs the private
       # signing key: transactions are signed even in shadow mode, so that a
-      # signature computed over the wrong bytes is caught now rather than on the
-      # day this goes live.
+      # signature over the wrong bytes is caught now rather than on the day
+      # this goes live.
       - /opt/matrix/synapse/synapse/aguiarvieira.pt.signing.key:/data/signing.key:ro
-      # The PostgreSQL socket and the rest of the shared socket directory.
+      # PostgreSQL and KeyDB sockets.
       - /var/sockets:/var/sockets
-      # The persisted shadow record. This MUST outlive the container: the
-      # promotion decision is read from counters measured in weeks, and a
-      # volume that resets on redeploy would make that unanswerable.
+      # These MUST outlive the container. The difflog is the promotion record,
+      # measured in weeks; the captures are half of the byte-level comparison
+      # and are read long after they are written.
       - ./difflog:/data/difflog
+      - ./captures:/data/captures
 
-    networks:
-      - npm-nw
-      - npm-nw6
+    networks: [npm-nw, npm-nw6]
 
     # Distroless, so there is no curl; the binary probes itself.
     healthcheck:
@@ -47,9 +57,34 @@ services:
 
     logging:
       driver: json-file
-      options:
-        max-size: 20m
-        max-file: "5"
+      options: {max-size: 20m, max-file: "5"}
+
+  # -------------------------------------------------------------- recorder --
+  fedrecorder:
+    image: ghcr.io/ricardo-duarte-av/synapse-gofederation-worker/fedrecorder:latest
+    container_name: av-fedrecorder
+    restart: unless-stopped
+
+    command:
+      - -listen=:8449
+      # The TEST homeserver, by container name on the shared network.
+      - -upstream=http://testing-synapse:8008
+      - -out=/data/captures/synapse.jsonl
+      # Record only traffic from the server being compared against. The origin
+      # is read from the transaction BODY, which is what was signed, not from
+      # the Authorization header, which is not.
+      - -origin=aguiarvieira.pt
+
+    volumes:
+      # Written by the recorder, read by fedcompare. Same directory the worker
+      # writes its own half into, so the two files sit side by side.
+      - ./captures:/data/captures
+
+    networks: [npm-nw, npm-nw6]
+
+    logging:
+      driver: json-file
+      options: {max-size: 20m, max-file: "5"}
 
 networks:
   npm-nw:

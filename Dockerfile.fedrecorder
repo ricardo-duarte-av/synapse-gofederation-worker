@@ -1,0 +1,31 @@
+# The recording proxy. Built from the same source tree as the worker, because it
+# shares internal/capture with it -- the two halves of the comparison must write
+# the identical format, and the surest way to guarantee that is for them to be
+# the same code.
+
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+
+# Download dependencies first so they cache independently of source changes.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# .dockerignore strips .git, so build info is passed in rather than derived.
+ARG TAG=dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
+
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w \
+        -X main.tag=${TAG} \
+        -X main.commit=${COMMIT} \
+        -X main.buildTime=${BUILD_TIME}" \
+      -o /out/fedrecorder ./cmd/fedrecorder
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/fedrecorder /fedrecorder
+# 8449 by convention: next to Synapse's federation port, and clearly not it.
+EXPOSE 8449
+ENTRYPOINT ["/fedrecorder"]

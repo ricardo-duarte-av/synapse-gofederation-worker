@@ -1,4 +1,4 @@
-name: Build container image
+name: Build container images
 
 on:
   push:
@@ -42,6 +42,27 @@ jobs:
       # Needed to push to GitHub's container registry.
       packages: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The worker itself keeps the repository's own image name.
+          - binary: gofederation-worker
+            dockerfile: Dockerfile
+            image: ${{ github.repository }}
+            # A missing config must be reported and exit non-zero, not panic.
+            smoke: -config /nonexistent.yaml
+          # The recording proxy is published beside it, under the same
+          # repository. It ships as its own image rather than a second
+          # entrypoint on the worker's, because it is deployed somewhere else
+          # entirely -- next to the TEST homeserver, not next to Synapse.
+          - binary: fedrecorder
+            dockerfile: Dockerfile.fedrecorder
+            image: ${{ github.repository }}/fedrecorder
+            # -upstream is required; without it the recorder has nowhere to
+            # forward and must say so rather than start and drop traffic.
+            smoke: ""
+
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +82,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
           tags: |
             # :latest only for the default branch, so feature branches don't overwrite it
             type=raw,value=latest,enable={{is_default_branch}}
@@ -76,6 +97,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -86,19 +108,21 @@ jobs:
             TAG=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
             BUILD_TIME=${{ github.event.repository.updated_at }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped per binary, or the two builds evict each other's layers.
+          cache-from: type=gha,scope=${{ matrix.binary }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.binary }}
 
       # The failure mode worth catching is an image that builds but cannot
       # start. -version exercises the entrypoint and the stamped build info
-      # without needing a database, a Redis socket or an access token.
+      # without needing a database, a Redis socket or a signing key.
       - name: Smoke test the image
         if: github.event_name != 'pull_request'
         run: |
           IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
           docker run --rm "$IMAGE" -version
-          # A bad config must be reported and exit non-zero, not panic.
-          if docker run --rm "$IMAGE" -config /nonexistent.yaml; then
-            echo "expected a missing config to fail"
+          # Starting with an unusable configuration must fail loudly rather
+          # than come up and silently do nothing.
+          if docker run --rm "$IMAGE" ${{ matrix.smoke }}; then
+            echo "expected an unusable configuration to fail"
             exit 1
           fi
