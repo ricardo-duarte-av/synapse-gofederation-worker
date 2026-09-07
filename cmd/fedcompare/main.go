@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/capture"
 )
@@ -32,6 +33,11 @@ func main() {
 		synapsePath = flag.String("synapse", "", "capture file from cmd/fedrecorder")
 		workerPath  = flag.String("worker", "", "capture file from the worker")
 		destination = flag.String("destination", "", "limit to one destination (recommended)")
+		since       = flag.String("since", "", "ignore records before this RFC3339 time (default: the overlap of the two captures)")
+		until       = flag.String("until", "", "ignore records after this RFC3339 time (default: the overlap of the two captures)")
+		byEventTime = flag.Bool("by-event-time", false,
+			"window on the events' own origin_server_ts rather than on when each side processed them; "+
+				"needed when either capture is a replay of history rather than a live follow")
 		asJSON      = flag.Bool("json", false, "emit the diff as JSON")
 		showVersion = flag.Bool("version", false, "print build information and exit")
 	)
@@ -46,7 +52,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	code, err := run(*synapsePath, *workerPath, *destination, *asJSON)
+	code, err := run(*synapsePath, *workerPath, *destination, *since, *until, *byEventTime, *asJSON)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fedcompare: %v\n", err)
 		os.Exit(1)
@@ -54,7 +60,7 @@ func main() {
 	os.Exit(code)
 }
 
-func run(synapsePath, workerPath, destination string, asJSON bool) (int, error) {
+func run(synapsePath, workerPath, destination, since, until string, byEventTime, asJSON bool) (int, error) {
 	synapse, synSkipped, err := capture.ReadFile(synapsePath)
 	if err != nil {
 		return 0, err
@@ -64,7 +70,30 @@ func run(synapsePath, workerPath, destination string, asJSON bool) (int, error) 
 		return 0, err
 	}
 
-	diff, err := capture.Compare(destination, synapse, worker)
+	// Default to the period both captures could have observed. The recorder's
+	// file is cumulative while the worker's covers only when the worker ran, so
+	// comparing the whole of each reports everything outside that period as
+	// MISSING -- true, and useless.
+	window := capture.Overlap(synapse, worker)
+	if byEventTime {
+		window = capture.OverlapByEventTime(synapse, worker)
+	}
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return 0, fmt.Errorf("parsing -since: %w", err)
+		}
+		window.Since = t
+	}
+	if until != "" {
+		t, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return 0, fmt.Errorf("parsing -until: %w", err)
+		}
+		window.Until = t
+	}
+
+	diff, err := capture.Compare(destination, window, synapse, worker)
 	if err != nil {
 		return 0, err
 	}
@@ -79,9 +108,15 @@ func run(synapsePath, workerPath, destination string, asJSON bool) (int, error) 
 		report(diff, synSkipped, workSkipped)
 	}
 
-	// A non-zero exit only for PDU disagreement. EDUs are excluded from the
-	// verdict while the m.device_list_update body is knowingly incomplete --
-	// a red light that is permanently on stops being read.
+	// Three outcomes, not two. A comparison that looked at nothing has
+	// established nothing, and calling that a pass is how a broken rig goes
+	// unnoticed: the output is green and nobody asks what it was green about.
+	if diff.Inconclusive() {
+		return 2, nil
+	}
+	// A non-zero exit otherwise only for PDU disagreement. EDUs are excluded
+	// from the verdict while the m.device_list_update body is knowingly
+	// incomplete -- a red light that is permanently on stops being read.
 	if !diff.Agreed() {
 		return 1, nil
 	}
@@ -91,6 +126,16 @@ func run(synapsePath, workerPath, destination string, asJSON bool) (int, error) 
 func report(d capture.Diff, synSkipped, workSkipped int) {
 	if d.Destination != "" {
 		fmt.Printf("destination: %s\n", d.Destination)
+	}
+	if d.Window.Since.IsZero() && d.Window.Until.IsZero() {
+		fmt.Printf("window: unbounded -- one of the captures has no timestamps\n")
+	} else {
+		basis := "processed"
+		if d.Window.ByEventTime {
+			basis = "event timestamps"
+		}
+		fmt.Printf("window: %s .. %s  (by %s; the period BOTH captures cover)\n",
+			d.Window.Since.Format(time.RFC3339), d.Window.Until.Format(time.RFC3339), basis)
 	}
 	fmt.Printf("transactions: synapse=%d worker=%d  (framing is not comparable; see the docs)\n",
 		d.SynapseTransactions, d.WorkerTransactions)
@@ -156,10 +201,18 @@ func report(d capture.Diff, synSkipped, workSkipped int) {
 	}
 
 	fmt.Printf("\n")
-	if d.Agreed() {
-		fmt.Printf("PDUs agree.\n")
-	} else {
-		fmt.Printf("PDUs DISAGREE.\n")
+	switch {
+	case d.Inconclusive():
+		fmt.Printf("INCONCLUSIVE: %d PDUs were compared.\n", d.Compared)
+		if d.Window.Empty() {
+			fmt.Printf("The two captures cover disjoint periods, so there is nothing\n" +
+				"they both observed. If one of them is a replay of history rather than\n" +
+				"a live follow, window on the events instead: -by-event-time\n")
+		}
+	case d.Agreed():
+		fmt.Printf("PDUs agree (%d compared).\n", d.Compared)
+	default:
+		fmt.Printf("PDUs DISAGREE (%d compared).\n", d.Compared)
 	}
 }
 

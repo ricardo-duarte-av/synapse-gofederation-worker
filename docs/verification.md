@@ -56,6 +56,23 @@ not have: wrong, but less damaging.
 **Result so far:** 507 settled pairs, 507 agreed, **100%**, over a window of
 21,815 stream orderings.
 
+### Two ways to get a meaningless answer
+
+Both were hit for real before being fixed, and both produced confident output.
+
+**Comparing periods only one side observed.** The recorder's file is cumulative
+from the day it was deployed; the worker's covers only when the worker ran.
+Diffing the whole of each reports everything outside that period as MISSING.
+`fedcompare` therefore windows to the intersection by default.
+
+**Windowing on the wrong clock.** A worker replaying history records
+yesterday's events with today's timestamp, so the processing-time overlap is
+*empty* even though both captures describe the same events — and an empty
+comparison printed "PDUs agree". `-by-event-time` windows on the events'
+own `origin_server_ts` instead, and an empty comparison is now reported as
+**INCONCLUSIVE** with exit status 2, distinct from agreement. A green light
+over zero records is worse than no comparison, because it gets believed.
+
 ## 2. Are our PDU bytes identical to Synapse's?
 
 Unlike transaction framing, an individual PDU's bytes are a pure function of the
@@ -106,10 +123,35 @@ own `ShardedWorkerHandlingConfig` over every destination in the database.
 Stated plainly, because an unverified thing that nobody has written down is
 indistinguishable from a verified one:
 
-- **EDU content.** To-device and device-list EDUs are routed and counted, but
-  the `m.device_list_update` body is deliberately incomplete (no `prev_id`,
-  `deleted`, `keys` or `device_display_name`), so there is nothing to compare
-  yet. The destinations and timing of device EDUs are covered by question 1.
+- **EDU content, and it cannot be fixed by shadowing.** This is a structural
+  limit rather than unfinished work, found by comparing a real encrypted
+  message.
+
+  A real sender does not merely read `device_federation_outbox` and
+  `device_lists_outbound_pokes` — it **deletes** the rows once the transaction
+  succeeds. Those deletions are its cursor. So by the time a shadow looks, the
+  row that produced Synapse's `m.direct_to_device` is gone: the capture shows
+  `synapse=1 worker=0` not because we decided differently but because the
+  evidence was destroyed by the act we are shadowing.
+
+  Confirmed on a live E2EE message: Synapse sent one `m.direct_to_device` to
+  the test destination, and both `device_federation_outbox` and
+  `device_lists_outbound_pokes` held **zero** rows for it afterwards.
+
+  Nothing in the shadow can close this. What can:
+
+  - **Send for real to that destination.** Once this worker owns the delivery,
+    it reads the row and the content is its own; correctness is then judged by
+    whether the receiving server decrypts, not by a diff.
+  - **A destination Synapse does not handle**, if one could be arranged — then
+    no other sender competes for the rows.
+
+  Until then the honest statement is that device EDU *routing and timing* are
+  verified (question 1 covers them) and device EDU *content* is not.
+
+- **`m.device_list_update` body.** Separately from the above, ours is
+  deliberately incomplete: no `prev_id`, `deleted`, `keys` or
+  `device_display_name`.
 - **Catch-up.** Not implemented, so not compared.
 - **Forked-DAG destination resolution.** 4.4% of routing decisions still fall
   back to current room state. Those pairs can still be compared by question 1 —

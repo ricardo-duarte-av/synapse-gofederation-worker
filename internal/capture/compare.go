@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tidwall/gjson"
 	"maunium.net/go/mautrix/crypto/canonicaljson"
@@ -22,6 +23,15 @@ import (
 // with what bytes, and which EDUs went with them.
 type Diff struct {
 	Destination string
+	// Window is the period compared. Records outside it are ignored on both
+	// sides.
+	Window Window
+	// Compared is how many distinct PDUs the comparison actually looked at.
+	//
+	// Zero means the comparison proved nothing, and a caller must not read
+	// that as agreement. An empty comparison reporting a green light is worse
+	// than no comparison at all, because it gets believed.
+	Compared int
 
 	// Transactions on each side, reported for context only. A difference here
 	// is expected and is not a finding.
@@ -128,17 +138,140 @@ var eduComparable = map[string]struct {
 	"m.presence": {false, "a snapshot of presence when the transaction was built"},
 }
 
-// Compare diffs two sets of records for one destination.
-func Compare(destination string, synapse, worker []Record) (Diff, error) {
-	d := Diff{Destination: destination}
+// Window bounds a comparison in time.
+//
+// It is not optional in practice and leaving it out is the mistake this type
+// exists to prevent. The recorder's file is cumulative -- everything since it
+// was deployed -- while the worker's covers only the period the worker was
+// running. Comparing the two whole files reports every transaction Synapse sent
+// outside that period as MISSING, which is true and useless, and is exactly the
+// false alarm the routing comparison's floor already had to solve.
+type Window struct {
+	Since time.Time
+	Until time.Time
 
-	synPDUs, synEDUs, n, err := flatten(synapse, destination)
+	// ByEventTime windows on the PDUs' own origin_server_ts instead of on when
+	// each side processed the transaction.
+	//
+	// Needed whenever one side is replaying history: a worker re-processing
+	// yesterday's events records them with today's timestamp, so the two
+	// captures never overlap in processing time even though they describe the
+	// same events. The event's own timestamp is a property of the event and is
+	// identical on both sides however either got there.
+	//
+	// EDUs carry no such timestamp and are not filtered in this mode.
+	ByEventTime bool
+}
+
+// Empty reports whether the window can contain anything at all.
+//
+// An inverted window -- Since after Until -- means the two captures observed
+// disjoint periods, so there is nothing to compare. Saying so is essential: the
+// alternative is a comparison over zero records reporting agreement, which is a
+// green light that means nothing.
+func (w Window) Empty() bool {
+	return !w.Since.IsZero() && !w.Until.IsZero() && w.Since.After(w.Until)
+}
+
+// Contains reports whether a time falls in the window. A zero bound is open.
+func (w Window) Contains(t time.Time) bool {
+	if !w.Since.IsZero() && t.Before(w.Since) {
+		return false
+	}
+	if !w.Until.IsZero() && t.After(w.Until) {
+		return false
+	}
+	return true
+}
+
+// Overlap returns the period both captures could have observed: the
+// intersection of their time ranges.
+//
+// This is the honest default. Anything outside it is a period only one side was
+// watching, so a difference there says nothing about whether the two senders
+// agree.
+func Overlap(a, b []Record) Window {
+	aMin, aMax := timeRange(a)
+	bMin, bMax := timeRange(b)
+	if aMin.IsZero() || bMin.IsZero() {
+		return Window{}
+	}
+	w := Window{Since: aMin, Until: aMax}
+	if bMin.After(w.Since) {
+		w.Since = bMin
+	}
+	if bMax.Before(w.Until) {
+		w.Until = bMax
+	}
+	return w
+}
+
+// OverlapByEventTime returns the intersection of the two captures' EVENT time
+// ranges, taken from the PDUs' origin_server_ts.
+//
+// Use this when either side replayed history rather than following the stream
+// live, which is the normal case while the worker is being run by hand.
+func OverlapByEventTime(a, b []Record) Window {
+	aMin, aMax := eventTimeRange(a)
+	bMin, bMax := eventTimeRange(b)
+	if aMin.IsZero() || bMin.IsZero() {
+		return Window{ByEventTime: true}
+	}
+	w := Window{Since: aMin, Until: aMax, ByEventTime: true}
+	if bMin.After(w.Since) {
+		w.Since = bMin
+	}
+	if bMax.Before(w.Until) {
+		w.Until = bMax
+	}
+	return w
+}
+
+func eventTimeRange(records []Record) (min, max time.Time) {
+	for _, r := range records {
+		for _, p := range gjson.GetBytes(r.Body, "pdus").Array() {
+			ts := p.Get("origin_server_ts").Int()
+			if ts == 0 {
+				continue
+			}
+			t := time.UnixMilli(ts)
+			if min.IsZero() || t.Before(min) {
+				min = t
+			}
+			if max.IsZero() || t.After(max) {
+				max = t
+			}
+		}
+	}
+	return min, max
+}
+
+func timeRange(records []Record) (min, max time.Time) {
+	for _, r := range records {
+		if r.Time.IsZero() {
+			continue
+		}
+		if min.IsZero() || r.Time.Before(min) {
+			min = r.Time
+		}
+		if max.IsZero() || r.Time.After(max) {
+			max = r.Time
+		}
+	}
+	return min, max
+}
+
+// Compare diffs two sets of records for one destination, within a window.
+func Compare(destination string, window Window, synapse, worker []Record) (Diff, error) {
+	d := Diff{Destination: destination, Window: window}
+
+	synPDUs, synEDUs, n, err := flatten(synapse, destination, window)
 	if err != nil {
 		return Diff{}, err
 	}
 	d.SynapseTransactions = n
 
-	ourPDUs, ourEDUs, n, err := flatten(worker, destination)
+	ourPDUs, ourEDUs, n, err := flatten(worker, destination, window)
 	if err != nil {
 		return Diff{}, err
 	}
@@ -171,6 +304,7 @@ func Compare(destination string, synapse, worker []Record) (Diff, error) {
 		return d.PDUsDiffering[i].EventID < d.PDUsDiffering[j].EventID
 	})
 
+	d.Compared = d.PDUsBoth + len(d.PDUsOnlySynapse) + len(d.PDUsOnlyWorker)
 	d.EDUs = compareEDUs(synEDUs, ourEDUs)
 	return d, nil
 }
@@ -181,7 +315,7 @@ func Compare(destination string, synapse, worker []Record) (Diff, error) {
 // canonical JSON, so this changes nothing in practice -- but it means a
 // difference reported here is a difference in CONTENT rather than in encoding,
 // which is the only kind worth reading.
-func flatten(records []Record, destination string) (
+func flatten(records []Record, destination string, window Window) (
 	pdus map[string]pduEntry, edus map[string][]string, transactions int, err error,
 ) {
 	pdus = map[string]pduEntry{}
@@ -189,6 +323,12 @@ func flatten(records []Record, destination string) (
 
 	for _, r := range records {
 		if destination != "" && r.Destination != destination {
+			continue
+		}
+		// In processing-time mode the whole record is in or out. In
+		// event-time mode the record always passes here and its PDUs are
+		// judged individually below, on their own timestamps.
+		if !window.ByEventTime && !window.Contains(r.Time) {
 			continue
 		}
 		t, decodeErr := r.Decode()
@@ -201,6 +341,12 @@ func flatten(records []Record, destination string) (
 		transactions++
 
 		for _, p := range t.PDUs {
+			if window.ByEventTime {
+				ts := gjson.GetBytes(p, "origin_server_ts").Int()
+				if ts == 0 || !window.Contains(time.UnixMilli(ts)) {
+					continue
+				}
+			}
 			id, ref := identify(p)
 			pdus[id] = pduEntry{canonical: canonical(p), ref: ref}
 		}
@@ -284,6 +430,13 @@ func (d Diff) Agreed() bool {
 		len(d.PDUsOnlyWorker) == 0 &&
 		len(d.PDUsDiffering) == 0
 }
+
+// Inconclusive reports that the comparison looked at nothing.
+//
+// Distinguished from agreement on purpose. A run that compared zero PDUs has
+// established nothing, and reporting it as a pass is how a broken rig goes
+// unnoticed -- the output is green and nobody asks what it was green about.
+func (d Diff) Inconclusive() bool { return d.Compared == 0 || d.Window.Empty() }
 
 // contentIDPrefix marks an identity derived from the content rather than read
 // from an event_id field.

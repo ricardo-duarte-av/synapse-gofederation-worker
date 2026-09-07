@@ -41,7 +41,7 @@ func TestCompareAgreesOnIdenticalPDUs(t *testing.T) {
 		rec(SourceWorker, "b.example", "10", []string{pdu("$b", "two")}),
 	}
 
-	d, err := Compare("b.example", syn, ours)
+	d, err := Compare("b.example", Window{}, syn, ours)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestCompareDetectsDifferingBytes(t *testing.T) {
 	syn := []Record{rec(SourceSynapse, "b.example", "1", []string{pdu("$a", "one")})}
 	ours := []Record{rec(SourceWorker, "b.example", "1", []string{pdu("$a", "ONE")})}
 
-	d, _ := Compare("b.example", syn, ours)
+	d, _ := Compare("b.example", Window{}, syn, ours)
 	if len(d.PDUsDiffering) != 1 || d.PDUsDiffering[0].EventID != "$a" {
 		t.Fatalf("PDUsDiffering = %+v", d.PDUsDiffering)
 	}
@@ -79,7 +79,7 @@ func TestCompareIgnoresKeyOrder(t *testing.T) {
 	ours := []Record{rec(SourceWorker, "b.example", "1",
 		[]string{`{"content":{"body":"x"},"type":"m.room.message","event_id":"$a"}`})}
 
-	d, _ := Compare("b.example", syn, ours)
+	d, _ := Compare("b.example", Window{}, syn, ours)
 	if !d.Agreed() {
 		t.Errorf("key order was reported as a difference: %+v", d.PDUsDiffering)
 	}
@@ -91,7 +91,7 @@ func TestCompareDetectsMissingAndExtra(t *testing.T) {
 	ours := []Record{rec(SourceWorker, "b.example", "1",
 		[]string{pdu("$a", "one"), pdu("$phantom", "three")})}
 
-	d, _ := Compare("b.example", syn, ours)
+	d, _ := Compare("b.example", Window{}, syn, ours)
 	if len(d.PDUsOnlySynapse) != 1 || d.PDUsOnlySynapse[0].ID != "$missed" {
 		t.Errorf("PDUsOnlySynapse = %v", d.PDUsOnlySynapse)
 	}
@@ -107,7 +107,7 @@ func TestCompareFiltersByDestination(t *testing.T) {
 	}
 	ours := []Record{rec(SourceWorker, "b.example", "1", []string{pdu("$a", "one")})}
 
-	d, _ := Compare("b.example", syn, ours)
+	d, _ := Compare("b.example", Window{}, syn, ours)
 	if !d.Agreed() {
 		t.Errorf("another destination's traffic leaked into the comparison: %+v", d)
 	}
@@ -126,7 +126,7 @@ func TestEDUComparabilityIsPerType(t *testing.T) {
 		EDU{Type: "m.presence", Content: json.RawMessage(`{"push":[{"user_id":"@b:a.example"}]}`)},
 	)}
 
-	d, _ := Compare("b.example", syn, ours)
+	d, _ := Compare("b.example", Window{}, syn, ours)
 	byType := map[string]EDUDiff{}
 	for _, e := range d.EDUs {
 		byType[e.Type] = e
@@ -155,7 +155,7 @@ func TestEDUContentIsAMultiset(t *testing.T) {
 	syn := []Record{rec(SourceSynapse, "b.example", "1", nil, same, same)}
 	ours := []Record{rec(SourceWorker, "b.example", "1", nil, same)}
 
-	d, _ := Compare("b.example", syn, ours)
+	d, _ := Compare("b.example", Window{}, syn, ours)
 	for _, e := range d.EDUs {
 		if e.Type != "m.direct_to_device" {
 			continue
@@ -283,7 +283,7 @@ func TestPDUsWithoutEventIDGetAShortContentIdentity(t *testing.T) {
 	syn := []Record{rec(SourceSynapse, "b.example", "1", []string{v12})}
 	ours := []Record{rec(SourceWorker, "b.example", "1", []string{v12})}
 
-	d, err := Compare("b.example", syn, ours)
+	d, err := Compare("b.example", Window{}, syn, ours)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestPDUsWithoutEventIDGetAShortContentIdentity(t *testing.T) {
 	// Now change it, and check the report stays readable.
 	changed := strings.Replace(v12, `"body":"`+strings.Repeat("x", 5000), `"body":"changed`, 1)
 	ours = []Record{rec(SourceWorker, "b.example", "1", []string{changed})}
-	d, _ = Compare("b.example", syn, ours)
+	d, _ = Compare("b.example", Window{}, syn, ours)
 
 	if len(d.PDUsOnlySynapse) != 1 || len(d.PDUsOnlyWorker) != 1 {
 		t.Fatalf("a content change should appear as one missing and one extra: %+v", d)
@@ -331,7 +331,7 @@ func TestUnimplementedEDUTypesAreMarked(t *testing.T) {
 		EDU{Type: "m.direct_to_device", Content: json.RawMessage(`{"message_id":"m1"}`)},
 	)}
 
-	d, err := Compare("b.example", syn, ours)
+	d, err := Compare("b.example", Window{}, syn, ours)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,5 +349,152 @@ func TestUnimplementedEDUTypesAreMarked(t *testing.T) {
 	// An unimplemented type still must not fail the PDU verdict.
 	if !d.Agreed() {
 		t.Error("an unimplemented EDU type failed the PDU verdict")
+	}
+}
+
+// The lesson the routing comparison already had to learn, applied here.
+//
+// The recorder's file is cumulative -- everything since it was deployed --
+// while the worker's covers only the period the worker was running. Comparing
+// the two whole files reports every transaction Synapse sent outside that
+// period as MISSING, which is true and useless. The first real E2EE comparison
+// did exactly that.
+func TestWindowExcludesWhatOnlyOneSideCouldSee(t *testing.T) {
+	old := time.Now().Add(-2 * time.Hour)
+	now := time.Now()
+
+	synOld := rec(SourceSynapse, "b.example", "1", []string{pdu("$old", "before we ran")})
+	synOld.Time = old
+	synNow := rec(SourceSynapse, "b.example", "2", []string{pdu("$now", "while we ran")})
+	synNow.Time = now
+
+	ourNow := rec(SourceWorker, "b.example", "9", []string{pdu("$now", "while we ran")})
+	ourNow.Time = now
+
+	syn := []Record{synOld, synNow}
+	ours := []Record{ourNow}
+
+	// Unbounded: the old transaction reads as a disagreement.
+	d, err := Compare("b.example", Window{}, syn, ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.PDUsOnlySynapse) != 1 {
+		t.Fatalf("unbounded comparison should surface the out-of-window record: %+v", d)
+	}
+
+	// Windowed to the overlap: only what both sides could have seen.
+	d, err = Compare("b.example", Overlap(syn, ours), syn, ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Agreed() {
+		t.Errorf("windowed comparison still disagrees: only=%v differing=%v",
+			d.PDUsOnlySynapse, d.PDUsDiffering)
+	}
+	if d.PDUsBoth != 1 {
+		t.Errorf("PDUsBoth = %d, want the one in-window event", d.PDUsBoth)
+	}
+}
+
+// The overlap is the intersection, so a capture that started later moves the
+// start and one that ended earlier moves the end.
+func TestOverlapIsTheIntersection(t *testing.T) {
+	mk := func(src Source, at time.Time) Record {
+		r := rec(src, "b.example", "1", nil)
+		r.Time = at
+		return r
+	}
+	base := time.Now().Truncate(time.Second)
+	syn := []Record{mk(SourceSynapse, base), mk(SourceSynapse, base.Add(10*time.Minute))}
+	ours := []Record{mk(SourceWorker, base.Add(2*time.Minute)), mk(SourceWorker, base.Add(6*time.Minute))}
+
+	w := Overlap(syn, ours)
+	if !w.Since.Equal(base.Add(2 * time.Minute)) {
+		t.Errorf("Since = %s, want the later start", w.Since)
+	}
+	if !w.Until.Equal(base.Add(6 * time.Minute)) {
+		t.Errorf("Until = %s, want the earlier end", w.Until)
+	}
+	if w.Contains(base) || w.Contains(base.Add(10*time.Minute)) {
+		t.Error("the window contains a time outside the intersection")
+	}
+}
+
+// An empty side means there is nothing both observed, and that must not be
+// reported as total disagreement.
+func TestOverlapWithAnEmptySideIsUnbounded(t *testing.T) {
+	if w := Overlap(nil, []Record{rec(SourceWorker, "b.example", "1", nil)}); !w.Since.IsZero() {
+		t.Errorf("Overlap with an empty side = %+v, want the zero window", w)
+	}
+}
+
+// A comparison that looked at nothing has established nothing, and reporting
+// that as agreement is how a broken rig goes unnoticed: the output is green and
+// nobody asks what it was green about. The first E2EE comparison did exactly
+// this -- the two captures covered disjoint periods and it printed "PDUs agree"
+// over zero records.
+func TestEmptyComparisonIsInconclusiveNotAgreement(t *testing.T) {
+	now := time.Now()
+	syn := rec(SourceSynapse, "b.example", "1", []string{pdu("$a", "x")})
+	syn.Time = now.Add(-time.Hour)
+	ours := rec(SourceWorker, "b.example", "2", []string{pdu("$a", "x")})
+	ours.Time = now
+
+	// The overlap of two disjoint periods is inverted, so nothing is compared.
+	w := Overlap([]Record{syn}, []Record{ours})
+	if !w.Empty() {
+		t.Fatalf("window %+v should be empty for disjoint captures", w)
+	}
+
+	d, err := Compare("b.example", w, []Record{syn}, []Record{ours})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Compared != 0 {
+		t.Fatalf("Compared = %d, want 0", d.Compared)
+	}
+	if !d.Inconclusive() {
+		t.Error("a comparison over zero PDUs is not reported as inconclusive")
+	}
+	// Agreed() may still be vacuously true; Inconclusive is what callers must
+	// check first, and the CLI does.
+	if !d.Agreed() {
+		t.Log("Agreed() is false as well, which is fine; Inconclusive is the guard")
+	}
+}
+
+// Windowing on the events' own timestamps is what makes a replay comparable.
+// A worker re-processing yesterday's events records them with today's time, so
+// processing-time overlap is empty even though both describe the same events.
+func TestEventTimeWindowMakesAReplayComparable(t *testing.T) {
+	eventTS := time.Now().Add(-24 * time.Hour).Truncate(time.Millisecond)
+	body := func() string {
+		return `{"type":"m.room.encrypted","room_id":"!r:a.example","sender":"@u:a.example",` +
+			`"origin_server_ts":` + itoa(eventTS.UnixMilli()) + `,"content":{"algorithm":"m.megolm.v1.aes-sha2"}}`
+	}
+
+	syn := rec(SourceSynapse, "b.example", "1", []string{body()})
+	syn.Time = eventTS // Synapse sent it as it happened
+	ours := rec(SourceWorker, "b.example", "2", []string{body()})
+	ours.Time = time.Now() // we replayed it today
+
+	if !Overlap([]Record{syn}, []Record{ours}).Empty() {
+		t.Fatal("processing-time overlap should be empty for a replay")
+	}
+
+	w := OverlapByEventTime([]Record{syn}, []Record{ours})
+	if w.Empty() || !w.ByEventTime {
+		t.Fatalf("event-time window = %+v, want a usable window", w)
+	}
+	d, err := Compare("b.example", w, []Record{syn}, []Record{ours})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Inconclusive() {
+		t.Fatalf("event-time comparison still compared nothing: %+v", d)
+	}
+	if !d.Agreed() || d.PDUsBoth != 1 {
+		t.Errorf("got %+v, want the replayed event matched", d)
 	}
 }
