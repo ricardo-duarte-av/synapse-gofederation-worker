@@ -439,3 +439,75 @@ func TestBackingOffDestinationIsNotDialled(t *testing.T) {
 		return p == 0
 	})
 }
+
+// The two mutable EDU shapes are rewritten in place while a transaction is
+// being built: a keyed EDU is clobbered by the next update for the same key,
+// and a receipt EDU has receipts merged into its nested maps. Building the
+// transaction outside the lock from a slice that still aliased the queue meant
+// reading those as they were rewritten -- a data race for the keyed case, and a
+// concurrent map read and write for receipts, which is a fatal runtime error
+// rather than merely a wrong answer.
+//
+// Only meaningful under -race, which CI runs. It caught the real thing.
+func TestConcurrentEnqueueDuringSend(t *testing.T) {
+	s := &recordingSink{}
+	m := testManager(t, s, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Start(ctx)
+
+	d := m.Get("b.example")
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Keyed EDUs for one key: every update after the first clobbers in place.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			typing := i%2 == 0
+			d.EnqueueKeyedEDU("!r|@alice:a.example", txn.EDU{
+				Type:    txn.EDUTypeTyping,
+				Content: []byte(`{"room_id":"!r","user_id":"@alice:a.example","typing":` + boolText(typing) + `}`),
+			})
+			m.Wake(d)
+		}
+	}()
+
+	// Receipts for one room: these merge into the maps materialise walks.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			d.EnqueueReceipt("!r:a.example", "m.read",
+				"@bob:a.example", "", []byte(`{"ts":1}`))
+			m.Wake(d)
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	if len(s.sent()) == 0 {
+		t.Error("nothing was sent; the test exercised nothing")
+	}
+}
+
+func boolText(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}

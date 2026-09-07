@@ -30,11 +30,23 @@ func (f *fixedHosts) CurrentJoinedHosts(context.Context, string) ([]string, erro
 type typingSink struct {
 	mu   sync.Mutex
 	edus map[string][]gjson.Result
+	// block, when set, makes every send hang. Nothing is ever dequeued, so the
+	// queue contents stay still long enough to be asserted on -- Wake starts a
+	// transmission loop whether or not the manager has been started, so an
+	// "idle" manager is not a thing that exists.
+	block chan struct{}
 }
 
 func (s *typingSink) Mode() string { return "typing-test" }
 
-func (s *typingSink) Send(_ context.Context, req *txn.Request) (sink.Result, error) {
+func (s *typingSink) Send(ctx context.Context, req *txn.Request) (sink.Result, error) {
+	if s.block != nil {
+		select {
+		case <-s.block:
+		case <-ctx.Done():
+			return sink.Result{}, ctx.Err()
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range gjson.GetBytes(req.Body, "edus").Array() {
@@ -63,14 +75,24 @@ func (s *typingSink) take(t *testing.T, destination string, want int) []gjson.Re
 	}
 }
 
-func newTyping(t *testing.T, hosts *fixedHosts) (*Typing, *typingSink) {
+// newQueuedTyping builds a Typing whose sends all hang, so nothing is ever
+// dequeued and the queue can be asserted on. Tests about what ends up QUEUED
+// use this; tests about what is SENT use newTyping.
+func newQueuedTyping(t *testing.T, hosts *fixedHosts) (*Typing, *queue.Manager) {
+	t.Helper()
+	ty, s, m := newTypingWith(t, hosts, make(chan struct{}))
+	_ = s
+	return ty, m
+}
+
+func newTypingWith(t *testing.T, hosts *fixedHosts, block chan struct{}) (*Typing, *typingSink, *queue.Manager) {
 	t.Helper()
 	signer, err := txn.NewSigner("example.com",
 		"ed25519 a_Yofy AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &typingSink{edus: map[string][]gjson.Result{}}
+	s := &typingSink{edus: map[string][]gjson.Result{}, block: block}
 	m := queue.NewManager(queue.ManagerConfig{
 		Limits:        queue.Limits{MaxPDUs: 50, MaxEDUs: 100},
 		Signer:        signer,
@@ -79,17 +101,28 @@ func newTyping(t *testing.T, hosts *fixedHosts) (*Typing, *typingSink) {
 		Log:           zerolog.Nop(),
 		MaxConcurrent: 10,
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	m.Start(ctx)
-
 	return NewTyping(TypingConfig{
 		Hosts:        hosts,
 		Queues:       m,
 		Log:          zerolog.Nop(),
 		ServerName:   "example.com",
 		ShouldHandle: func(string) bool { return true },
-	}), s
+	}), s, m
+}
+
+func newTyping(t *testing.T, hosts *fixedHosts) (*Typing, *typingSink) {
+	t.Helper()
+	ty, s, m := newTypingWith(t, hosts, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	m.Start(ctx)
+	return ty, s
+}
+
+// pendingEDUs is how many EDUs are waiting for a destination.
+func pendingEDUs(m *queue.Manager, destination string) int {
+	_, edus := m.Get(destination).Pending()
+	return edus
 }
 
 // A row is the whole typing set for a room, so the start/stop distinction only
@@ -155,24 +188,18 @@ func TestTypingNeverSendsToOurselves(t *testing.T) {
 // would switch the indicator on after the user had finished.
 func TestTypingClobbersPerRoomAndUser(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
-	ty, s := newTyping(t, hosts)
+	ty, m := newQueuedTyping(t, hosts)
 	ctx := context.Background()
 
-	// Both rows before the transmission loop can drain, so the clobber is
-	// observable: the stop replaces the start in place rather than queueing
-	// behind it.
 	ty.HandleRows(ctx, 1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 	ty.HandleRows(ctx, 2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
 
-	edus := s.take(t, "remote.example", 1)
-	if len(edus) == 0 {
-		t.Fatal("nothing was sent")
-	}
-	// Whatever arrives, the LAST word must be the stop -- an indicator left on
-	// is the failure this key exists to prevent.
-	last := edus[len(edus)-1]
-	if last.Get("content.typing").Bool() {
-		t.Errorf("the last EDU sent is a start, not the stop: %s", last.Raw)
+	// One pending EDU, not two: the stop replaced the start rather than
+	// queueing behind it. WHICH one survives is the queue's business and is
+	// covered by TestKeyedEDUReplacesRatherThanAccumulates; what is being
+	// tested here is the key this package chooses.
+	if n := pendingEDUs(m, "remote.example"); n != 1 {
+		t.Errorf("%d EDUs queued, want the stop to have replaced the start", n)
 	}
 }
 
@@ -180,13 +207,13 @@ func TestTypingClobbersPerRoomAndUser(t *testing.T) {
 // each other, which is why the key is (room, user) and not the room alone.
 func TestTypingDoesNotClobberAcrossUsers(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
-	ty, s := newTyping(t, hosts)
+	ty, m := newQueuedTyping(t, hosts)
 
 	ty.HandleRows(context.Background(), 1, []TypingRow{{RoomID: "!r",
 		UserIDs: []string{"@alice:example.com", "@bob:example.com"}}})
 
-	if edus := s.take(t, "remote.example", 2); len(edus) != 2 {
-		t.Errorf("got %d EDUs, want one per user", len(edus))
+	if n := pendingEDUs(m, "remote.example"); n != 2 {
+		t.Errorf("%d EDUs queued, want one per user", n)
 	}
 }
 

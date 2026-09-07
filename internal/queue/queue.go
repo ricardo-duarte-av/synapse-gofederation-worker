@@ -284,8 +284,15 @@ func (d *Destination) Run(ctx context.Context) {
 		// Cleared at the TOP, so anything enqueued during the send below is
 		// seen by the next iteration rather than lost.
 		d.newData = false
-		pdus, edus := d.takeLocked()
+		batch, err := d.takeLocked()
 		d.mu.Unlock()
+		if err != nil {
+			// An EDU that cannot be encoded. It stays queued, as a failed send
+			// would, and the loop exits for a later Attempt to retry.
+			d.log.Error().Err(err).Msg("failed to encode a queued EDU")
+			return
+		}
+		pdus, edus := batch.pdus, batch.edus
 
 		if len(pdus) == 0 && len(edus) == 0 {
 			// Nothing to send. If something arrived between the check and
@@ -299,7 +306,7 @@ func (d *Destination) Run(ctx context.Context) {
 			return
 		}
 
-		err := d.send(ctx, pdus, edus)
+		err = d.send(ctx, batch)
 		if d.onOutcome != nil {
 			d.onOutcome(d.name, err == nil)
 		}
@@ -318,19 +325,8 @@ func (d *Destination) Run(ctx context.Context) {
 		// Bookkeeping for the EDUs that were actually in the delivered
 		// transaction, and only then. Synapse does the same in __aexit__,
 		// which it skips entirely when the send raised.
-		if d.onEDUsSent != nil {
-			var toDevice, deviceList int64
-			for _, e := range edus {
-				if e.ToDeviceUpTo > toDevice {
-					toDevice = e.ToDeviceUpTo
-				}
-				if e.DeviceListUpTo > deviceList {
-					deviceList = e.DeviceListUpTo
-				}
-			}
-			if toDevice > 0 || deviceList > 0 {
-				d.onEDUsSent(d.name, toDevice, deviceList)
-			}
+		if d.onEDUsSent != nil && (batch.toDeviceUpTo > 0 || batch.deviceListUpTo > 0) {
+			d.onEDUsSent(d.name, batch.toDeviceUpTo, batch.deviceListUpTo)
 		}
 
 		if len(pdus) > 0 {
@@ -347,13 +343,40 @@ func (d *Destination) Run(ctx context.Context) {
 	}
 }
 
+// taken is one transaction's worth of work, fully detached from the queue.
+//
+// Detached is the load-bearing word. A transaction is built and sent WITHOUT
+// the lock -- it waits on a remote server, so holding the lock would stall
+// every enqueue to that destination for the length of a network round trip --
+// and the two pending EDU shapes are both mutated IN PLACE while it waits:
+// a keyed EDU is clobbered by the next update for the same key, and a receipt
+// EDU has receipts merged into its nested maps. Handing the sender a slice that
+// still aliases the queue means it reads those bytes as they are being
+// rewritten. The keyed case is a data race; the receipt case is a concurrent
+// map read and write, which is a fatal runtime error rather than merely a wrong
+// answer.
+//
+// So everything the send and the bookkeeping after it need is copied out here,
+// under the lock, and the EDUs are materialised while they still cannot change.
+type taken struct {
+	pdus []PDU
+	// edus are already encoded, so nothing downstream can observe a merge in
+	// progress.
+	edus []txn.EDU
+	// toDeviceUpTo and deviceListUpTo are the maxima over the taken EDUs,
+	// computed here so the post-send bookkeeping needs no second look at the
+	// queue.
+	toDeviceUpTo   int64
+	deviceListUpTo int64
+}
+
 // takeLocked copies the next transaction's worth of units WITHOUT removing
 // them.
 //
 // Not removing is the point. If the send fails, the units must still be queued,
 // and a take-then-restore would reorder them against anything enqueued in the
 // meantime. Only dequeue, after a confirmed delivery, actually removes.
-func (d *Destination) takeLocked() ([]PDU, []EDU) {
+func (d *Destination) takeLocked() (taken, error) {
 	pdus := d.pendingPDUs
 	if len(pdus) > d.limits.MaxPDUs {
 		pdus = pdus[:d.limits.MaxPDUs]
@@ -362,7 +385,24 @@ func (d *Destination) takeLocked() ([]PDU, []EDU) {
 	if len(edus) > d.limits.MaxEDUs {
 		edus = edus[:d.limits.MaxEDUs]
 	}
-	return pdus, edus
+
+	t := taken{pdus: append([]PDU(nil), pdus...)}
+	for _, e := range edus {
+		// Materialising here rather than in send is what makes a merged receipt
+		// EDU safe: it walks maps the enqueue path writes to.
+		unit, err := e.materialise()
+		if err != nil {
+			return taken{}, err
+		}
+		t.edus = append(t.edus, unit)
+		if e.ToDeviceUpTo > t.toDeviceUpTo {
+			t.toDeviceUpTo = e.ToDeviceUpTo
+		}
+		if e.DeviceListUpTo > t.deviceListUpTo {
+			t.deviceListUpTo = e.DeviceListUpTo
+		}
+	}
+	return t, nil
 }
 
 func (d *Destination) dequeue(pdus, edus int) {
@@ -372,18 +412,12 @@ func (d *Destination) dequeue(pdus, edus int) {
 	d.mu.Unlock()
 }
 
-func (d *Destination) send(ctx context.Context, pdus []PDU, edus []EDU) error {
+func (d *Destination) send(ctx context.Context, batch taken) error {
 	t := txn.Transaction{OriginServerTS: time.Now().UnixMilli()}
-	for _, p := range pdus {
+	for _, p := range batch.pdus {
 		t.PDUs = append(t.PDUs, p.JSON)
 	}
-	for _, e := range edus {
-		unit, err := e.materialise()
-		if err != nil {
-			return err
-		}
-		t.EDUs = append(t.EDUs, unit)
-	}
+	t.EDUs = append(t.EDUs, batch.edus...)
 
 	req, err := d.signer.Build(d.ids.Next(), d.name, t)
 	if err != nil {
@@ -469,7 +503,9 @@ func (d *Destination) TakeCatchUpSkipped() int64 {
 // being brought forward room by room and a failure should cost one room's
 // progress rather than fifty.
 func (d *Destination) SendCatchUp(ctx context.Context, p PDU) error {
-	if err := d.send(ctx, []PDU{p}, nil); err != nil {
+	// Catch-up carries no EDUs at all, so there is nothing here that another
+	// goroutine could be mutating; the batch is built from one event.
+	if err := d.send(ctx, taken{pdus: []PDU{p}}); err != nil {
 		if d.onOutcome != nil {
 			d.onOutcome(d.name, false)
 		}
