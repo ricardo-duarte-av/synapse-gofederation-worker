@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/difflog"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
 )
@@ -32,11 +33,20 @@ func (w *worker) registerMetrics() {
 // run starts every long-lived task and returns when the first one stops.
 func (w *worker) run(ctx context.Context) error {
 	key, _ := w.cfg.Synapse.SigningKey()
+	// "shadowing" is the sender whose shard we borrow, and a primary borrows
+	// nobody's -- it takes its own. Logging shadowing=<our own name> reads like
+	// a worker shadowing itself, which is a thing that cannot happen and so
+	// makes the reader doubt the rest of the line.
+	shard := "shadowing"
+	if w.cfg.Mode == config.ModePrimary {
+		shard = "shard"
+	}
 	w.log.Info().
 		Str("version", tag).
 		Str("server_name", w.cfg.ServerName).
 		Str("worker_name", w.cfg.WorkerName).
-		Str("shadowing", w.cfg.ShardInstance).
+		Str("mode", string(w.cfg.Mode)).
+		Str(shard, w.cfg.ShardInstance).
 		Strs("senders", w.cfg.Synapse.SenderInstances).
 		Str("signing_key", key.ID()).
 		Str("redis", w.cfg.RedisAddress).
