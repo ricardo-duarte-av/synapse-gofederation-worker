@@ -88,6 +88,23 @@ type EDUDiff struct {
 	// between two senders, so a reader does not treat the counts as failures.
 	Comparable bool   `json:"comparable"`
 	Note       string `json:"note,omitempty"`
+	// Implemented is false for EDU types this worker does not send at all.
+	//
+	// Without it a permanently-zero worker column reads like "none happened in
+	// this window" when it actually means "this is not built yet" -- which is
+	// exactly the kind of gap that goes unnoticed for weeks because the report
+	// looked fine.
+	Implemented bool `json:"implemented"`
+}
+
+// eduImplemented lists the EDU types this worker actually emits.
+//
+// Kept here rather than inferred from the capture, because inferring it is
+// what produces the bug: a type nobody happened to send in the sample window
+// is indistinguishable from one that was never built.
+var eduImplemented = map[string]bool{
+	"m.direct_to_device":   true,
+	"m.device_list_update": true,
 }
 
 // eduComparable says whether an EDU type's content can be compared at all.
@@ -217,6 +234,7 @@ func compareEDUs(synapse, worker map[string][]string) []EDUDiff {
 		d := EDUDiff{
 			Type: t, Synapse: len(synapse[t]), Worker: len(worker[t]),
 			Comparable: meta.comparable, Note: meta.note,
+			Implemented: eduImplemented[t],
 		}
 		if meta.comparable {
 			d.ContentBoth, d.ContentOnlySynapse, d.ContentOnlyWorker =

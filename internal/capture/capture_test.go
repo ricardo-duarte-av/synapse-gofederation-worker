@@ -317,3 +317,37 @@ func TestPDUsWithoutEventIDGetAShortContentIdentity(t *testing.T) {
 		}
 	}
 }
+
+// A zero in the worker column means two very different things, and a column of
+// numbers cannot tell them apart: "none happened in this window" or "this is
+// not built yet". The second is exactly the gap that goes unnoticed for weeks
+// because the report looked fine.
+func TestUnimplementedEDUTypesAreMarked(t *testing.T) {
+	syn := []Record{rec(SourceSynapse, "b.example", "1", nil,
+		EDU{Type: "m.typing", Content: json.RawMessage(`{"typing":true}`)},
+		EDU{Type: "m.direct_to_device", Content: json.RawMessage(`{"message_id":"m1"}`)},
+	)}
+	ours := []Record{rec(SourceWorker, "b.example", "1", nil,
+		EDU{Type: "m.direct_to_device", Content: json.RawMessage(`{"message_id":"m1"}`)},
+	)}
+
+	d, err := Compare("b.example", syn, ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byType := map[string]EDUDiff{}
+	for _, e := range d.EDUs {
+		byType[e.Type] = e
+	}
+
+	if byType["m.typing"].Implemented {
+		t.Error("m.typing is reported as implemented; this worker does not send typing")
+	}
+	if !byType["m.direct_to_device"].Implemented {
+		t.Error("m.direct_to_device is reported as unimplemented; it is sent")
+	}
+	// An unimplemented type still must not fail the PDU verdict.
+	if !d.Agreed() {
+		t.Error("an unimplemented EDU type failed the PDU verdict")
+	}
+}

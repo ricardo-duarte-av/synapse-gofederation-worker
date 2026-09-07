@@ -138,14 +138,20 @@ func report(d capture.Diff, synSkipped, workSkipped int) {
 	}
 	for _, e := range d.EDUs {
 		fmt.Printf("  %-24s synapse=%-4d worker=%-4d", e.Type, e.Synapse, e.Worker)
-		if !e.Comparable {
+		switch {
+		case !e.Implemented:
+			// Said first and said plainly. A zero here is not "none this
+			// window", it is "not built", and the two look identical in a
+			// column of numbers.
+			fmt.Printf("  NOT IMPLEMENTED by this worker\n")
+		case !e.Comparable:
 			fmt.Printf("  (content not comparable: %s)\n", e.Note)
-			continue
-		}
-		fmt.Printf("  content: both=%d only-synapse=%d only-worker=%d\n",
-			e.ContentBoth, len(e.ContentOnlySynapse), len(e.ContentOnlyWorker))
-		if e.Note != "" {
-			fmt.Printf("      note: %s\n", e.Note)
+		default:
+			fmt.Printf("  content: both=%d only-synapse=%d only-worker=%d\n",
+				e.ContentBoth, len(e.ContentOnlySynapse), len(e.ContentOnlyWorker))
+			if e.Note != "" {
+				fmt.Printf("      note: %s\n", e.Note)
+			}
 		}
 	}
 
