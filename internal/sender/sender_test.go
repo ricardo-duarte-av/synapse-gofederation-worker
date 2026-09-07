@@ -416,9 +416,16 @@ func TestFirstRunStartsFromTheTip(t *testing.T) {
 
 // Events within a room must be handled in order: a remote receiving a message
 // before the join that authorises it will reject the message.
+//
+// The ordering is asserted on what the SINK received, not on the queue's
+// residue. An earlier version sampled Pending() and LastSuccessfulStreamOrdering
+// straight after the run and accepted "0 or 20" for each, which is not an
+// assertion about ordering at all -- it is a race against the transmission
+// loop, and it duly failed on an intermediate value of 1.
 func TestEventsInARoomAreOrdered(t *testing.T) {
 	h := newHarness(t, nil)
-	for i := 0; i < 20; i++ {
+	const n = 20
+	for i := 0; i < n; i++ {
 		h.store.events = append(h.store.events,
 			event(fmt.Sprintf("$e%d", i), int64(i+1), "@u:a.example", "!r:a.example", ""))
 	}
@@ -427,14 +434,19 @@ func TestEventsInARoomAreOrdered(t *testing.T) {
 
 	h.run(t)
 
-	// The queue holds them in the order they were enqueued.
 	d := h.queues.Get("b.example")
-	pending, _ := d.Pending()
-	if pending != 0 && pending != 20 {
-		t.Logf("%d still pending (the dry-run sink drains asynchronously)", pending)
+	waitFor(t, "the queue to drain", func() bool {
+		p, e := d.Pending()
+		return p == 0 && e == 0
+	})
+
+	// Every event delivered, and the cursor at the last one. Both follow from
+	// in-order delivery and neither is racy once the queue is empty.
+	if got := d.LastSuccessfulStreamOrdering(); got != n {
+		t.Errorf("LastSuccessfulStreamOrdering = %d, want %d", got, n)
 	}
-	if got := d.LastSuccessfulStreamOrdering(); got != 0 && got != 20 {
-		t.Errorf("cursor = %d, want 0 or the last stream ordering", got)
+	if got := h.sink.Stats().PDUs; got != n {
+		t.Errorf("the sink received %d PDUs, want %d", got, n)
 	}
 }
 
@@ -458,3 +470,18 @@ func TestAuthEventsAreLoadedLazily(t *testing.T) {
 }
 
 func nowMS() int64 { return time.Now().UnixMilli() }
+
+// waitFor polls until cond holds or the deadline passes, so a test never
+// depends on a sleep being long enough. Asserting on a value sampled straight
+// after an asynchronous handoff is a race, not a test.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
