@@ -160,7 +160,7 @@ type raw struct {
 	InstanceMap map[string]struct {
 		Path string `yaml:"path"`
 		Host string `yaml:"host"`
-		Port int    `yaml:"port"`
+		Port any    `yaml:"port"`
 		TLS  bool   `yaml:"tls"`
 	} `yaml:"instance_map"`
 
@@ -168,9 +168,9 @@ type raw struct {
 		Enabled  *bool  `yaml:"enabled"`
 		Path     string `yaml:"path"`
 		Host     string `yaml:"host"`
-		Port     int    `yaml:"port"`
+		Port     any    `yaml:"port"`
 		Password string `yaml:"password"`
-		DBID     int    `yaml:"dbid"`
+		DBID     any    `yaml:"dbid"`
 	} `yaml:"redis"`
 
 	Database struct {
@@ -183,7 +183,7 @@ type raw struct {
 			Database string `yaml:"database"`
 			DBName   string `yaml:"dbname"`
 			Host     string `yaml:"host"`
-			Port     int    `yaml:"port"`
+			Port     any    `yaml:"port"`
 			SSLMode  string `yaml:"sslmode"`
 		} `yaml:"args"`
 	} `yaml:"database"`
@@ -264,10 +264,15 @@ func LoadWithOptions(path string, opts Options) (*Config, error) {
 		Enabled:  r.Redis.Enabled != nil && *r.Redis.Enabled,
 		Socket:   r.Redis.Path,
 		Password: r.Redis.Password,
-		DBID:     r.Redis.DBID,
+	}
+	if cfg.Redis.DBID, err = parseInt(r.Redis.DBID, "redis.dbid"); err != nil {
+		return nil, err
 	}
 	if cfg.Redis.Socket == "" && r.Redis.Host != "" {
-		port := r.Redis.Port
+		port, err := parseInt(r.Redis.Port, "redis.port")
+		if err != nil {
+			return nil, err
+		}
 		if port == 0 {
 			port = 6379
 		}
@@ -346,16 +351,20 @@ func instanceMap(r raw) (map[string]Instance, error) {
 		if name == "main" {
 			name = MainProcessInstanceName
 		}
+		port, err := parseInt(loc.Port, fmt.Sprintf("instance_map.%s.port", name))
+		if err != nil {
+			return nil, err
+		}
 		inst := Instance{Name: name}
 		switch {
 		case loc.Path != "":
 			inst.Socket = loc.Path
-		case loc.Host != "" && loc.Port != 0:
+		case loc.Host != "" && port != 0:
 			scheme := "http"
 			if loc.TLS {
 				scheme = "https"
 			}
-			inst.URL = fmt.Sprintf("%s://%s:%d", scheme, loc.Host, loc.Port)
+			inst.URL = fmt.Sprintf("%s://%s:%d", scheme, loc.Host, port)
 		default:
 			return nil, fmt.Errorf(
 				"synapsecfg: instance_map entry for %q has neither a path nor a host and port", name)
@@ -461,6 +470,36 @@ func instanceList(v any) ([]string, error) {
 		return out, nil
 	default:
 		return nil, fmt.Errorf("expected a string or a list, got %T", v)
+	}
+}
+
+// parseInt accepts a number or a string holding one.
+//
+// Ports and dbids are the fields this exists for. YAML makes `port: 5432` an
+// int and `port: "5432"` a string, psycopg2 and redis-py take either, and this
+// deployment's own test homeserver quotes it -- so an int-typed field turns a
+// working Synapse config into a startup failure with a message about YAML
+// types, which says nothing about what to do.
+func parseInt(v any, what string) (int, error) {
+	switch t := v.(type) {
+	case nil:
+		return 0, nil
+	case int:
+		return t, nil
+	case float64:
+		return int(t), nil
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return 0, nil
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, fmt.Errorf("synapsecfg: %s: %q is not a number", what, t)
+		}
+		return n, nil
+	default:
+		return 0, fmt.Errorf("synapsecfg: %s: expected a number, got %T", what, v)
 	}
 }
 
@@ -610,13 +649,17 @@ func database(r raw) (Database, error) {
 		return Database{}, fmt.Errorf(
 			"synapsecfg: database.name is %q; only psycopg2 is supported", name)
 	}
+	port, err := parseInt(r.Database.Args.Port, "database.args.port")
+	if err != nil {
+		return Database{}, err
+	}
 	db := Database{
 		Present:  true,
 		User:     r.Database.Args.User,
 		Password: r.Database.Args.Password,
 		DBName:   r.Database.Args.Database,
 		Host:     r.Database.Args.Host,
-		Port:     r.Database.Args.Port,
+		Port:     port,
 		SSLMode:  r.Database.Args.SSLMode,
 	}
 	if db.DBName == "" {

@@ -352,3 +352,61 @@ func TestSigningKeyMissingInBothPlacesNamesBoth(t *testing.T) {
 		t.Errorf("error names only one location: %v", err)
 	}
 }
+
+// YAML types a quoted port as a string, psycopg2 and redis-py both take one,
+// and this deployment's test homeserver writes it that way. An int-typed field
+// turned a working Synapse config into a startup failure whose message was
+// about YAML types and said nothing about what to do.
+func TestQuotedPortsAreAccepted(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimal+`
+database:
+  name: psycopg2
+  allow_unsafe_locale: true
+  args:
+    user: testingsynapse
+    password: testingsynapse
+    database: testingsynapse
+    host: "matrix-postgres"
+    port: "5432"
+    cp_min: 5
+    cp_max: 10
+redis:
+  enabled: true
+  host: testing-redis
+  port: "6379"
+  dbid: "2"
+instance_map:
+  main:
+    host: localhost
+    port: "9093"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "host=matrix-postgres port=5432 user=testingsynapse " +
+		"password=testingsynapse dbname=testingsynapse"
+	if got := cfg.Database.DSN(); got != want {
+		t.Errorf("DSN() = %q, want %q", got, want)
+	}
+	if cfg.Redis.Addr != "testing-redis:6379" {
+		t.Errorf("Redis.Addr = %q", cfg.Redis.Addr)
+	}
+	if cfg.Redis.DBID != 2 {
+		t.Errorf("Redis.DBID = %d, want 2", cfg.Redis.DBID)
+	}
+	if got := cfg.InstanceMap[MainProcessInstanceName].URL; got != "http://localhost:9093" {
+		t.Errorf("instance_map URL = %q", got)
+	}
+}
+
+// A port that is not a number at all is still an error, and it says which key.
+func TestANonNumericPortIsAnError(t *testing.T) {
+	_, err := Load(writeConfig(t, minimal+
+		"database:\n  name: psycopg2\n  args:\n    database: d\n    port: \"not-a-port\"\n"))
+	if err == nil {
+		t.Fatal("a non-numeric port was accepted")
+	}
+	if !strings.Contains(err.Error(), "database.args.port") {
+		t.Errorf("error does not name the key: %v", err)
+	}
+}
