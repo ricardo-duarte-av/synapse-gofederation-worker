@@ -41,6 +41,29 @@ It is on by default, because the dangerous configuration is the one this worker
 starts life in. `queue.transaction_id_prefix: ""` turns it off, and is only
 safe once no other sender delivers to any destination this worker handles.
 
+### There is no way to tell Synapse to skip one destination
+
+Worth stating plainly, because it is the obvious thing to reach for and it does
+not exist.
+
+- **`federation_domain_whitelist`** is a whitelist, not a denylist
+  (`config/federation.py:97`). Setting it restricts the homeserver to ONLY the
+  listed domains; there is no way to subtract one.
+- **No denylist exists.** The whitelist is the only destination filter the
+  sender applies.
+- **The module callback is an observer, not a decision hook.**
+  `notify_on_event_delivered_over_federation` fires at
+  `transaction_manager.py:226`, *after* a successful send. Modules are told what
+  was delivered; they cannot stop a delivery.
+- **Patching Synapse** would work -- the deployment already has a patch
+  mechanism in `patches/patches.sh`, currently all commented out -- but
+  carrying a local patch on a production homeserver to accommodate a test is a
+  worse trade than accepting deduplicated duplicates on a server we own.
+
+So while this worker is not a member of `federation_sender_instances`, any
+destination it sends to is served by two senders. That is not a configuration
+mistake to be fixed; it is the shape of the problem.
+
 ### Why duplicate delivery is worth accepting for the test destination
 
 Device EDU **content** cannot be verified while shadowing at all: a real sender
