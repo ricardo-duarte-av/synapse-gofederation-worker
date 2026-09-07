@@ -248,3 +248,20 @@ cursor into `destination_rooms`, not a delivery receipt.
 
 A fresh destination with no `last_successful_stream_ordering` row exits catch-up
 immediately and never replays history.
+
+## 10. What a federation sender does NOT use
+
+Worth stating, because it saves reading the config in alarm later.
+
+A federation sender is not a stream writer, so nothing addresses it through
+`instance_map`. The one setting that would make other workers call a sender over
+HTTP replication is `outbound_federation_restricted_to`
+(`config/workers.py:483`, used at `matrixfederationclient.py:422`), which makes
+every other worker proxy its outbound federation requests through the named
+instances. It is unset on this deployment, and while it is unset a sender's
+`instance_map` entry and its replication listener are inert — a duplicated or
+wrong socket path there has no effect.
+
+This worker never makes replication HTTP calls at all: it reads Redis and
+PostgreSQL and nothing else. `instance_map` is parsed only so startup can say
+something useful if a configured sender has no address.
