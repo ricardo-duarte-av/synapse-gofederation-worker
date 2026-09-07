@@ -64,6 +64,41 @@ Three tables would be actively destructive to touch:
 `destinations` and `destination_rooms` are less dramatic but still shared state
 driving both real senders' backoff and catch-up.
 
+### `destinations` retry timings are not ours to write, even as a primary
+
+A primary sender writes Synapse's tables by design — that is what primary mode
+is. The retry columns of `destinations` are the exception, and the reason is a
+cache rather than a permission.
+
+`get_destination_retry_timings` is `@cached` (`transactions.py:169`), and
+Synapse invalidates it only from its own write path, which streams the
+invalidation to every other process (`transactions.py:302`). A write from out
+here does the write and not the invalidation, so every Synapse process goes on
+serving what it cached. The harmful direction is the one that matters most:
+**we clear a backoff when a destination recovers, and Synapse keeps refusing to
+talk to a server that is up** — for as long as the cached interval says, which
+on Synapse's defaults is up to seven days. That suppresses key queries, device
+list resyncs and media fetches, not just federation sending. It self-heals only
+when the far side happens to send us something, because the inbound path resets
+the timings properly (`transport/server/_base.py:143`).
+
+Publishing the invalidation on the `caches` stream is the obvious fix and is a
+worse trade. It makes this worker a writer of that stream, and
+`MultiWriterIdGenerator` computes the stream's persisted-upto position as the
+minimum across the *other* writers' positions (`id_generators.py:787`). A
+writer that publishes once and then goes quiet — exactly the shape of a
+backoff, rare and bursty — pins that position in every Synapse process, freezing
+cache-invalidation cleanup and anything waiting on the stream. Our worker being
+idle, or simply stopped, would then degrade the homeserver. That is the
+perturbation the subscribe-only rule exists to prevent, and it is a worse
+failure than a stale read.
+
+So the backoff lives in `gofederation.destination_retry`, in the schema we own,
+where nothing else has cached it. Synapse keeps its own for its own outbound
+requests, written and invalidated by Synapse, exactly as when no sender of ours
+is running. `last_successful_stream_ordering` and `destination_rooms` are still
+written: both are read straight from the database and cached nowhere.
+
 ## 3. Keep our own positions
 
 Follows from (2). We cannot use `federation_stream_position`, and we cannot mark

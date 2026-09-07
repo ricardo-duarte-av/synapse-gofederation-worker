@@ -57,6 +57,36 @@ CREATE TABLE IF NOT EXISTS gofederation.destination_rooms (
     PRIMARY KEY (instance_name, destination, room_id)
 );
 
+-- THIS SENDER's per-destination backoff.
+--
+-- Synapse keeps the same thing in its `destinations` table, and this
+-- deliberately does not go there. Synapse caches those timings in every process
+-- (get_destination_retry_timings, transactions.py:169) and only its own writes
+-- invalidate the cache, streaming the invalidation to the other processes. A
+-- write from outside Synapse does the write and not the invalidation, so every
+-- process serves what it cached -- and a backoff we CLEARED when a destination
+-- recovered would keep Synapse from talking to a server that is up, for as long
+-- as the cached interval says. With Synapse's defaults that is up to seven days.
+--
+-- Publishing the invalidation on the caches stream would be worse: it makes
+-- this worker a writer of that stream, whose persisted-upto position is the
+-- minimum across the other writers (id_generators.py:787), so a worker that
+-- publishes rarely -- which is exactly the shape of a backoff -- pins that
+-- position in every Synapse process for as long as it stays quiet.
+--
+-- Matches state.retry_table in gofederation-worker.yaml.
+CREATE TABLE IF NOT EXISTS gofederation.destination_retry (
+    instance_name  TEXT NOT NULL,
+    destination    TEXT NOT NULL,
+    -- Milliseconds since epoch, matching Synapse's columns. Zero everywhere
+    -- means the destination is not backing off.
+    failure_ts     BIGINT NOT NULL,
+    retry_last_ts  BIGINT NOT NULL,
+    retry_interval BIGINT NOT NULL,
+    updated_ts     BIGINT NOT NULL,
+    PRIMARY KEY (instance_name, destination)
+);
+
 -- The comparison scans by ordering to pick a settled window.
 CREATE INDEX IF NOT EXISTS gofederation_destination_rooms_ordering
     ON gofederation.destination_rooms (instance_name, stream_ordering);
@@ -66,6 +96,7 @@ CREATE INDEX IF NOT EXISTS gofederation_destination_rooms_ordering
 GRANT USAGE ON SCHEMA gofederation TO gofed_state;
 GRANT SELECT, INSERT, UPDATE, DELETE ON gofederation.stream_positions TO gofed_state;
 GRANT SELECT, INSERT, UPDATE, DELETE ON gofederation.destination_rooms TO gofed_state;
+GRANT SELECT, INSERT, UPDATE, DELETE ON gofederation.destination_retry TO gofed_state;
 
 -- The comparison reads Synapse's destination_rooms alongside ours. That is the
 -- ONE Synapse table this role may see, and read-only: it is the oracle, not

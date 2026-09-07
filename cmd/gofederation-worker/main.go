@@ -216,6 +216,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		DSN:            cfg.StateDSN,
 		Table:          cfg.State.Table,
 		RoutesTable:    cfg.State.RoutesTable,
+		RetryTable:     cfg.State.RetryTable,
 		InstanceName:   cfg.WorkerName,
 		MaxConns:       4,
 		ConnectTimeout: cfg.ConnectTimeout(),
@@ -313,20 +314,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			Multiplier:  cfg.Synapse.Retry.Multiplier,
 			MaxInterval: cfg.Synapse.Retry.MaxInterval,
 		},
-		func(ctx context.Context, dests []string) (map[string]retry.Timings, error) {
-			timings, err := w.db.GetDestinationRetryTimings(ctx, dests)
-			if err != nil {
-				return nil, err
-			}
-			out := make(map[string]retry.Timings, len(timings))
-			for d, t := range timings {
-				out[d] = retry.Timings{
-					FailureTS: t.FailureTS, RetryLastTS: t.RetryLastTS,
-					RetryInterval: t.RetryInterval,
-				}
-			}
-			return out, nil
-		},
+		w.loadTimings,
 		w.persistTimings,
 	)
 	w.limiter.SetOnRecovered(func(destination string) {

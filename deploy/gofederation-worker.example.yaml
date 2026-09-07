@@ -136,6 +136,15 @@ state:
   # Our copy of Synapse's destination_rooms, which the routing comparison
   # joins against. See docs/verification.md.
   routes_table: gofederation.destination_rooms
+  # This sender's per-destination backoff.
+  #
+  # Ours rather than Synapse's `destinations` table on purpose: Synapse caches
+  # those timings in every process and only its own writes invalidate the
+  # cache, so a backoff cleared from out here would keep Synapse from talking
+  # to a server that is back up. Empty keeps the backoff in memory only, which
+  # forgets on every restart that a quarter of the destination list has been
+  # dead for years.
+  retry_table: gofederation.destination_retry
 
 replication:
   enabled: true

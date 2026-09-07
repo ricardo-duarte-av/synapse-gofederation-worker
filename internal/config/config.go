@@ -178,6 +178,17 @@ type StateConfig struct {
 	// RoutesTable holds our copy of Synapse's destination_rooms, which is what
 	// the routing comparison joins against. Empty disables route recording.
 	RoutesTable string `yaml:"routes_table"`
+
+	// RetryTable holds THIS sender's per-destination backoff.
+	//
+	// Deliberately ours rather than Synapse's `destinations`: Synapse caches
+	// those timings in every process and only its own writes invalidate the
+	// cache, so a backoff written or cleared from out here would be served
+	// stale indefinitely. See internal/state.SetRetryTimings for why
+	// publishing the invalidation instead would be worse. Empty keeps the
+	// backoff in memory for this process's lifetime, which loses it on every
+	// restart.
+	RetryTable string `yaml:"retry_table"`
 }
 
 // ReplicationConfig is the Redis subscription.
@@ -268,6 +279,7 @@ func Parse(data []byte) (*Config, error) {
 		State: StateConfig{
 			Table:       "gofederation.stream_positions",
 			RoutesTable: "gofederation.destination_rooms",
+			RetryTable:  "gofederation.destination_retry",
 		},
 		Queue: QueueConfig{
 			MaxConcurrentDestinations: 2000,

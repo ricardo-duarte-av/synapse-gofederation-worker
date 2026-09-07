@@ -30,6 +30,7 @@ func liveState(t *testing.T, instance string) *Store {
 	s, err := Open(ctx, Config{
 		DSN:            dsn,
 		Table:          "gofederation.stream_positions",
+		RetryTable:     "gofederation.destination_retry",
 		InstanceName:   instance,
 		MaxConns:       4,
 		ConnectTimeout: 10 * time.Second,
@@ -162,5 +163,106 @@ func TestLiveOpenRejectsMissingTable(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Open succeeded against a table that does not exist")
+	}
+}
+
+// The backoff lives in our schema rather than Synapse's `destinations` because
+// Synapse caches that table and only its own writes invalidate the cache. These
+// exercise the upsert, which like the others names its conflict target through
+// a schema-qualified table -- a runtime error when written wrong, not a compile
+// error.
+func TestLiveRetryTimings(t *testing.T) {
+	s := liveState(t, "test-"+t.Name())
+	ctx := context.Background()
+
+	// Nothing recorded is not the same as a zero backoff: an absent row means
+	// this sender has never had an opinion about the destination, so the
+	// caller falls back to Synapse's.
+	got, err := s.GetRetryTimings(ctx, []string{"a.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["a.example"]; ok {
+		t.Error("an unwritten destination came back with timings")
+	}
+
+	want := RetryTimings{FailureTS: 1000, RetryLastTS: 2000, RetryInterval: 60_000}
+	if err := s.SetRetryTimings(ctx, "a.example", want); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetRetryTimings(ctx, []string{"a.example", "b.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["a.example"] != want {
+		t.Errorf("timings = %+v, want %+v", got["a.example"], want)
+	}
+	if _, ok := got["b.example"]; ok {
+		t.Error("a destination we never wrote came back")
+	}
+
+	// A recovery clears it, and must overwrite rather than insert a second row.
+	if err := s.SetRetryTimings(ctx, "a.example", RetryTimings{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetRetryTimings(ctx, []string{"a.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["a.example"] != (RetryTimings{}) {
+		t.Errorf("timings = %+v, want cleared", got["a.example"])
+	}
+}
+
+// Two senders sharing a database must not overwrite each other's view of a
+// destination -- the same reason the cursors are keyed by instance.
+func TestLiveRetryTimingsAreIsolatedByInstance(t *testing.T) {
+	a := liveState(t, "test-retry-a")
+	b := liveState(t, "test-retry-b")
+	ctx := context.Background()
+
+	if err := a.SetRetryTimings(ctx, "shared.example",
+		RetryTimings{FailureTS: 1, RetryLastTS: 1, RetryInterval: 99}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetRetryTimings(ctx, "shared.example", RetryTimings{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := a.GetRetryTimings(ctx, []string{"shared.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["shared.example"].RetryInterval != 99 {
+		t.Errorf("one instance's write clobbered another's: %+v", got["shared.example"])
+	}
+}
+
+// Empty RetryTable is the in-memory-only configuration; it must be a no-op
+// rather than a query against a table that does not exist.
+func TestLiveRetryTimingsDisabled(t *testing.T) {
+	dsn := os.Getenv("STATE_DSN")
+	if dsn == "" {
+		t.Skip("set STATE_DSN to run against a real PostgreSQL")
+	}
+	ctx := context.Background()
+	s, err := Open(ctx, Config{
+		DSN: dsn, Table: "gofederation.stream_positions",
+		InstanceName: "test-retry-off", MaxConns: 2, ConnectTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+
+	if err := s.SetRetryTimings(ctx, "a.example", RetryTimings{RetryInterval: 1}); err != nil {
+		t.Errorf("writing with no retry table configured: %v", err)
+	}
+	got, err := s.GetRetryTimings(ctx, []string{"a.example"})
+	if err != nil {
+		t.Errorf("reading with no retry table configured: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing", got)
 	}
 }

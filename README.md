@@ -124,8 +124,8 @@ psql -h /var/sockets -U synapse -d synapse-db -f deploy/readonly-role.sql
 psql -h /var/sockets -U synapse -d synapse-db -f deploy/state-role.sql
 ```
 
-`state-role.sql` also creates the two tables the worker keeps its cursors and
-routing record in. **They are not created at runtime** — a missing one is a
+`state-role.sql` also creates the three tables the worker keeps its cursors,
+routing record and per-destination backoff in. **They are not created at runtime** — a missing one is a
 startup failure naming the file to run, because a worker that can create tables
 is a worker that can create them in the wrong database on the day somebody
 points it at the wrong one. Where the worker connects as *Synapse's* role

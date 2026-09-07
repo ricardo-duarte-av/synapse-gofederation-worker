@@ -4,8 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/retry"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/state"
 )
 
 // bookkeepingTimeout bounds one write. Generous, because losing a deletion is
@@ -133,21 +135,24 @@ func (w *worker) onSendOutcome(destination string, delivered bool) {
 		Msg("destination failed; backing off")
 }
 
-// persistTimings writes a destination's backoff, in primary mode only.
+// persistTimings writes a destination's backoff to OUR table, in primary mode.
 //
-// A shadow keeps the backoff in memory for its own lifetime and writes nothing:
-// destinations is the real senders' bookkeeping and a shadow that wrote it
-// would change their behaviour, which is the one thing it must never do.
+// Not Synapse's `destinations`, even though that is where a Python sender keeps
+// it and we are otherwise doing a sender's bookkeeping. Synapse caches those
+// timings and only its own writes invalidate the cache, so a backoff we cleared
+// from outside the process would go on suppressing Synapse's own outbound
+// federation for as long as the cached interval said. The full reasoning, and
+// why publishing the invalidation would be worse, is on state.SetRetryTimings.
+//
+// A shadow persists nothing at all: it keeps the backoff in memory for its own
+// lifetime, because writing anywhere is what a shadow must never do.
 func (w *worker) persistTimings(ctx context.Context, destination string, t retry.Timings) error {
-	if w.writer == nil {
+	if w.writer == nil || w.cursors == nil {
 		return nil
 	}
-	var err error
-	if t.RetryInterval == 0 && t.RetryLastTS == 0 {
-		err = w.writer.ClearDestinationRetryTimings(ctx, destination)
-	} else {
-		err = w.writer.SetDestinationRetryTimings(ctx, destination, t.FailureTS, t.RetryLastTS, t.RetryInterval)
-	}
+	err := w.cursors.SetRetryTimings(ctx, destination, state.RetryTimings{
+		FailureTS: t.FailureTS, RetryLastTS: t.RetryLastTS, RetryInterval: t.RetryInterval,
+	})
 	if err != nil {
 		metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
 		w.log.Error().Err(err).Str("destination", destination).Msg("failed to persist a backoff")
@@ -155,4 +160,43 @@ func (w *worker) persistTimings(ctx context.Context, destination string, t retry
 	}
 	metrics.WriteOps.WithLabelValues("retry_timings", "ok").Inc()
 	return nil
+}
+
+// loadTimings seeds the backoff for destinations this process has not seen yet.
+//
+// Ours first, Synapse's as a fallback, and the fallback is not a leftover: a
+// primary taking over from a Python sender starts with an empty table of its
+// own, and a quarter of a real destination list has been unreachable for years.
+// Ignoring that would mean waking every dead server once on every deploy.
+//
+// A shadow reads only Synapse's, which is the point of a shadow: it must make
+// the same decisions from the same state as the sender it is compared against.
+func (w *worker) loadTimings(ctx context.Context, dests []string) (map[string]retry.Timings, error) {
+	out := make(map[string]retry.Timings, len(dests))
+
+	synapse, err := w.db.GetDestinationRetryTimings(ctx, dests)
+	if err != nil {
+		return nil, err
+	}
+	for d, t := range synapse {
+		out[d] = retry.Timings{
+			FailureTS: t.FailureTS, RetryLastTS: t.RetryLastTS, RetryInterval: t.RetryInterval,
+		}
+	}
+
+	// Ours wins where it exists, because it is the only record of what THIS
+	// sender has seen. Synapse's row for the same destination is its client's
+	// experience, which is a different question and may be much older.
+	if w.cfg.Mode == config.ModePrimary && w.cursors != nil {
+		mine, err := w.cursors.GetRetryTimings(ctx, dests)
+		if err != nil {
+			return nil, err
+		}
+		for d, t := range mine {
+			out[d] = retry.Timings{
+				FailureTS: t.FailureTS, RetryLastTS: t.RetryLastTS, RetryInterval: t.RetryInterval,
+			}
+		}
+	}
+	return out, nil
 }

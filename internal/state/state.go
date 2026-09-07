@@ -40,6 +40,8 @@ type Store struct {
 	table string
 	// routesTable mirrors Synapse's destination_rooms, for the comparison.
 	routesTable string
+	// retryTable holds our own per-destination backoff. Empty disables it.
+	retryTable string
 	// instance is the sender we impersonate, so two shadows of two different
 	// senders can share a database without overwriting each other.
 	instance string
@@ -52,7 +54,12 @@ type Config struct {
 	// RoutesTable holds our copy of Synapse's destination_rooms. Empty
 	// disables route recording, which only makes sense for a worker that is
 	// not being compared against anything.
-	RoutesTable    string
+	RoutesTable string
+	// RetryTable holds our own per-destination backoff, kept out of Synapse's
+	// `destinations` table because Synapse caches that one and only its own
+	// writes invalidate the cache. See SetRetryTimings. Empty keeps the backoff
+	// in memory for this process's lifetime only.
+	RetryTable     string
 	InstanceName   string
 	MaxConns       int32
 	ConnectTimeout time.Duration
@@ -83,7 +90,8 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("state: connect: %w", err)
 	}
-	s := &Store{pool: pool, table: cfg.Table, routesTable: cfg.RoutesTable, instance: cfg.InstanceName}
+	s := &Store{pool: pool, table: cfg.Table, routesTable: cfg.RoutesTable,
+		retryTable: cfg.RetryTable, instance: cfg.InstanceName}
 
 	// Read one row rather than merely pinging. The failure this catches is the
 	// state role being pointed at a database where the schema was never
@@ -214,6 +222,98 @@ func (s *Store) RecordRoutes(ctx context.Context, routes []RoutedRoom) error {
 	_, err := s.pool.Exec(ctx, q, s.instance, dests, rooms, orders, time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("state: record routes: %w", err)
+	}
+	return nil
+}
+
+// RetryTimings is one destination's backoff.
+type RetryTimings struct {
+	// FailureTS is when the destination started failing, or zero.
+	FailureTS int64
+	// RetryLastTS is the last attempt, and RetryInterval how long to wait from
+	// it. Both zero means the destination is not backing off.
+	RetryLastTS   int64
+	RetryInterval int64
+}
+
+// GetRetryTimings reads the persisted backoff for some destinations.
+//
+// Ours rather than Synapse's `destinations` table, and the reason is not
+// tidiness -- see SetRetryTimings.
+func (s *Store) GetRetryTimings(ctx context.Context, destinations []string) (map[string]RetryTimings, error) {
+	if s.retryTable == "" || len(destinations) == 0 {
+		return nil, nil
+	}
+	q := fmt.Sprintf(`
+		SELECT destination, failure_ts, retry_last_ts, retry_interval
+		FROM %s WHERE instance_name = $1 AND destination = ANY($2)`, s.retryTable)
+
+	rows, err := s.pool.Query(ctx, q, s.instance, destinations)
+	if err != nil {
+		return nil, fmt.Errorf("state: get retry timings: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]RetryTimings)
+	for rows.Next() {
+		var d string
+		var t RetryTimings
+		if err := rows.Scan(&d, &t.FailureTS, &t.RetryLastTS, &t.RetryInterval); err != nil {
+			return nil, fmt.Errorf("state: get retry timings: %w", err)
+		}
+		out[d] = t
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: get retry timings: %w", err)
+	}
+	return out, nil
+}
+
+// SetRetryTimings writes one destination's backoff. Zero timings clear it.
+//
+// This is deliberately NOT Synapse's `destinations` table, which is where a
+// Python sender keeps the same thing. Synapse caches those timings
+// (get_destination_retry_timings is @cached, transactions.py:169) and
+// invalidates the cache only from its own write path, by streaming the
+// invalidation to every other process. A write from outside Synapse cannot do
+// that, so every process would go on serving the value it cached before we
+// wrote -- and the harmful direction is the one that matters most: we clear a
+// backoff when a destination recovers, Synapse keeps refusing to talk to a
+// server that is now up, for as long as the cached interval says, which with
+// Synapse's defaults is up to seven days.
+//
+// The obvious fix -- publish the invalidation on the caches stream -- is worse
+// than the problem. It would make this worker a writer of that stream, and
+// MultiWriterIdGenerator computes the stream's persisted-upto position as the
+// minimum across the OTHER writers' positions (id_generators.py:787). A writer
+// that publishes once and then goes quiet -- which is exactly the shape of a
+// backoff, rare and bursty -- pins that position in every Synapse process,
+// freezing cache-invalidation cleanup and anything waiting on the stream. Our
+// worker being idle or stopped would then degrade the homeserver. That is the
+// perturbation the subscribe-only rule exists to prevent (see
+// internal/replication), and it is a worse failure than a stale read.
+//
+// So the backoff lives here, in the schema we own, where nothing else has
+// cached it. Synapse still keeps its own for its own outbound requests, written
+// and invalidated by Synapse, exactly as it does when no sender is running.
+func (s *Store) SetRetryTimings(ctx context.Context, destination string, t RetryTimings) error {
+	if s.retryTable == "" {
+		return nil
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (instance_name, destination, failure_ts, retry_last_ts,
+		                retry_interval, updated_ts)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (instance_name, destination) DO UPDATE
+		SET failure_ts = EXCLUDED.failure_ts,
+		    retry_last_ts = EXCLUDED.retry_last_ts,
+		    retry_interval = EXCLUDED.retry_interval,
+		    updated_ts = EXCLUDED.updated_ts`, s.retryTable)
+
+	_, err := s.pool.Exec(ctx, q, s.instance, destination,
+		t.FailureTS, t.RetryLastTS, t.RetryInterval, time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("state: set retry timings for %s: %w", destination, err)
 	}
 	return nil
 }
