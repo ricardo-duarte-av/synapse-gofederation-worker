@@ -42,15 +42,25 @@ func (w *worker) run(ctx context.Context) error {
 		Str("redis", w.cfg.RedisAddress).
 		Str("channel", w.cfg.RedisChannel).
 		Bool("shadow", w.cfg.ShadowEnabled()).
+		Str("sink", w.sinkMode()).
 		Msg("starting")
 
-	if w.cfg.ShadowEnabled() {
-		// Said plainly and at info level, because the one thing an operator
-		// must never be unsure about is whether this process is putting
-		// federation traffic on the wire.
+	// Said plainly and at info level, because the one thing an operator must
+	// never be unsure about is whether this process is putting federation
+	// traffic on the internet.
+	switch {
+	case w.cfg.ShadowEnabled():
 		w.log.Info().Msg(
 			"SHADOW MODE: transactions will be built and signed but never sent, " +
 				"and no Synapse table will be written")
+	case w.cfg.Shadow.SendToAll:
+		w.log.Warn().Msg(
+			"LIVE: sending real federation traffic to EVERY destination in this shard")
+	default:
+		w.log.Warn().
+			Strs("destinations", w.router.Allowed()).
+			Msg("LIVE: sending real federation traffic to the allowlisted destinations only; " +
+				"every other destination is still dry-run")
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -144,4 +154,12 @@ func (w *worker) serveMetrics(ctx context.Context) error {
 		return err
 	}
 	return ctx.Err()
+}
+
+// sinkMode describes where transactions go, for the startup line.
+func (w *worker) sinkMode() string {
+	if w.router != nil {
+		return w.router.Mode()
+	}
+	return "dry-run (shadow; nothing is sent)"
 }

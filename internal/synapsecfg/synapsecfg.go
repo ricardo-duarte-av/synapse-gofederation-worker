@@ -80,6 +80,14 @@ type Retry struct {
 	MaxInterval time.Duration
 }
 
+// Synapse's per-request retry defaults for outbound federation, from
+// synapse/config/federation.py:67. This deployment tightens all of them.
+const (
+	DefaultClientTimeout     = 60 * time.Second
+	DefaultMaxLongRetries    = 10
+	DefaultMaxLongRetryDelay = 60 * time.Second
+)
+
 // Config is the subset of homeserver.yaml this worker needs.
 type Config struct {
 	// Path is the file this was read from, kept for error messages and for
@@ -104,6 +112,14 @@ type Config struct {
 
 	Redis Redis
 	Retry Retry
+
+	// ClientTimeout, MaxLongRetries and MaxLongRetryDelay bound ONE outbound
+	// request. Distinct from Retry, which is the per-destination backoff that
+	// persists across transactions: these govern a single PUT to /send, which
+	// Synapse issues with long_retries=True (transport/client.py:257).
+	ClientTimeout     time.Duration
+	MaxLongRetries    int
+	MaxLongRetryDelay time.Duration
 
 	// DomainWhitelist is federation_domain_whitelist. Nil means no whitelist
 	// (send to everyone); an empty non-nil map means send to nobody, which is
@@ -150,6 +166,11 @@ type raw struct {
 		DestinationMinRetryInterval any     `yaml:"destination_min_retry_interval"`
 		DestinationRetryMultiplier  float64 `yaml:"destination_retry_multiplier"`
 		DestinationMaxRetryInterval any     `yaml:"destination_max_retry_interval"`
+		ClientTimeout               any     `yaml:"client_timeout"`
+		MaxLongRetries              *int    `yaml:"max_long_retries"`
+		MaxLongRetryDelay           any     `yaml:"max_long_retry_delay"`
+		MaxShortRetries             *int    `yaml:"max_short_retries"`
+		MaxShortRetryDelay          any     `yaml:"max_short_retry_delay"`
 	} `yaml:"federation"`
 
 	FederationDomainWhitelist []string `yaml:"federation_domain_whitelist"`
@@ -193,6 +214,9 @@ func LoadWithOptions(path string, opts Options) (*Config, error) {
 			Multiplier:  DefaultDestinationRetryMultiplier,
 			MaxInterval: DefaultDestinationMaxRetryInterval,
 		},
+		ClientTimeout:     DefaultClientTimeout,
+		MaxLongRetries:    DefaultMaxLongRetries,
+		MaxLongRetryDelay: DefaultMaxLongRetryDelay,
 	}
 
 	if cfg.SenderInstances, err = senderInstances(r); err != nil {
@@ -231,6 +255,19 @@ func LoadWithOptions(path string, opts Options) (*Config, error) {
 	}
 	if r.Federation.DestinationRetryMultiplier != 0 {
 		cfg.Retry.Multiplier = r.Federation.DestinationRetryMultiplier
+	}
+	if d, ok, err := parseDuration(r.Federation.ClientTimeout); err != nil {
+		return nil, fmt.Errorf("synapsecfg: federation.client_timeout: %w", err)
+	} else if ok {
+		cfg.ClientTimeout = d
+	}
+	if d, ok, err := parseDuration(r.Federation.MaxLongRetryDelay); err != nil {
+		return nil, fmt.Errorf("synapsecfg: federation.max_long_retry_delay: %w", err)
+	} else if ok {
+		cfg.MaxLongRetryDelay = d
+	}
+	if r.Federation.MaxLongRetries != nil {
+		cfg.MaxLongRetries = *r.Federation.MaxLongRetries
 	}
 
 	// Nil and empty mean opposite things here, so the map is only allocated

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const minimal = `
 worker_name: av-gofederation-worker-1
@@ -55,6 +58,7 @@ synapse_config: /etc/synapse/homeserver.yaml
 shadow:
   enabled: false
   instance: av-federation-sender-worker-1
+  send_only_to: [testing.aguiarvieira.pt]
 database:
   dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
 `))
@@ -115,5 +119,85 @@ func TestRejectsBadLogLevel(t *testing.T) {
 	}
 	if _, err := Parse([]byte(minimal + "\nlog:\n  level: debug\n")); err != nil {
 		t.Fatalf("debug should be accepted: %v", err)
+	}
+}
+
+// Leaving shadow mode is the one change here with consequences outside the
+// process, so an ambiguous configuration is refused rather than resolved.
+func TestLeavingShadowModeRequiresAnExplicitTarget(t *testing.T) {
+	live := `
+worker_name: av-gofederation-worker-1
+synapse_config: /etc/synapse/homeserver.yaml
+shadow:
+  enabled: false
+  instance: av-federation-sender-worker-1
+database:
+  dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+`
+	if _, err := Parse([]byte(live)); err == nil {
+		t.Fatal("shadow.enabled: false was accepted with no send target; " +
+			"it must not be unclear whether real traffic is sent")
+	}
+
+	// An allowlist is a valid target.
+	withAllowlist := strings.Replace(live,
+		"  instance: av-federation-sender-worker-1\n",
+		"  instance: av-federation-sender-worker-1\n  send_only_to: [testing.aguiarvieira.pt]\n", 1)
+	cfg, err := Parse([]byte(withAllowlist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ShadowEnabled() || len(cfg.Shadow.SendOnlyTo) != 1 {
+		t.Errorf("got %+v", cfg.Shadow)
+	}
+
+	// So is sending to everything, but only when asked for by name.
+	withAll := strings.Replace(live,
+		"  instance: av-federation-sender-worker-1\n",
+		"  instance: av-federation-sender-worker-1\n  send_to_all: true\n", 1)
+	if _, err := Parse([]byte(withAll)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The two options contradict each other, so neither is assumed.
+func TestSendToAllAndAllowlistTogetherIsRefused(t *testing.T) {
+	_, err := Parse([]byte(`
+worker_name: av-gofederation-worker-1
+synapse_config: /etc/synapse/homeserver.yaml
+shadow:
+  enabled: false
+  instance: av-federation-sender-worker-1
+  send_to_all: true
+  send_only_to: [testing.aguiarvieira.pt]
+database:
+  dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+`))
+	if err == nil {
+		t.Fatal("send_to_all and send_only_to were accepted together")
+	}
+}
+
+// An allowlist set while still shadowing is harmless and must not be an error:
+// it is how a config is staged before the switch is flipped.
+func TestAllowlistIsAllowedWhileStillShadowing(t *testing.T) {
+	cfg, err := Parse([]byte(`
+worker_name: av-gofederation-worker-1
+synapse_config: /etc/synapse/homeserver.yaml
+shadow:
+  instance: av-federation-sender-worker-1
+  difflog_dir: /data/difflog
+  send_only_to: [testing.aguiarvieira.pt]
+database:
+  dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ShadowEnabled() {
+		t.Error("shadow mode was turned off by setting an allowlist")
+	}
+	if len(cfg.Shadow.SendOnlyTo) != 1 {
+		t.Errorf("SendOnlyTo = %v", cfg.Shadow.SendOnlyTo)
 	}
 }

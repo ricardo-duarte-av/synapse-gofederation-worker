@@ -87,6 +87,22 @@ type ShadowConfig struct {
 
 	// CaptureFile is where those recordings go.
 	CaptureFile string `yaml:"capture_file"`
+
+	// SendOnlyTo is the send allowlist: destinations this worker REALLY sends
+	// to. Everything else is dry-run, even when shadow.enabled is false.
+	//
+	// This is how going live happens -- one destination at a time, starting
+	// with a test homeserver we control -- rather than all of them at once.
+	// An empty list sends to nobody; that is the safe reading and it is not
+	// overridable by accident. See SendToAll.
+	SendOnlyTo []string `yaml:"send_only_to"`
+
+	// SendToAll makes this worker send to every destination in its shard.
+	//
+	// The end state, and the one that carries real consequence, so it is a
+	// separate option rather than a property of leaving send_only_to empty.
+	// Nobody should reach production federation traffic by deleting a line.
+	SendToAll bool `yaml:"send_to_all"`
 }
 
 // DatabaseConfig is the read-only connection to Synapse's database.
@@ -273,6 +289,21 @@ func (c *Config) validate() error {
 	} {
 		if f.value < 1 {
 			return fmt.Errorf("config: %s must be at least 1, got %d", f.name, f.value)
+		}
+	}
+	if !c.ShadowEnabled() {
+		// Leaving shadow mode is the one change here with consequences
+		// outside this process, so an ambiguous configuration is refused
+		// rather than resolved.
+		if !c.Shadow.SendToAll && len(c.Shadow.SendOnlyTo) == 0 {
+			return fmt.Errorf("config: shadow.enabled is false but neither " +
+				"shadow.send_only_to nor shadow.send_to_all is set; refusing to start " +
+				"in a state where it is unclear whether this worker sends real " +
+				"federation traffic")
+		}
+		if c.Shadow.SendToAll && len(c.Shadow.SendOnlyTo) > 0 {
+			return fmt.Errorf("config: shadow.send_to_all and shadow.send_only_to are " +
+				"both set; they contradict each other, so neither is assumed")
 		}
 	}
 	if len(c.Shadow.CaptureDestinations) > 0 && c.Shadow.CaptureFile == "" {

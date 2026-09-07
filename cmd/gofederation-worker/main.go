@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -147,6 +146,8 @@ type worker struct {
 	cursors *state.Store
 	diff    *difflog.Writer
 	capture *capture.WorkerCapture
+	// router is set only outside shadow mode; it owns the send allowlist.
+	router  *sink.Router
 	queues  *queue.Manager
 	sender  *sender.Sender
 	devices *sender.Devices
@@ -232,27 +233,36 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			Msg("recording full transactions for comparison")
 	}
 
-	var out sink.Sink
-	if cfg.ShadowEnabled() {
-		dry := sink.NewDryRun(log)
-		if w.capture != nil {
-			dry.SetCapture(w.capture)
-		}
-		dry.SetOnSent(func(pdus, edus, bytes int) {
-			metrics.Transactions.Inc()
-			metrics.TransactionPDUs.Add(float64(pdus))
-			metrics.TransactionEDUs.Add(float64(edus))
-			metrics.TransactionBytes.Add(float64(bytes))
-			if w.diff != nil {
-				w.diff.RecordTransaction(pdus, edus)
-			}
+	// The dry-run sink always exists: it is where every destination that is not
+	// on the send allowlist goes, including in live mode.
+	dry := sink.NewDryRun(log)
+	dry.SetOnSent(w.countTransaction)
+	if w.capture != nil {
+		dry.SetCapture(w.capture)
+	}
+
+	var out sink.Sink = dry
+	if !cfg.ShadowEnabled() {
+		live := sink.NewHTTP(sink.HTTPConfig{
+			Log:       log,
+			UserAgent: "synapse-gofederation-worker/" + tag,
+			Timeout:   cfg.Synapse.ClientTimeout,
+			Retries:   cfg.Synapse.MaxLongRetries,
+			MaxDelay:  cfg.Synapse.MaxLongRetryDelay,
 		})
-		out = dry
-	} else {
-		w.close()
-		return nil, errors.New(
-			"shadow.enabled is false but no real sender is implemented yet; " +
-				"this worker can only shadow (docs/shadow-safety.md)")
+		live.SetOnSent(w.countTransaction)
+		if w.capture != nil {
+			live.SetCapture(w.capture)
+		}
+		router := sink.NewRouter(sink.RouterConfig{
+			Allowed: cfg.Shadow.SendOnlyTo,
+			All:     cfg.Shadow.SendToAll,
+			Live:    live,
+			Dry:     dry,
+			Log:     log,
+		})
+		w.router = router
+		out = router
 	}
 
 	w.queues = queue.NewManager(queue.ManagerConfig{

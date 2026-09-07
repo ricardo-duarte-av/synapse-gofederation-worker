@@ -33,10 +33,26 @@ shadow:
   # sent. Nothing is written to any Synapse table and nothing is published to
   # Redis.
   #
-  # Setting this to false makes the worker send real federation traffic to real
-  # homeservers. It is the promotion decision, made from the difflog, and it is
-  # the only switch that does that. Defaults to true if omitted.
+  # Setting this to false makes the worker send real federation traffic. It is
+  # the promotion decision, made from the difflog, and it is the only switch
+  # that does that. Defaults to true if omitted.
+  #
+  # With enabled: false you MUST also set exactly one of send_only_to or
+  # send_to_all below -- startup is refused otherwise, because it must never be
+  # unclear whether this process is putting traffic on the internet.
   enabled: true
+
+  # The send allowlist: destinations this worker REALLY sends to. Everything
+  # else stays dry-run even when enabled is false, which is how going live
+  # happens one server at a time.
+  #
+  # An empty list sends to NOBODY. It is never read as "everyone".
+  # send_only_to: [testing.aguiarvieira.pt]
+
+  # Send to every destination in this worker's shard. The end state, and a
+  # separate option on purpose: nobody should reach production federation
+  # traffic by deleting a line. Cannot be combined with send_only_to.
+  # send_to_all: false
 
   # The federation sender whose SHARD we take -- which destinations are ours.
   # Not our identity; see worker_name above.

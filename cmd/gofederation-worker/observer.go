@@ -48,3 +48,19 @@ func (o *observer) OnEventRouted(eventID string, all, ours []string, fallback de
 func (o *observer) OnBatch(_, _ int, _, _ int64, took time.Duration) {
 	metrics.BatchDuration.Observe(took.Seconds())
 }
+
+// countTransaction feeds the metrics and the shadow record for every assembled
+// transaction, whether it was really sent or only logged.
+//
+// Shared by both sinks so the numbers mean the same thing in either mode: a
+// count that changed meaning when the worker went live would make every
+// dashboard built on it wrong at exactly the moment it mattered.
+func (w *worker) countTransaction(pdus, edus, bytes int) {
+	metrics.Transactions.Inc()
+	metrics.TransactionPDUs.Add(float64(pdus))
+	metrics.TransactionEDUs.Add(float64(edus))
+	metrics.TransactionBytes.Add(float64(bytes))
+	if w.diff != nil {
+		w.diff.RecordTransaction(pdus, edus)
+	}
+}

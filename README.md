@@ -26,16 +26,20 @@ real sender over weeks, one flag flips.
 
 ## Status
 
-Shadow mode only. `shadow.enabled: false` is currently wired to a startup
-refusal rather than to an HTTP sender, because failing closed is the only
-acceptable direction for that flag.
+Shadow by default, with a send allowlist for going live one destination at a
+time. A real, signed transaction has been sent to a test homeserver and
+accepted — the receiving Synapse verified our signature against the published
+key. See [docs/going-live.md](docs/going-live.md).
 
 Implemented: PDU routing, to-device and device-list EDUs, per-destination
-queues, transaction assembly and signing, the persisted shadow record, metrics.
+queues, transaction assembly and signing, the outbound HTTP sender with Matrix
+server discovery, transaction capture and comparison, the persisted shadow
+record, metrics.
 
-Not yet: the real HTTP sender (server discovery, well-known, SRV, backoff),
-receipts, typing and presence EDUs, catch-up, full state resolution for forked
-DAGs, and the full `m.device_list_update` body (`prev_id`, `deleted`, `keys`,
+Not yet: our own persistent per-destination backoff (the retry filter still
+reads Synapse's `destinations` table, which is another sender's bookkeeping),
+catch-up, receipts/typing/presence EDUs, full state resolution for forked DAGs,
+and the full `m.device_list_update` body (`prev_id`, `deleted`, `keys`,
 `device_display_name`).
 
 ## The three rules
@@ -161,3 +165,5 @@ room should be private.
 - [docs/verification.md](docs/verification.md) — how we confirm we match
   Synapse, and what is still unverified.
 - [docs/test-destination.md](docs/test-destination.md) — the capture rig.
+- [docs/going-live.md](docs/going-live.md) — the send allowlist, and the order
+  in which to widen it.
