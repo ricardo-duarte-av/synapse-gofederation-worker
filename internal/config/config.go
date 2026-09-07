@@ -75,6 +75,18 @@ type ShadowConfig struct {
 	// DiffLogDir holds the persisted comparison record. Counters there survive
 	// restarts because the promotion gate is measured in weeks.
 	DiffLogDir string `yaml:"difflog_dir"`
+
+	// CaptureDestinations names servers whose transactions are recorded in
+	// full, for byte-level comparison against what Synapse actually sent to
+	// them (see cmd/fedrecorder and docs/verification.md).
+	//
+	// Meant for ONE test destination we control. Pointing it at a real,
+	// busy server would write every transaction to that server to disk, which
+	// is a lot of disk and a lot of other people's message content.
+	CaptureDestinations []string `yaml:"capture_destinations"`
+
+	// CaptureFile is where those recordings go.
+	CaptureFile string `yaml:"capture_file"`
 }
 
 // DatabaseConfig is the read-only connection to Synapse's database.
@@ -262,6 +274,10 @@ func (c *Config) validate() error {
 		if f.value < 1 {
 			return fmt.Errorf("config: %s must be at least 1, got %d", f.name, f.value)
 		}
+	}
+	if len(c.Shadow.CaptureDestinations) > 0 && c.Shadow.CaptureFile == "" {
+		return fmt.Errorf("config: shadow.capture_file is required when " +
+			"shadow.capture_destinations is set")
 	}
 	if c.ShadowEnabled() && c.Shadow.DiffLogDir == "" {
 		return fmt.Errorf("config: shadow.difflog_dir is required while shadowing; " +

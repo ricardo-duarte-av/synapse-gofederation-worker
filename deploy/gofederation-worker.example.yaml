@@ -54,6 +54,19 @@ shadow:
   # the promotion gate is measured in weeks, not in one afternoon's uptime.
   difflog_dir: /data/difflog
 
+  # Record complete transactions for these destinations, so they can be
+  # compared byte for byte against what Synapse actually sent to the same
+  # server (see docs/test-destination.md and cmd/fedrecorder).
+  #
+  # Meant for ONE low-volume test destination we control. Pointing this at a
+  # real busy server writes every transaction to it to disk -- a lot of disk,
+  # and a lot of other people's message content. Leave it empty otherwise.
+  #
+  # The name matters: it must hash into the shard named by shadow.instance
+  # above, or the worker produces nothing for it and the capture stays empty.
+  # capture_destinations: [testing.aguiarvieira.pt]
+  # capture_file: /data/captures/worker.jsonl
+
 database:
   # Synapse's database, read-only. libpq keyword form, not a URI.
   # host=/var/sockets is the direct unix socket with peer auth as uid 991; the

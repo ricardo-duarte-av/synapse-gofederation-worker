@@ -20,6 +20,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/capture"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/destinations"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/difflog"
@@ -145,6 +146,7 @@ type worker struct {
 	db      *store.Store
 	cursors *state.Store
 	diff    *difflog.Writer
+	capture *capture.WorkerCapture
 	queues  *queue.Manager
 	sender  *sender.Sender
 	devices *sender.Devices
@@ -214,9 +216,28 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 
 	// The switch. In shadow mode the HTTP sink is never constructed, so there
 	// is no client in the process that a bug could reach.
+	if len(cfg.Shadow.CaptureDestinations) > 0 {
+		cw, err := capture.Open(capture.Config{
+			Path:         cfg.Shadow.CaptureFile,
+			Destinations: cfg.Shadow.CaptureDestinations,
+		})
+		if err != nil {
+			w.close()
+			return nil, err
+		}
+		w.capture = capture.NewWorkerCapture(cw, cfg.ServerName)
+		log.Info().
+			Strs("destinations", cfg.Shadow.CaptureDestinations).
+			Str("file", cfg.Shadow.CaptureFile).
+			Msg("recording full transactions for comparison")
+	}
+
 	var out sink.Sink
 	if cfg.ShadowEnabled() {
 		dry := sink.NewDryRun(log)
+		if w.capture != nil {
+			dry.SetCapture(w.capture)
+		}
 		dry.SetOnSent(func(pdus, edus, bytes int) {
 			metrics.Transactions.Inc()
 			metrics.TransactionPDUs.Add(float64(pdus))
@@ -315,6 +336,11 @@ func (w *worker) close() {
 	if w.diff != nil {
 		if err := w.diff.Close(); err != nil {
 			w.log.Error().Err(err).Msg("failed to flush the shadow record")
+		}
+	}
+	if w.capture != nil {
+		if err := w.capture.Close(); err != nil {
+			w.log.Error().Err(err).Msg("failed to close the transaction capture")
 		}
 	}
 	if w.cursors != nil {

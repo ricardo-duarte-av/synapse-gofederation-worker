@@ -31,6 +31,16 @@ type Result struct {
 	PDUErrors map[string]string
 }
 
+// Capturer records complete transactions for later comparison against what
+// Synapse actually sent. See internal/capture.
+type Capturer interface {
+	// Captures reports whether a destination is recorded, so the caller can
+	// skip building a record it would discard.
+	Captures(destination string) bool
+	// Capture records one request.
+	Capture(req *txn.Request) error
+}
+
 // Sink accepts signed transactions.
 type Sink interface {
 	// Send delivers a transaction, or pretends to.
@@ -48,6 +58,10 @@ type DryRun struct {
 	// testable without a Prometheus registry -- and so the same numbers reach
 	// both the metrics and the persisted shadow record from one place.
 	onSent func(pdus, edus, bytes int)
+	// capture records the full request for named destinations. Separate from
+	// onSent because it is about bytes rather than counts, and because it is
+	// off for every destination but the handful being compared.
+	capture Capturer
 
 	transactions atomic.Int64
 	pdus         atomic.Int64
@@ -62,6 +76,9 @@ func NewDryRun(log zerolog.Logger) *DryRun {
 
 // SetOnSent registers a callback invoked for every transaction.
 func (d *DryRun) SetOnSent(f func(pdus, edus, bytes int)) { d.onSent = f }
+
+// SetCapture registers a full-request recorder.
+func (d *DryRun) SetCapture(c Capturer) { d.capture = c }
 
 // Mode identifies this sink.
 func (d *DryRun) Mode() string { return "dry-run (shadow; nothing is sent)" }
@@ -82,6 +99,17 @@ func (d *DryRun) Send(_ context.Context, req *txn.Request) (Result, error) {
 
 	if d.onSent != nil {
 		d.onSent(pdus, edus, len(req.Body))
+	}
+	// Recorded before the log line, and never allowed to fail the send: in
+	// shadow mode there is nothing to fail, but the same code runs when this
+	// worker sends for real and a capture error must not become a delivery
+	// error.
+	if d.capture != nil && d.capture.Captures(req.Destination) {
+		if err := d.capture.Capture(req); err != nil {
+			d.log.Error().Err(err).
+				Str("destination", req.Destination).
+				Msg("failed to record transaction for comparison")
+		}
 	}
 
 	d.log.Debug().

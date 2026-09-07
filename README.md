@@ -139,9 +139,25 @@ Over 14,485 production events it sits at **4.4% of routing decisions** (20 of
 local events have a single prev event and therefore a single state group with
 nothing to resolve.
 
+## The test destination
+
+The captures and the recording proxy for comparing against a homeserver we
+control are built; the server itself is deployment work. See
+[docs/test-destination.md](docs/test-destination.md) — including why the
+subdomain has to be chosen so it hashes into the right shard, and why the first
+room should be private.
+
+- `cmd/fedrecorder` sits in front of the test homeserver and records what
+  Synapse actually sent.
+- `shadow.capture_destinations` records what this worker would have sent.
+- `cmd/fedcompare` diffs the two.
+
 ## Documentation
 
 - [docs/synapse-reference.md](docs/synapse-reference.md) — what is reimplemented,
   with the file:line in Synapse each rule comes from.
 - [docs/shadow-safety.md](docs/shadow-safety.md) — the invariants, and how to
   verify inertness from outside.
+- [docs/verification.md](docs/verification.md) — how we confirm we match
+  Synapse, and what is still unverified.
+- [docs/test-destination.md](docs/test-destination.md) — the capture rig.
