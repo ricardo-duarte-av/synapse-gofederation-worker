@@ -186,6 +186,27 @@ Row shapes are positional JSON arrays:
 - `device_lists`: `[user_id, is_signature, hosts_calculated]`
 - `receipts`: `[room_id, receipt_type, user_id, event_id, thread_id, data]`
 
+### Server resolution caching
+
+`http/federation/well_known_resolver.py:45`. The periods differ by how the
+answer was reached, and the split is the part that matters:
+
+| Case | Period |
+|---|---|
+| valid `.well-known`, no cache headers | 24h (±10% jitter) |
+| valid `.well-known`, with `Cache-Control` | its own, clamped to 5m–48h |
+| no `.well-known` | **1h** (`WELL_KNOWN_INVALID_CACHE_PERIOD`) |
+| no `.well-known`, but one was seen in the last 2h | **2m** (`WELL_KNOWN_DOWN_CACHE_PERIOD`) |
+| memory of "this domain had a valid well-known" | 2h |
+
+The 2-minute case is the important one. A resolution reached *without* a
+delegation, for a server that normally delegates, is a fallback to port 8448 on
+the bare name -- a successful resolution to the wrong place. Caching it for a
+day turns a brief `.well-known` outage into a day of failed delivery.
+
+mautrix caches every resolution for 24h regardless (`resolution.go:59`), so
+`internal/sink.resolveCache` applies the table above instead.
+
 ## 7. Tables
 
 | Table | Columns we care about |

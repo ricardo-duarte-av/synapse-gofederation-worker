@@ -80,8 +80,13 @@ func NewHTTP(cfg HTTPConfig) *HTTP {
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	// Ours rather than mautrix's default cache. Both keep resolutions in
+	// memory; the difference is the TTL, and mautrix keeps every resolution for
+	// 24 hours however it was reached -- including one that fell back to port
+	// 8448 because a delegating server's .well-known was briefly down. See
+	// resolveCache.
 	transport := federation.NewServerResolvingTransport(
-		nil, // an in-memory resolution cache, which is what Synapse keeps too
+		newResolveCache(),
 		exhttp.DialerFunc(dialer.DialContext),
 		exhttp.ClientSettings{},
 	)
