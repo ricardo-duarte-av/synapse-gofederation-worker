@@ -53,6 +53,20 @@ noticing. These three are not — see [docs/shadow-safety.md](docs/shadow-safety
 
 ## Verification
 
+**How we confirm we match Synapse — not just that we are self-consistent — is
+[docs/verification.md](docs/verification.md).** Transaction framing is
+deliberately not compared: which PDUs share a transaction depends on what was
+queued when a sender's loop ran, so two correct senders differ there and
+matching it would be fitting to noise. Three things that *are* comparable are,
+each against an oracle produced by Synapse itself:
+
+| Question | Oracle | Result |
+|---|---|---|
+| Same events to the same servers? | Synapse's `destination_rooms` | 507/507 pairs, **100%** |
+| Same PDU bytes? | Synapse's `canonicaljson` | 200 events, **byte-identical** |
+| Same shard? | Synapse's `ShardedWorkerHandlingConfig` | 27,824 destinations, **identical** |
+| Valid signature? | Synapse's `signedjson` | **byte-identical** |
+
 Against the live deployment, over ~9,000 real events:
 
 - **Shard parity is exact.** All 27,824 destinations partition identically to

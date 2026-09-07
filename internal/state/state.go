@@ -38,6 +38,8 @@ const (
 type Store struct {
 	pool  *pgxpool.Pool
 	table string
+	// routesTable mirrors Synapse's destination_rooms, for the comparison.
+	routesTable string
 	// instance is the sender we impersonate, so two shadows of two different
 	// senders can share a database without overwriting each other.
 	instance string
@@ -45,8 +47,12 @@ type Store struct {
 
 // Config describes how to reach the cursor table.
 type Config struct {
-	DSN            string
-	Table          string
+	DSN   string
+	Table string
+	// RoutesTable holds our copy of Synapse's destination_rooms. Empty
+	// disables route recording, which only makes sense for a worker that is
+	// not being compared against anything.
+	RoutesTable    string
 	InstanceName   string
 	MaxConns       int32
 	ConnectTimeout time.Duration
@@ -77,7 +83,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("state: connect: %w", err)
 	}
-	s := &Store{pool: pool, table: cfg.Table, instance: cfg.InstanceName}
+	s := &Store{pool: pool, table: cfg.Table, routesTable: cfg.RoutesTable, instance: cfg.InstanceName}
 
 	// Read one row rather than merely pinging. The failure this catches is the
 	// state role being pointed at a database where the schema was never
@@ -166,3 +172,48 @@ func ToDeviceCursor(destination string) string { return "to_device:" + destinati
 
 // DeviceListCursor is the per-destination device list poke cursor.
 func DeviceListCursor(destination string) string { return "device_lists:" + destination }
+
+// RoutedRoom is one routing decision in the shape Synapse records it.
+type RoutedRoom struct {
+	Destination    string
+	RoomID         string
+	StreamOrdering int64
+}
+
+// RecordRoutes writes our routing decisions in the same shape as Synapse's
+// destination_rooms table.
+//
+// This is what makes the shadow checkable. Synapse's _send_pdu upserts
+// (destination, room_id) -> stream_ordering for the full sharded destination
+// set, BEFORE the retry filter, so destination_rooms is its own durable record
+// of every routing decision it made -- independent of whether delivery
+// succeeded, and written by Synapse rather than reconstructed by us. Keeping
+// ours in the identical shape turns "did we agree?" into a SQL join.
+//
+// Like Synapse's, this is a high-water mark rather than a log: one row per
+// (destination, room), holding the newest stream ordering routed there.
+func (s *Store) RecordRoutes(ctx context.Context, routes []RoutedRoom) error {
+	if len(routes) == 0 {
+		return nil
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s AS dr (instance_name, destination, room_id, stream_ordering, updated_ts)
+		SELECT $1, d, r, o, $5
+		FROM unnest($2::text[], $3::text[], $4::bigint[]) AS t(d, r, o)
+		ON CONFLICT (instance_name, destination, room_id) DO UPDATE
+		SET stream_ordering = EXCLUDED.stream_ordering, updated_ts = EXCLUDED.updated_ts
+		WHERE dr.stream_ordering < EXCLUDED.stream_ordering`, s.routesTable)
+
+	dests := make([]string, len(routes))
+	rooms := make([]string, len(routes))
+	orders := make([]int64, len(routes))
+	for i, r := range routes {
+		dests[i], rooms[i], orders[i] = r.Destination, r.RoomID, r.StreamOrdering
+	}
+
+	_, err := s.pool.Exec(ctx, q, s.instance, dests, rooms, orders, time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("state: record routes: %w", err)
+	}
+	return nil
+}

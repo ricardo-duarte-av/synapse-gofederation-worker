@@ -6,7 +6,9 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/destinations"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/queue"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/state"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/store"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
 )
 
 // catchupRetryInterval is Synapse's CATCHUP_RETRY_INTERVAL, one hour
@@ -83,7 +85,34 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 	}
 	due := store.FilterDestinationsByRetryLimiter(ours, timings, time.Now(), catchupRetryInterval)
 
-	p := queue.PDU{EventID: e.EventID, StreamOrdering: e.StreamOrdering, JSON: e.JSON}
+	// Serialise as Synapse does before queueing, so a PDU it would drop is
+	// never queued anywhere. The depth filter removes the event entirely
+	// rather than trimming it: one unencodable PDU makes the whole transaction
+	// unparseable, taking every other PDU in it down too.
+	body, ok := txn.SerialisePDU(e.JSON)
+	if !ok {
+		if s.cfg.Observer != nil {
+			s.cfg.Observer.OnEventSkipped(e.EventID, destinations.SkipUnserialisable)
+		}
+		return false, nil
+	}
+
+	// Record the decision BEFORE the retry filter and before queueing, exactly
+	// where Synapse writes destination_rooms (federation/sender/__init__.py:828).
+	// Recording after the retry filter would make us disagree with Synapse for
+	// every destination that happened to be backing off -- a difference in
+	// bookkeeping that would look like a difference in routing.
+	routes := make([]state.RoutedRoom, 0, len(ours))
+	for _, d := range ours {
+		routes = append(routes, state.RoutedRoom{
+			Destination: d, RoomID: e.RoomID, StreamOrdering: e.StreamOrdering,
+		})
+	}
+	if err := s.cfg.Cursors.RecordRoutes(ctx, routes); err != nil {
+		return false, err
+	}
+
+	p := queue.PDU{EventID: e.EventID, StreamOrdering: e.StreamOrdering, JSON: body}
 	for _, d := range due {
 		q := s.cfg.Queues.Get(d)
 		q.EnqueuePDU(p)

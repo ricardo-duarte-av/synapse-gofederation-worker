@@ -179,6 +179,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	if w.cursors, err = state.Open(openCtx, state.Config{
 		DSN:            stateDSN,
 		Table:          cfg.State.Table,
+		RoutesTable:    cfg.State.RoutesTable,
 		InstanceName:   cfg.WorkerName,
 		MaxConns:       4,
 		ConnectTimeout: cfg.ConnectTimeout(),

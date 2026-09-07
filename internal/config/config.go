@@ -101,6 +101,9 @@ type StateConfig struct {
 	DSN string `yaml:"dsn"`
 	// Table is the qualified name of our cursor table.
 	Table string `yaml:"table"`
+	// RoutesTable holds our copy of Synapse's destination_rooms, which is what
+	// the routing comparison joins against. Empty disables route recording.
+	RoutesTable string `yaml:"routes_table"`
 }
 
 // ReplicationConfig is the Redis subscription.
@@ -175,7 +178,10 @@ func Parse(data []byte) (*Config, error) {
 	// document still wins.
 	cfg := &Config{
 		Database: DatabaseConfig{MaxConns: 16, ConnectTimeoutSeconds: 10},
-		State:    StateConfig{Table: "gofederation.stream_positions"},
+		State: StateConfig{
+			Table:       "gofederation.stream_positions",
+			RoutesTable: "gofederation.destination_rooms",
+		},
 		Queue: QueueConfig{
 			MaxConcurrentDestinations: 2000,
 			MaxPDUsPerTransaction:     SynapseMaxPDUsPerTransaction,

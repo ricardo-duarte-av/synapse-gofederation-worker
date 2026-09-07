@@ -67,6 +67,11 @@ const (
 	SkipRejected       SkipReason = "rejected"
 	SkipNoPrevEvents   SkipReason = "no prev events"
 	SkipNoDestinations SkipReason = "no remote destinations"
+	// SkipUnserialisable is a PDU Synapse's own filter would drop, in practice
+	// a depth outside canonical JSON's integer range. Dropping the event is
+	// what Synapse does: one unencodable PDU makes the whole transaction
+	// unparseable, taking every other PDU in it down too.
+	SkipUnserialisable SkipReason = "unserialisable"
 )
 
 // Eligible reports whether an event should be federated at all.

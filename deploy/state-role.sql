@@ -40,10 +40,38 @@ CREATE TABLE IF NOT EXISTS gofederation.stream_positions (
     PRIMARY KEY (instance_name, name)
 );
 
+-- Our copy of Synapse's destination_rooms, in the identical shape.
+--
+-- This is what makes the shadow checkable rather than merely self-consistent.
+-- Synapse's _send_pdu upserts (destination, room_id) -> stream_ordering for the
+-- full sharded destination set BEFORE the retry filter, so destination_rooms is
+-- its own durable record of every routing decision it made. Keeping ours in the
+-- same shape turns "did we agree with Synapse?" into a SQL join between this
+-- table and that one.
+CREATE TABLE IF NOT EXISTS gofederation.destination_rooms (
+    instance_name   TEXT NOT NULL,
+    destination     TEXT NOT NULL,
+    room_id         TEXT NOT NULL,
+    stream_ordering BIGINT NOT NULL,
+    updated_ts      BIGINT NOT NULL,
+    PRIMARY KEY (instance_name, destination, room_id)
+);
+
+-- The comparison scans by ordering to pick a settled window.
+CREATE INDEX IF NOT EXISTS gofederation_destination_rooms_ordering
+    ON gofederation.destination_rooms (instance_name, stream_ordering);
+
 -- No grants on public: this role has no business reading Synapse's tables, and
 -- the read-only role has no business writing these.
 GRANT USAGE ON SCHEMA gofederation TO gofed_state;
 GRANT SELECT, INSERT, UPDATE, DELETE ON gofederation.stream_positions TO gofed_state;
+GRANT SELECT, INSERT, UPDATE, DELETE ON gofederation.destination_rooms TO gofed_state;
+
+-- The comparison reads Synapse's destination_rooms alongside ours. That is the
+-- ONE Synapse table this role may see, and read-only: it is the oracle, not
+-- something we write.
+GRANT USAGE ON SCHEMA public TO gofed_state;
+GRANT SELECT ON public.destination_rooms TO gofed_state;
 
 ALTER ROLE gofed_state SET statement_timeout = '30s';
 

@@ -36,10 +36,13 @@ type Store interface {
 	GetDestinationRetryTimings(ctx context.Context, destinations []string) (map[string]store.RetryTimings, error)
 }
 
-// Cursors persists our position.
+// Cursors persists our position and our routing decisions.
 type Cursors interface {
 	Get(ctx context.Context, name string) (int64, bool, error)
 	Set(ctx context.Context, name string, pos int64) error
+	// RecordRoutes writes our routing decisions in the shape of Synapse's
+	// destination_rooms, which is what the comparison joins against.
+	RecordRoutes(ctx context.Context, routes []state.RoutedRoom) error
 }
 
 // Observer is told what the pipeline decided, so the shadow comparison and the

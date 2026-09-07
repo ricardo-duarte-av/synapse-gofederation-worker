@@ -98,11 +98,19 @@ func (f *fakeStore) JoinedHostsAtStateGroup(context.Context, int64) ([]string, e
 }
 
 type memCursors struct {
-	mu sync.Mutex
-	m  map[string]int64
+	mu     sync.Mutex
+	m      map[string]int64
+	routes []state.RoutedRoom
 }
 
 func newCursors() *memCursors { return &memCursors{m: map[string]int64{}} }
+
+func (c *memCursors) RecordRoutes(_ context.Context, routes []state.RoutedRoom) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.routes = append(c.routes, routes...)
+	return nil
+}
 
 func (c *memCursors) Get(_ context.Context, name string) (int64, bool, error) {
 	c.mu.Lock()
