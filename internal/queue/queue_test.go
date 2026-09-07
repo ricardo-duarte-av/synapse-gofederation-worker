@@ -292,3 +292,108 @@ func TestSetLastSuccessfulStreamOrderingNeverGoesBackwards(t *testing.T) {
 		t.Errorf("cursor moved backwards to %d", got)
 	}
 }
+
+// Bookkeeping must happen ONLY for a transaction that was actually delivered.
+//
+// The rows a mark authorises deleting are to-device messages and device pokes.
+// Deleting them for a transaction that failed destroys undelivered messages
+// with nothing to recover them from -- there is no second copy, and the
+// receiving server never knew they existed.
+func TestEDUMarksCommitOnlyOnDelivery(t *testing.T) {
+	s := &recordingSink{}
+	s.fail.Store(true)
+
+	var committed struct {
+		sync.Mutex
+		calls    int
+		toDevice int64
+	}
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		OnEDUsSent: func(_ string, toDevice, _ int64) {
+			committed.Lock()
+			committed.calls++
+			committed.toDevice = toDevice
+			committed.Unlock()
+		},
+	})
+
+	d.EnqueueMarkedEDU(EDU{
+		Unit:         txn.EDU{Type: "m.direct_to_device", Content: []byte(`{"message_id":"m1"}`)},
+		ToDeviceUpTo: 500,
+	})
+	d.Attempt(context.Background())
+	waitFor(t, "the failing attempt to finish", func() bool { return !d.isRunning() })
+
+	committed.Lock()
+	calls := committed.calls
+	committed.Unlock()
+	if calls != 0 {
+		t.Fatal("bookkeeping ran for a transaction that was never delivered; " +
+			"those rows would have been deleted undelivered")
+	}
+	if _, edus := d.Pending(); edus != 1 {
+		t.Errorf("%d EDUs queued after a failure, want it still there", edus)
+	}
+
+	// And on success it commits, with the mark it carried.
+	s.fail.Store(false)
+	d.Attempt(context.Background())
+	waitFor(t, "the retry", func() bool {
+		committed.Lock()
+		defer committed.Unlock()
+		return committed.calls == 1
+	})
+	committed.Lock()
+	defer committed.Unlock()
+	if committed.toDevice != 500 {
+		t.Errorf("committed up to %d, want 500", committed.toDevice)
+	}
+}
+
+// Only the highest mark in the delivered batch is committed, and marks from
+// units left behind by the 100-EDU limit are not.
+func TestOnlyDeliveredMarksAreCommitted(t *testing.T) {
+	s := &recordingSink{}
+	var got struct {
+		sync.Mutex
+		toDevice int64
+	}
+	signer, _ := txn.NewSigner("a.example", testKeyLine)
+	d := NewDestination(Config{
+		Name: "b.example", Limits: Limits{MaxEDUs: 2}, Signer: signer,
+		IDs: txn.NewIDGenerator(txn.DefaultIDPrefix), Sink: s, Log: zerolog.New(io.Discard),
+		OnEDUsSent: func(_ string, toDevice, _ int64) {
+			got.Lock()
+			if toDevice > got.toDevice {
+				got.toDevice = toDevice
+			}
+			got.Unlock()
+		},
+	})
+
+	// Three units; the first transaction can take only two. The mark on the
+	// third must not be committed by that transaction.
+	d.EnqueueMarkedEDU(EDU{Unit: txn.EDU{Type: "m.direct_to_device", Content: []byte(`{}`)}})
+	d.EnqueueMarkedEDU(EDU{Unit: txn.EDU{Type: "m.direct_to_device", Content: []byte(`{}`)},
+		ToDeviceUpTo: 10})
+	d.EnqueueMarkedEDU(EDU{Unit: txn.EDU{Type: "m.direct_to_device", Content: []byte(`{}`)},
+		ToDeviceUpTo: 99})
+
+	d.Attempt(context.Background())
+	waitFor(t, "everything to drain", func() bool {
+		_, e := d.Pending()
+		return e == 0
+	})
+
+	got.Lock()
+	defer got.Unlock()
+	if got.toDevice != 99 {
+		t.Errorf("highest committed mark = %d, want 99 once all were delivered", got.toDevice)
+	}
+}

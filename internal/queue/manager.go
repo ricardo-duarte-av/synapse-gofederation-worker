@@ -32,7 +32,9 @@ type Manager struct {
 	// goroutine parked on the same socket timeout.
 	sem chan struct{}
 
-	onSuccess func(destination string, streamOrdering int64)
+	onSuccess  func(destination string, streamOrdering int64)
+	onEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
+	onOutcome  func(destination string, delivered bool)
 
 	mu    sync.RWMutex
 	dests map[string]*Destination
@@ -58,6 +60,8 @@ type ManagerConfig struct {
 	Log           zerolog.Logger
 	MaxConcurrent int
 	OnSuccess     func(destination string, streamOrdering int64)
+	OnEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
+	OnOutcome     func(destination string, delivered bool)
 }
 
 // NewManager builds a Manager.
@@ -67,15 +71,17 @@ func NewManager(cfg ManagerConfig) *Manager {
 		maxConcurrent = 2000
 	}
 	return &Manager{
-		limits:    cfg.Limits,
-		signer:    cfg.Signer,
-		ids:       cfg.IDs,
-		sink:      cfg.Sink,
-		log:       cfg.Log,
-		sem:       make(chan struct{}, maxConcurrent),
-		onSuccess: cfg.OnSuccess,
-		dests:     map[string]*Destination{},
-		base:      context.Background(),
+		limits:     cfg.Limits,
+		signer:     cfg.Signer,
+		ids:        cfg.IDs,
+		sink:       cfg.Sink,
+		log:        cfg.Log,
+		sem:        make(chan struct{}, maxConcurrent),
+		onSuccess:  cfg.OnSuccess,
+		onEDUsSent: cfg.OnEDUsSent,
+		onOutcome:  cfg.OnOutcome,
+		dests:      map[string]*Destination{},
+		base:       context.Background(),
 	}
 }
 
@@ -110,13 +116,15 @@ func (m *Manager) Get(name string) *Destination {
 		return d
 	}
 	d = NewDestination(Config{
-		Name:      name,
-		Limits:    m.limits,
-		Signer:    m.signer,
-		IDs:       m.ids,
-		Sink:      m.sink,
-		Log:       m.log,
-		OnSuccess: m.onSuccess,
+		Name:       name,
+		Limits:     m.limits,
+		Signer:     m.signer,
+		IDs:        m.ids,
+		Sink:       m.sink,
+		Log:        m.log,
+		OnSuccess:  m.onSuccess,
+		OnEDUsSent: m.onEDUsSent,
+		OnOutcome:  m.onOutcome,
 	})
 	m.dests[name] = d
 	return d

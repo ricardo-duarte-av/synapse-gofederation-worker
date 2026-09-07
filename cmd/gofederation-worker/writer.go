@@ -1,0 +1,170 @@
+package main
+
+import (
+	"context"
+	"math/rand"
+	"time"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
+)
+
+// bookkeepingTimeout bounds one write. Generous, because losing a deletion is
+// worse than a slow one: the row comes back on the next pass and is sent again.
+const bookkeepingTimeout = 30 * time.Second
+
+// onEDUsDelivered performs the deletions a delivered transaction makes due.
+//
+// This is the point of primary mode. A real federation sender's cursor for
+// to-device messages and device pokes IS the deletion of those rows -- Synapse
+// does it in __aexit__, only when the transaction succeeded, and a sender that
+// skips it re-reads the same rows forever and grows the outbox without bound.
+//
+// A failure here is logged and not retried. The rows survive, so the next pass
+// sends them again and the receiving server deduplicates on message_id; the
+// alternative, retrying inline, would hold a destination's transmission loop on
+// a database that is already unhappy.
+func (w *worker) onEDUsDelivered(destination string, toDeviceUpTo, deviceListUpTo int64) {
+	if w.writer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
+	defer cancel()
+
+	if toDeviceUpTo > 0 {
+		if err := w.writer.DeleteDeviceMsgsForRemote(ctx, destination, toDeviceUpTo); err != nil {
+			metrics.WriteOps.WithLabelValues("delete_to_device", "error").Inc()
+			w.log.Error().Err(err).Str("destination", destination).Int64("up_to", toDeviceUpTo).
+				Msg("failed to delete delivered to-device messages; they will be sent again")
+		} else {
+			metrics.WriteOps.WithLabelValues("delete_to_device", "ok").Inc()
+		}
+	}
+	if deviceListUpTo > 0 {
+		// Deletes the pokes AND records the highest stream id per user, in one
+		// transaction. The second half is where the next batch's prev_id comes
+		// from, so losing it breaks the chain a receiver uses to notice a gap.
+		if err := w.writer.MarkAsSentDevicesByRemote(ctx, destination, deviceListUpTo); err != nil {
+			metrics.WriteOps.WithLabelValues("mark_devices_sent", "error").Inc()
+			w.log.Error().Err(err).Str("destination", destination).Int64("up_to", deviceListUpTo).
+				Msg("failed to mark device list updates sent; prev_id chaining will lag")
+		} else {
+			metrics.WriteOps.WithLabelValues("mark_devices_sent", "ok").Inc()
+		}
+	}
+}
+
+// onDelivered advances a destination's catch-up cursor after a delivered
+// transaction (transactions.py:359).
+//
+// In shadow mode this goes to our own table and Synapse's is untouched; in
+// primary mode it is Synapse's, because there is no other sender to keep it.
+func (w *worker) onDelivered(destination string, streamOrdering int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
+	defer cancel()
+
+	if w.writer == nil {
+		return
+	}
+	if err := w.writer.SetDestinationLastSuccessfulStreamOrdering(ctx, destination, streamOrdering); err != nil {
+		metrics.WriteOps.WithLabelValues("last_successful_ordering", "error").Inc()
+		w.log.Error().Err(err).Str("destination", destination).
+			Msg("failed to advance the catch-up cursor")
+		return
+	}
+	metrics.WriteOps.WithLabelValues("last_successful_ordering", "ok").Inc()
+}
+
+// recordRoutes writes the record of which destinations are owed which room.
+//
+// Synapse writes destination_rooms BEFORE the retry filter, so an event is
+// recorded as owed to a server that is currently down and catch-up can find it
+// later (federation/sender/__init__.py:828). A primary sender must do the same
+// or nothing survives its own downtime.
+func (w *worker) recordRoutes(ctx context.Context, destinations []string, roomID string, streamOrdering int64) error {
+	if w.writer == nil {
+		return nil
+	}
+	if err := w.writer.StoreDestinationRoomsEntries(ctx, destinations, roomID, streamOrdering); err != nil {
+		metrics.WriteOps.WithLabelValues("destination_rooms", "error").Inc()
+		return err
+	}
+	metrics.WriteOps.WithLabelValues("destination_rooms", "ok").Inc()
+	return nil
+}
+
+// recordPosition writes our events position where Synapse keeps it.
+//
+// Not optional for a primary. Synapse rewrites federation_stream_position at
+// startup from MIN(stream_id) across the configured senders
+// (stream.py:2162), so a row we never advance would rewind the homeserver's
+// entire federation position the next time it restarts -- resending everything
+// since the worker was deployed.
+func (w *worker) recordPosition(ctx context.Context, streamID int64) error {
+	if w.writer == nil {
+		return nil
+	}
+	if err := w.writer.UpdateFederationOutPos(ctx, "events", w.cfg.WorkerName, streamID); err != nil {
+		metrics.WriteOps.WithLabelValues("federation_stream_position", "error").Inc()
+		return err
+	}
+	metrics.WriteOps.WithLabelValues("federation_stream_position", "ok").Inc()
+	return nil
+}
+
+// onSendOutcome records a destination's backoff state after an attempt.
+//
+// Synapse's RetryDestinationLimiter (retryutils.py:226): a success clears the
+// backoff, a failure grows it by the configured multiplier with jitter, capped.
+// Without this a primary never backs off persistently -- it would retry a dead
+// server on every event, forever, and the destinations table would never show
+// that anything was wrong.
+func (w *worker) onSendOutcome(destination string, delivered bool) {
+	if w.writer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
+	defer cancel()
+
+	if delivered {
+		if err := w.writer.ClearDestinationRetryTimings(ctx, destination); err != nil {
+			metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
+			w.log.Error().Err(err).Str("destination", destination).
+				Msg("failed to clear the backoff for a destination that is working")
+			return
+		}
+		metrics.WriteOps.WithLabelValues("retry_timings", "ok").Inc()
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	next := w.nextRetryInterval(ctx, destination)
+	if err := w.writer.SetDestinationRetryTimings(ctx, destination, now, now, next); err != nil {
+		metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
+		w.log.Error().Err(err).Str("destination", destination).Msg("failed to record a backoff")
+		return
+	}
+	metrics.WriteOps.WithLabelValues("retry_timings", "ok").Inc()
+}
+
+// nextRetryInterval grows the backoff the way Synapse does.
+//
+// The jitter is Synapse's uniform(0.8, 1.4) and is not decoration: without it
+// every destination that failed together retries together, and a server coming
+// back up is met by the entire backlog at once.
+func (w *worker) nextRetryInterval(ctx context.Context, destination string) int64 {
+	retry := w.cfg.Synapse.Retry
+	timings, err := w.db.GetDestinationRetryTimings(ctx, []string{destination})
+	if err != nil {
+		// Reading failed, so start from the minimum rather than guessing high.
+		return retry.MinInterval.Milliseconds()
+	}
+	current := timings[destination].RetryInterval
+	if current <= 0 {
+		return retry.MinInterval.Milliseconds()
+	}
+	grown := float64(current) * retry.Multiplier * (0.8 + rand.Float64()*0.6)
+	if max := float64(retry.MaxInterval.Milliseconds()); grown > max {
+		grown = max
+	}
+	return int64(grown)
+}

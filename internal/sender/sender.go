@@ -80,6 +80,18 @@ type Config struct {
 	ShouldHandle func(destination string) bool
 	// BatchLimit is the pickup query's limit, Synapse's 100.
 	BatchLimit int
+	// RecordRoutes, when set, additionally records the routing decision where
+	// Synapse keeps it. A primary sender must, since nothing else will and
+	// catch-up reads that table; a shadow must not, and leaves it nil.
+	RecordRoutes func(ctx context.Context, destinations []string, roomID string, streamOrdering int64) error
+
+	// RecordPosition, when set, additionally writes our events position where
+	// Synapse keeps it. A primary must: Synapse rewrites
+	// federation_stream_position from MIN(stream_id) across configured senders
+	// at startup, so a row left stale would rewind the homeserver's whole
+	// federation position on its next restart.
+	RecordPosition func(ctx context.Context, streamID int64) error
+
 	// MaxRoomConcurrency bounds how many rooms are processed at once. Synapse
 	// gathers all of them; a bound here keeps one very wide batch from
 	// launching thousands of database queries at the same instant.
@@ -279,6 +291,11 @@ func (s *Sender) processBatch(ctx context.Context) (bool, error) {
 
 	if err := s.cfg.Cursors.Set(ctx, state.CursorEvents, next); err != nil {
 		return false, err
+	}
+	if s.cfg.RecordPosition != nil {
+		if err := s.cfg.RecordPosition(ctx, next); err != nil {
+			return false, err
+		}
 	}
 	if s.cfg.Observer != nil {
 		s.cfg.Observer.OnBatch(len(events), routed, from, next, time.Since(started))

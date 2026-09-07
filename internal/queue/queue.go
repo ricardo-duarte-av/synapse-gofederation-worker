@@ -33,6 +33,25 @@ type Limits struct {
 	MaxEDUs int
 }
 
+// EDU is an ephemeral unit waiting to go to a destination, with the
+// bookkeeping that becomes due once it has actually been delivered.
+//
+// Synapse tracks the same thing on its queue (_device_stream_id and
+// _device_list_id) and acts on it in __aexit__, only when the transaction
+// succeeded. The marks travel WITH the unit rather than on the queue, because
+// a transaction takes a prefix of what is queued: a mark held on the queue
+// would be committed for units that were not in the batch that succeeded.
+type EDU struct {
+	Unit txn.EDU
+	// ToDeviceUpTo is the device_federation_outbox stream id this unit
+	// consumed, or zero. Once delivered, those rows may be deleted -- that
+	// deletion is the real sender's cursor.
+	ToDeviceUpTo int64
+	// DeviceListUpTo is the device_lists_outbound_pokes stream id this unit
+	// consumed, or zero.
+	DeviceListUpTo int64
+}
+
 // PDU is an event waiting to go to a destination.
 type PDU struct {
 	EventID string
@@ -59,7 +78,7 @@ type Destination struct {
 
 	mu          sync.Mutex
 	pendingPDUs []PDU
-	pendingEDUs []txn.EDU
+	pendingEDUs []EDU
 	// running is the "exactly one in-flight transaction" mutex. Synapse calls
 	// it transmission_loop_running.
 	running bool
@@ -77,17 +96,27 @@ type Destination struct {
 	// onSuccess is called after a delivered transaction, with the highest
 	// stream ordering in it, so the caller can persist the cursor.
 	onSuccess func(destination string, streamOrdering int64)
+	// onEDUsSent is called after a delivered transaction carrying marked EDUs,
+	// with the highest consumed stream id of each kind.
+	onEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
+	// onOutcome is called after every attempt, delivered or not, so a primary
+	// can keep the destination's persistent backoff. Called for failures too,
+	// which is the half that matters: without it a dead server is retried on
+	// every event forever.
+	onOutcome func(destination string, delivered bool)
 }
 
 // Config builds a Destination.
 type Config struct {
-	Name      string
-	Limits    Limits
-	Signer    *txn.Signer
-	IDs       *txn.IDGenerator
-	Sink      sink.Sink
-	Log       zerolog.Logger
-	OnSuccess func(destination string, streamOrdering int64)
+	Name       string
+	Limits     Limits
+	Signer     *txn.Signer
+	IDs        *txn.IDGenerator
+	Sink       sink.Sink
+	Log        zerolog.Logger
+	OnSuccess  func(destination string, streamOrdering int64)
+	OnEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
+	OnOutcome  func(destination string, delivered bool)
 }
 
 // NewDestination builds a queue for one remote server.
@@ -100,13 +129,15 @@ func NewDestination(cfg Config) *Destination {
 		limits.MaxEDUs = 100
 	}
 	return &Destination{
-		name:      cfg.Name,
-		limits:    limits,
-		signer:    cfg.Signer,
-		ids:       cfg.IDs,
-		sink:      cfg.Sink,
-		log:       cfg.Log.With().Str("destination", cfg.Name).Logger(),
-		onSuccess: cfg.OnSuccess,
+		name:       cfg.Name,
+		limits:     limits,
+		signer:     cfg.Signer,
+		ids:        cfg.IDs,
+		sink:       cfg.Sink,
+		log:        cfg.Log.With().Str("destination", cfg.Name).Logger(),
+		onSuccess:  cfg.OnSuccess,
+		onEDUsSent: cfg.OnEDUsSent,
+		onOutcome:  cfg.OnOutcome,
 	}
 }
 
@@ -123,6 +154,11 @@ func (d *Destination) EnqueuePDU(p PDU) {
 
 // EnqueueEDU adds an ephemeral unit to the queue.
 func (d *Destination) EnqueueEDU(e txn.EDU) {
+	d.EnqueueMarkedEDU(EDU{Unit: e})
+}
+
+// EnqueueMarkedEDU adds a unit whose delivery makes bookkeeping due.
+func (d *Destination) EnqueueMarkedEDU(e EDU) {
 	d.mu.Lock()
 	d.pendingEDUs = append(d.pendingEDUs, e)
 	d.newData = true
@@ -196,7 +232,11 @@ func (d *Destination) Run(ctx context.Context) {
 			return
 		}
 
-		if err := d.send(ctx, pdus, edus); err != nil {
+		err := d.send(ctx, pdus, edus)
+		if d.onOutcome != nil {
+			d.onOutcome(d.name, err == nil)
+		}
+		if err != nil {
 			// The units stay queued: nothing was dequeued, because takeLocked
 			// only copies. Synapse gets the same result from __aexit__ bailing
 			// on an exception. The loop exits and a later Attempt retries.
@@ -207,6 +247,24 @@ func (d *Destination) Run(ctx context.Context) {
 		}
 
 		d.dequeue(len(pdus), len(edus))
+
+		// Bookkeeping for the EDUs that were actually in the delivered
+		// transaction, and only then. Synapse does the same in __aexit__,
+		// which it skips entirely when the send raised.
+		if d.onEDUsSent != nil {
+			var toDevice, deviceList int64
+			for _, e := range edus {
+				if e.ToDeviceUpTo > toDevice {
+					toDevice = e.ToDeviceUpTo
+				}
+				if e.DeviceListUpTo > deviceList {
+					deviceList = e.DeviceListUpTo
+				}
+			}
+			if toDevice > 0 || deviceList > 0 {
+				d.onEDUsSent(d.name, toDevice, deviceList)
+			}
+		}
 
 		if len(pdus) > 0 {
 			last := pdus[len(pdus)-1].StreamOrdering
@@ -228,7 +286,7 @@ func (d *Destination) Run(ctx context.Context) {
 // Not removing is the point. If the send fails, the units must still be queued,
 // and a take-then-restore would reorder them against anything enqueued in the
 // meantime. Only dequeue, after a confirmed delivery, actually removes.
-func (d *Destination) takeLocked() ([]PDU, []txn.EDU) {
+func (d *Destination) takeLocked() ([]PDU, []EDU) {
 	pdus := d.pendingPDUs
 	if len(pdus) > d.limits.MaxPDUs {
 		pdus = pdus[:d.limits.MaxPDUs]
@@ -247,12 +305,14 @@ func (d *Destination) dequeue(pdus, edus int) {
 	d.mu.Unlock()
 }
 
-func (d *Destination) send(ctx context.Context, pdus []PDU, edus []txn.EDU) error {
+func (d *Destination) send(ctx context.Context, pdus []PDU, edus []EDU) error {
 	t := txn.Transaction{OriginServerTS: time.Now().UnixMilli()}
 	for _, p := range pdus {
 		t.PDUs = append(t.PDUs, p.JSON)
 	}
-	t.EDUs = edus
+	for _, e := range edus {
+		t.EDUs = append(t.EDUs, e.Unit)
+	}
 
 	req, err := d.signer.Build(d.ids.Next(), d.name, t)
 	if err != nil {
@@ -303,7 +363,7 @@ func (d *Destination) Release() {
 	d.mu.Unlock()
 }
 
-// PeekEDUs returns a copy of the queued EDUs.
+// PeekEDUs returns a copy of the queued EDU units.
 //
 // For metrics and tests. A copy rather than the slice itself, because the
 // transmission loop takes it without removing and a caller holding the live
@@ -311,7 +371,9 @@ func (d *Destination) Release() {
 func (d *Destination) PeekEDUs() []txn.EDU {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	out := make([]txn.EDU, len(d.pendingEDUs))
-	copy(out, d.pendingEDUs)
+	out := make([]txn.EDU, 0, len(d.pendingEDUs))
+	for _, e := range d.pendingEDUs {
+		out = append(out, e.Unit)
+	}
 	return out
 }

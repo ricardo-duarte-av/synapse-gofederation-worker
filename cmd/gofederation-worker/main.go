@@ -142,7 +142,10 @@ type worker struct {
 	cfg *config.Resolved
 	log zerolog.Logger
 
-	db      *store.Store
+	db *store.Store
+	// writer is nil in shadow mode, which is what guarantees a shadow has no
+	// writable handle to Synapse's tables anywhere in the process.
+	writer  *store.Writer
 	cursors *state.Store
 	diff    *difflog.Writer
 	capture *capture.WorkerCapture
@@ -173,6 +176,26 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	if err := w.checkReadOnly(openCtx); err != nil {
 		w.close()
 		return nil, err
+	}
+
+	// The writable pool exists only in primary mode. Constructed here rather
+	// than lazily, so a role that cannot actually write is a startup failure
+	// rather than a stream of silent errors hours later.
+	if cfg.Mode == config.ModePrimary {
+		if w.writer, err = store.OpenWriter(openCtx, store.Config{
+			DSN:            cfg.Database.WriteDSN,
+			MaxConns:       cfg.Database.MaxConns,
+			ConnectTimeout: cfg.ConnectTimeout(),
+		}); err != nil {
+			w.close()
+			return nil, err
+		}
+		if err := w.writer.CanWrite(openCtx); err != nil {
+			w.close()
+			return nil, err
+		}
+		log.Info().Msg("primary mode: this worker is the homeserver's federation sender " +
+			"and keeps its own bookkeeping in Synapse's tables")
 	}
 
 	stateDSN := cfg.State.DSN
@@ -281,18 +304,23 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		Sink:          out,
 		Log:           log,
 		MaxConcurrent: cfg.Queue.MaxConcurrentDestinations,
+		OnSuccess:     w.onDelivered,
+		OnEDUsSent:    w.onEDUsDelivered,
+		OnOutcome:     w.onSendOutcome,
 	})
 
 	w.sender = sender.New(sender.Config{
-		Store:        w.db,
-		Cursors:      w.cursors,
-		Resolver:     destinations.NewResolver(w.db, cfg.ServerName, cfg.Synapse.DomainWhitelist),
-		Queues:       w.queues,
-		Observer:     &observer{diff: w.diff},
-		Log:          log,
-		ServerName:   cfg.ServerName,
-		ShouldHandle: cfg.ShouldHandle,
-		BatchLimit:   cfg.Queue.EventBatchLimit,
+		Store:          w.db,
+		Cursors:        w.cursors,
+		Resolver:       destinations.NewResolver(w.db, cfg.ServerName, cfg.Synapse.DomainWhitelist),
+		Queues:         w.queues,
+		Observer:       &observer{diff: w.diff},
+		Log:            log,
+		ServerName:     cfg.ServerName,
+		ShouldHandle:   cfg.ShouldHandle,
+		BatchLimit:     cfg.Queue.EventBatchLimit,
+		RecordRoutes:   w.recordRoutes,
+		RecordPosition: w.recordPosition,
 	})
 
 	w.devices = sender.NewDevices(sender.DevicesConfig{
@@ -363,6 +391,9 @@ func (w *worker) close() {
 	}
 	if w.cursors != nil {
 		w.cursors.Close()
+	}
+	if w.writer != nil {
+		w.writer.Close()
 	}
 	if w.db != nil {
 		w.db.Close()

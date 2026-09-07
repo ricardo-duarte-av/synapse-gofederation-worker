@@ -134,13 +134,21 @@ func (d *Devices) toDeviceFor(ctx context.Context, server string, current int64)
 	}
 
 	q := d.queues.Get(server)
-	for _, m := range msgs {
+	for i, m := range msgs {
 		// Synapse emits one EDU per row rather than merging them
 		// (per_destination_queue.py:700).
-		q.EnqueueEDU(txn.EDU{
+		e := queue.EDU{Unit: txn.EDU{
 			Type:    txn.EDUTypeDirectToDevice,
 			Content: json.RawMessage(m.MessagesJSON),
-		})
+		}}
+		// Only the LAST unit carries the mark. The deletion is
+		// "everything up to this stream id", so marking each one would
+		// delete rows whose EDU had not yet been delivered if the
+		// transaction took only a prefix of the batch.
+		if i == len(msgs)-1 {
+			e.ToDeviceUpTo = next
+		}
+		q.EnqueueMarkedEDU(e)
 	}
 	d.queues.Wake(q)
 
@@ -204,8 +212,12 @@ func (d *Devices) deviceListsFor(ctx context.Context, server string, current int
 	}
 
 	q := d.queues.Get(server)
-	for _, e := range edus {
-		q.EnqueueEDU(e)
+	for i, e := range edus {
+		m := queue.EDU{Unit: e}
+		if i == len(edus)-1 {
+			m.DeviceListUpTo = highest
+		}
+		q.EnqueueMarkedEDU(m)
 	}
 	d.queues.Wake(q)
 

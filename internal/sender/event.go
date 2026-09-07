@@ -116,6 +116,13 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 	if err := s.cfg.Cursors.RecordRoutes(ctx, routes); err != nil {
 		return false, err
 	}
+	// In primary mode the same decision goes where Synapse keeps it, because
+	// catch-up reads that table and nothing else is writing it.
+	if s.cfg.RecordRoutes != nil {
+		if err := s.cfg.RecordRoutes(ctx, ours, e.RoomID, e.StreamOrdering); err != nil {
+			return false, err
+		}
+	}
 
 	// The fan-out itself, timed separately: it is the thing this worker's
 	// design is a bet on, so "did it help?" has to be answerable directly
