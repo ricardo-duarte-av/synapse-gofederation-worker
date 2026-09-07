@@ -27,16 +27,23 @@ services:
 
     volumes:
       - ./gofederation-worker.yaml:/data/gofederation-worker.yaml:ro
-      # Synapse's own config is the source of truth for server_name, the
-      # federation sender list, Redis and the retry tuning. Read-only: we never
-      # write it, and federation_sender_instances in particular DEFINES which
-      # destinations are ours, so a stale copy would silently reshard us.
-      - /opt/matrix/synapse/synapse/homeserver.yaml:/etc/synapse/homeserver.yaml:ro
-      # Unlike the read-only workers, a federation SENDER needs the private
-      # signing key: transactions are signed even in shadow mode, so that a
-      # signature over the wrong bytes is caught now rather than on the day
-      # this goes live.
-      - /opt/matrix/synapse/synapse/aguiarvieira.pt.signing.key:/data/signing.key:ro
+      # Synapse's whole data directory, READ-ONLY. It is the source of truth for
+      # server_name, the federation sender list, the database, Redis and the
+      # retry tuning, and federation_sender_instances in particular DEFINES
+      # which destinations are ours, so a stale copy would silently reshard us.
+      #
+      # The directory rather than homeserver.yaml alone, because the private
+      # signing key lives in it and homeserver.yaml is what says so. Unlike the
+      # read-only workers, a federation SENDER needs that key: transactions are
+      # signed even in shadow mode, so a signature over the wrong bytes is
+      # caught now rather than on the day this goes live. signing_key_path names
+      # /data/aguiarvieira.pt.signing.key -- the path inside SYNAPSE's container
+      # -- and the worker falls back to the same basename beside the
+      # homeserver.yaml it read, which is here.
+      #
+      # :ro is the whole point of the line. Nothing in this directory is ever
+      # written by this worker, and the key in particular must not be.
+      - /opt/matrix/synapse/synapse:/etc/synapse:ro
       # PostgreSQL and KeyDB sockets.
       - /var/sockets:/var/sockets
       # These MUST outlive the container. The difflog is the promotion record,

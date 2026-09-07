@@ -218,3 +218,94 @@ func TestModeInvertsTheWorkerNameCheck(t *testing.T) {
 		t.Errorf("unhelpful error: %v", err)
 	}
 }
+
+func withDatabase(scfg *synapsecfg.Config) *synapsecfg.Config {
+	scfg.Database = synapsecfg.Database{
+		Present:  true,
+		User:     "synapse",
+		Password: "a b'c",
+		DBName:   "synapse-db",
+		Host:     "/var/sockets",
+	}
+	return scfg
+}
+
+// The point of reading homeserver.yaml: a deployment that says nothing about
+// the database still connects to the one the homeserver actually uses.
+func TestDatabaseComesFromSynapseWhenUnset(t *testing.T) {
+	cfg := worker(t, "")
+	cfg.Database.DSN = ""
+	r, err := Resolve(cfg, withDatabase(synapse()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.DatabaseFromSynapse {
+		t.Error("DatabaseFromSynapse should be set when the dsn was derived")
+	}
+	// Keyword form, with the password quoted because it contains a space and a
+	// quote -- the reason values are escaped at all.
+	want := `host=/var/sockets user=synapse password='a b\'c' dbname=synapse-db`
+	if r.DatabaseDSN != want {
+		t.Errorf("DatabaseDSN = %q, want %q", r.DatabaseDSN, want)
+	}
+	// state.dsn is unset in the minimal config, so it follows.
+	if r.StateDSN != want {
+		t.Errorf("StateDSN = %q, want the same connection", r.StateDSN)
+	}
+	if r.WriteDSN != "" {
+		t.Errorf("WriteDSN = %q, want empty in shadow mode", r.WriteDSN)
+	}
+}
+
+func TestConfiguredDatabaseDSNWins(t *testing.T) {
+	r, err := Resolve(worker(t, ""), withDatabase(synapse()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.DatabaseFromSynapse {
+		t.Error("an explicit database.dsn should not be reported as derived")
+	}
+	if r.DatabaseDSN != "host=/var/sockets user=gofed_ro dbname=synapse-db" {
+		t.Errorf("DatabaseDSN = %q, want the configured one", r.DatabaseDSN)
+	}
+}
+
+// Synapse's own role writes to these tables for a living, so a requirement it
+// cannot satisfy is refused at startup rather than at the first query.
+func TestRequireReadOnlyRefusesTheDerivedConnection(t *testing.T) {
+	cfg := worker(t, "\n  require_read_only: true\n")
+	cfg.Database.DSN = ""
+	_, err := Resolve(cfg, withDatabase(synapse()))
+	if err == nil {
+		t.Fatal("require_read_only was accepted over Synapse's own connection")
+	}
+	if !strings.Contains(err.Error(), "read-write role") {
+		t.Errorf("unhelpful error: %v", err)
+	}
+}
+
+func TestMissingDatabaseEverywhereIsAnError(t *testing.T) {
+	cfg := worker(t, "")
+	cfg.Database.DSN = ""
+	if _, err := Resolve(cfg, synapse()); err == nil {
+		t.Error("resolved a worker with no database connection anywhere")
+	}
+}
+
+// A primary that names no write_dsn takes Synapse's, which is by definition
+// able to write: it is what Synapse writes with.
+func TestPrimaryWithoutAWriteDSNTakesSynapses(t *testing.T) {
+	primary := worker(t, "")
+	primary.Mode = ModePrimary
+	primary.WorkerName = "av-federation-sender-worker-1"
+	primary.Shadow.Enabled = new(bool)
+	primary.Shadow.SendToAll = true
+	primary.Database.DSN = ""
+	r, err := Resolve(primary, withDatabase(synapse()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.WriteDSN != r.DatabaseDSN {
+		t.Errorf("WriteDSN = %q, want Synapse's connection %q", r.WriteDSN, r.DatabaseDSN)
+	}
+}

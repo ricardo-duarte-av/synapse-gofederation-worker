@@ -4,8 +4,9 @@
 # are the ones INSIDE the container, as mounted by that compose file.
 #
 # Anything derivable from Synapse's own config is not repeated here:
-# server_name, the federation sender list, the signing key path, Redis and the
-# retry tuning are read from homeserver.yaml at every start. That is deliberate
+# server_name, the federation sender list, the signing key, the PostgreSQL
+# connection, Redis and the retry tuning are read from homeserver.yaml at every
+# start. That is deliberate
 # -- federation_sender_instances is not a value we consume but the value that
 # DEFINES which destinations are ours, since the shard is
 # sha256(destination) mod len(instances). A stale copy would not fail; it would
@@ -23,13 +24,16 @@
 # and process nothing at all, while looking perfectly healthy.
 worker_name: av-gofederation-worker-1
 
-# Synapse's homeserver.yaml, mounted read-only.
+# Synapse's homeserver.yaml, inside the data directory the compose file mounts
+# read-only at /etc/synapse.
 synapse_config: /etc/synapse/homeserver.yaml
 
-# homeserver.yaml's signing_key_path names a path inside SYNAPSE's container
-# (/data/aguiarvieira.pt.signing.key). This worker mounts the same file
-# elsewhere, so it says where.
-signing_key_path: /data/signing.key
+# The signing key comes from homeserver.yaml too. Its signing_key_path names a
+# path inside SYNAPSE's container (/data/aguiarvieira.pt.signing.key); since
+# that whole directory is mounted here, the worker finds the same file beside
+# the homeserver.yaml it just read. Set signing_key_path below only if the
+# directory is NOT mounted whole and the key really is somewhere else.
+# signing_key_path: /data/signing.key
 
 shadow:
   # true = dry-run. The full pipeline runs -- destinations resolved, shard
@@ -94,21 +98,31 @@ shadow:
 #     destination_max_retry_interval: 12h
 
 database:
-  # Synapse's database, read-only. libpq keyword form, not a URI.
-  # host=/var/sockets is the direct unix socket with peer auth as uid 991; the
-  # Go workers deliberately bypass the pgcat pooler homeserver.yaml uses.
-  dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+  # Omitted: the connection is built from homeserver.yaml's `database:` block --
+  # host, port, user, password, dbname -- so there is one statement of where the
+  # homeserver's data lives rather than two that can drift.
+  #
+  # Set dsn to connect DIFFERENTLY from Synapse, which is what a shadow should
+  # do. libpq keyword form, not a URI. This deployment's read-only role, on the
+  # direct unix socket with peer auth as uid 991, deliberately bypassing the
+  # pgcat pooler homeserver.yaml points at:
+  #
+  #   dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+  #
   max_conns: 16
   connect_timeout_seconds: 10
-  # Refuse to start if the role can write to Synapse's tables. Off by default
-  # so a scratch database works for development; ON in production, because
-  # three of the tables this reads are consumed by the real senders.
-  require_read_only: true
+  # Refuse to start if the role can write to Synapse's tables. Requires the dsn
+  # above: homeserver.yaml can only ever give us Synapse's own read-write role,
+  # so this and a derived connection are refused together at startup rather than
+  # pretending to hold. Set both in production -- three of the tables this reads
+  # are consumed by the real senders.
+  # require_read_only: true
 
 state:
   # Our own cursors and routing record -- the only things this worker writes
   # anywhere. A separate role with access to one schema. See
-  # deploy/state-role.sql.
+  # deploy/state-role.sql. Omitting it reuses the database connection above,
+  # which only works if that role can write to our schema.
   dsn: "host=/var/sockets user=gofed_state dbname=synapse-db"
   table: gofederation.stream_positions
   # Our copy of Synapse's destination_rooms, which the routing comparison

@@ -113,6 +113,11 @@ type Config struct {
 	Redis Redis
 	Retry Retry
 
+	// Database is Synapse's own PostgreSQL connection. Read here so the worker
+	// does not carry a second, drifting copy of where the homeserver's data
+	// actually lives; gofederation-worker.yaml's database.dsn overrides it.
+	Database Database
+
 	// ClientTimeout, MaxLongRetries and MaxLongRetryDelay bound ONE outbound
 	// request. Distinct from Retry, which is the per-destination backoff that
 	// persists across transactions: these govern a single PUT to /send, which
@@ -168,6 +173,21 @@ type raw struct {
 		DBID     int    `yaml:"dbid"`
 	} `yaml:"redis"`
 
+	Database struct {
+		Name string `yaml:"name"`
+		Args struct {
+			User     string `yaml:"user"`
+			Password string `yaml:"password"`
+			// psycopg2 accepts either spelling; Synapse's own documented
+			// example uses `database`.
+			Database string `yaml:"database"`
+			DBName   string `yaml:"dbname"`
+			Host     string `yaml:"host"`
+			Port     int    `yaml:"port"`
+			SSLMode  string `yaml:"sslmode"`
+		} `yaml:"args"`
+	} `yaml:"database"`
+
 	Federation struct {
 		DestinationMinRetryInterval any     `yaml:"destination_min_retry_interval"`
 		DestinationRetryMultiplier  float64 `yaml:"destination_retry_multiplier"`
@@ -187,12 +207,13 @@ type raw struct {
 type Options struct {
 	// SigningKeyPath overrides signing_key_path.
 	//
-	// Needed because homeserver.yaml's value is a path inside Synapse's own
-	// container (/data/<server_name>.signing.key on this deployment), and the
-	// Go workers mount the same file at a path of their own -- media-worker
-	// uses /data/signing.key. Without an override, every host-side tool and
-	// every container with a different layout would fail at startup on a path
-	// that is perfectly correct for Synapse.
+	// Rarely needed now: homeserver.yaml's value is a path inside Synapse's own
+	// container (/data/<server_name>.signing.key on this deployment), and a
+	// deployment that mounts Synapse's config directory read-only gets the key
+	// found beside homeserver.yaml without saying anything -- see
+	// readSigningKeyFile. This remains for the case the directory is NOT
+	// mounted whole and the key really is somewhere else, which is mostly
+	// host-side tools and tests.
 	SigningKeyPath string
 }
 
@@ -233,6 +254,9 @@ func LoadWithOptions(path string, opts Options) (*Config, error) {
 		return nil, err
 	}
 	if cfg.SigningKeys, err = loadSigningKeys(r, path, opts.SigningKeyPath); err != nil {
+		return nil, err
+	}
+	if cfg.Database, err = database(r); err != nil {
 		return nil, err
 	}
 
@@ -347,6 +371,14 @@ func instanceMap(r raw) (map[string]Instance, error) {
 // "<algorithm> <version> <unpadded-base64 32-byte seed>". A relative path is
 // resolved against homeserver.yaml's directory, which is how Synapse's
 // config-directory handling behaves for the deployments this runs in.
+//
+// An ABSOLUTE path gets a second chance beside homeserver.yaml. The path in
+// the file is the one inside SYNAPSE's container -- /data/<server_name>.signing.key
+// here -- while this worker mounts Synapse's config directory somewhere of its
+// own (/etc/synapse). Since the key lives in that same directory, looking for
+// its basename next to the homeserver.yaml we just read finds it, and means a
+// deployment that mounts the directory read-only says where the key is exactly
+// once: in Synapse's own config. See resolveSigningKeyPath.
 func loadSigningKeys(r raw, cfgPath, override string) ([]SigningKey, error) {
 	body := r.SigningKey
 	// An explicit override wins even over an inline signing_key, so a
@@ -364,12 +396,9 @@ func loadSigningKeys(r raw, cfgPath, override string) ([]SigningKey, error) {
 			// directory.
 			p = r.ServerName + ".signing.key"
 		}
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(filepath.Dir(cfgPath), p)
-		}
-		b, err := os.ReadFile(p)
+		b, err := readSigningKeyFile(p, cfgPath)
 		if err != nil {
-			return nil, fmt.Errorf("synapsecfg: reading signing key: %w", err)
+			return nil, err
 		}
 		body = string(b)
 	}
@@ -378,6 +407,39 @@ func loadSigningKeys(r raw, cfgPath, override string) ([]SigningKey, error) {
 		return nil, fmt.Errorf("synapsecfg: %w", err)
 	}
 	return keys, nil
+}
+
+// readSigningKeyFile resolves p against homeserver.yaml and reads it.
+//
+// The fallback only ever looks in the directory homeserver.yaml itself came
+// from, and only for the basename Synapse's own config named. It cannot pick up
+// some other key: if that file is not there, the original error is reported,
+// naming both paths, because "no such file: /data/x.signing.key" from inside a
+// container that has no /data is a confusing thing to be told.
+func readSigningKeyFile(p, cfgPath string) ([]byte, error) {
+	dir := filepath.Dir(cfgPath)
+	resolved := p
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(dir, resolved)
+	}
+	b, err := os.ReadFile(resolved)
+	if err == nil {
+		return b, nil
+	}
+	if !os.IsNotExist(err) || !filepath.IsAbs(p) {
+		return nil, fmt.Errorf("synapsecfg: reading signing key: %w", err)
+	}
+	beside := filepath.Join(dir, filepath.Base(p))
+	if beside == resolved {
+		return nil, fmt.Errorf("synapsecfg: reading signing key: %w", err)
+	}
+	b, err2 := os.ReadFile(beside)
+	if err2 != nil {
+		return nil, fmt.Errorf(
+			"synapsecfg: reading signing key: %w (and not at %s, beside %s)",
+			err, beside, cfgPath)
+	}
+	return b, nil
 }
 
 // instanceList accepts Synapse's string-or-list, per _instance_to_list_converter.
@@ -442,4 +504,127 @@ func parseDuration(v any) (time.Duration, bool, error) {
 	default:
 		return 0, false, fmt.Errorf("expected a number or a string, got %T", v)
 	}
+}
+
+// Database is Synapse's PostgreSQL connection, from the `database:` block.
+//
+// Read rather than restated for the same reason as everything else here: it is
+// the database this worker must read to produce the same transactions as the
+// sender it shadows. A separate copy that drifts -- a renamed database, a moved
+// socket, a rotated password -- fails at connect time on a good day and reads a
+// stale replica on a bad one.
+//
+// Only the psycopg2 backend is understood. Synapse's sqlite3 backend is not a
+// database this worker can share.
+type Database struct {
+	// Present is false when homeserver.yaml has no usable `database:` block,
+	// which is not by itself an error: gofederation-worker.yaml may carry a
+	// full dsn of its own.
+	Present bool
+
+	User     string
+	Password string
+	DBName   string
+	// Host is a hostname or, when it starts with a slash, the directory
+	// holding the unix socket -- libpq and psycopg2 spell that the same way.
+	Host    string
+	Port    int
+	SSLMode string
+}
+
+// DSN renders the connection in libpq keyword form, which is what pgx takes.
+//
+// Keyword form rather than a URI because a unix-socket directory as the host
+// (host=/var/sockets) needs percent-encoding in a URI and does not here, and
+// because it is the form the sibling workers already use.
+func (d Database) DSN() string {
+	if !d.Present {
+		return ""
+	}
+	var b strings.Builder
+	add := func(k, v string) {
+		if v == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(quoteDSNValue(v))
+	}
+	add("host", d.Host)
+	if d.Port != 0 {
+		add("port", strconv.Itoa(d.Port))
+	}
+	add("user", d.User)
+	add("password", d.Password)
+	add("dbname", d.DBName)
+	add("sslmode", d.SSLMode)
+	return b.String()
+}
+
+// Redacted is DSN with the password replaced, for logs and error messages.
+func (d Database) Redacted() string {
+	r := d
+	if r.Password != "" {
+		r.Password = "xxxxx"
+	}
+	return r.DSN()
+}
+
+// quoteDSNValue escapes a value for libpq keyword/value form: single quotes
+// around anything with whitespace or a quote in it, backslash-escaping the
+// quote and the backslash. Passwords are the reason this exists.
+func quoteDSNValue(v string) string {
+	if !strings.ContainsAny(v, " \t\n\r'\\") {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, c := range v {
+		if c == '\'' || c == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
+// database resolves the `database:` block.
+//
+// Synapse hands `args` straight to psycopg2.connect, so the keys are
+// psycopg2's. It accepts both `database` and `dbname` for the database name,
+// and so do we. cp_min and cp_max are Twisted pool sizes and are deliberately
+// ignored: our pool is sized by database.max_conns.
+func database(r raw) (Database, error) {
+	name := r.Database.Name
+	if name == "" && r.Database.Args.Host == "" && r.Database.Args.Database == "" &&
+		r.Database.Args.DBName == "" {
+		return Database{}, nil
+	}
+	if name != "" && name != "psycopg2" {
+		// sqlite3 is a file this worker has no business opening alongside a
+		// running Synapse, and there is no third backend.
+		return Database{}, fmt.Errorf(
+			"synapsecfg: database.name is %q; only psycopg2 is supported", name)
+	}
+	db := Database{
+		Present:  true,
+		User:     r.Database.Args.User,
+		Password: r.Database.Args.Password,
+		DBName:   r.Database.Args.Database,
+		Host:     r.Database.Args.Host,
+		Port:     r.Database.Args.Port,
+		SSLMode:  r.Database.Args.SSLMode,
+	}
+	if db.DBName == "" {
+		db.DBName = r.Database.Args.DBName
+	}
+	if db.DBName == "" {
+		return Database{}, fmt.Errorf(
+			"synapsecfg: database.args names no database (neither `database` nor `dbname`)")
+	}
+	return db, nil
 }

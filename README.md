@@ -124,9 +124,18 @@ psql -h /var/sockets -U synapse -d synapse-db -f deploy/readonly-role.sql
 psql -h /var/sockets -U synapse -d synapse-db -f deploy/state-role.sql
 ```
 
-`require_read_only: true` then makes a role with write access to Synapse's
-tables a startup failure rather than a warning. Three of the tables this reads
-are consumed by the real senders — see [docs/shadow-safety.md](docs/shadow-safety.md).
+Naming that read-only role in `database.dsn` is what makes the guarantee real,
+and `require_read_only: true` then turns a role with write access to Synapse's
+tables into a startup failure rather than a warning. Three of the tables this
+reads are consumed by the real senders — see
+[docs/shadow-safety.md](docs/shadow-safety.md).
+
+Left unset, `database.dsn` is built from `homeserver.yaml`'s own `database:`
+block instead — host, port, user, password and database name — so a deployment
+that does not care to separate roles states the connection nowhere. That
+connection is Synapse's own read-write role, so it cannot satisfy
+`require_read_only`, and asking for both is refused at startup rather than
+quietly downgraded.
 
 ### 2. Configuration
 
@@ -135,7 +144,13 @@ cp deploy/gofederation-worker.example.yaml gofederation-worker.yaml
 ```
 
 The paths in it are the ones inside the container, as mounted by the compose
-file. Two fields decide whether it works at all:
+file, which mounts Synapse's data directory read-only at `/etc/synapse`. The
+directory rather than `homeserver.yaml` alone: the private signing key lives
+beside it, and `signing_key_path` names the path inside *Synapse's* container
+(`/data/<server_name>.signing.key`), so the worker looks for that same file name
+next to the `homeserver.yaml` it read. Nothing under that mount is ever written.
+
+Two fields decide whether it works at all:
 
 - **`worker_name`** is this process's own identity and must **not** appear in
   `federation_sender_instances`. Startup refuses that, because the replication

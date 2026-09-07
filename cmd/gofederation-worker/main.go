@@ -174,11 +174,16 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 
 	var err error
 	if w.db, err = store.Open(openCtx, store.Config{
-		DSN:            cfg.Database.DSN,
+		DSN:            cfg.DatabaseDSN,
 		MaxConns:       cfg.Database.MaxConns,
 		ConnectTimeout: cfg.ConnectTimeout(),
 	}); err != nil {
 		return nil, err
+	}
+
+	if cfg.DatabaseFromSynapse {
+		log.Info().Str("dsn", cfg.Synapse.Database.Redacted()).
+			Msg("connected to Synapse's database as configured in homeserver.yaml")
 	}
 
 	if err := w.checkReadOnly(openCtx); err != nil {
@@ -191,7 +196,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	// rather than a stream of silent errors hours later.
 	if cfg.Mode == config.ModePrimary {
 		if w.writer, err = store.OpenWriter(openCtx, store.Config{
-			DSN:            cfg.Database.WriteDSN,
+			DSN:            cfg.WriteDSN,
 			MaxConns:       cfg.Database.MaxConns,
 			ConnectTimeout: cfg.ConnectTimeout(),
 		}); err != nil {
@@ -206,12 +211,8 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			"and keeps its own bookkeeping in Synapse's tables")
 	}
 
-	stateDSN := cfg.State.DSN
-	if stateDSN == "" {
-		stateDSN = cfg.Database.DSN
-	}
 	if w.cursors, err = state.Open(openCtx, state.Config{
-		DSN:            stateDSN,
+		DSN:            cfg.StateDSN,
 		Table:          cfg.State.Table,
 		RoutesTable:    cfg.State.RoutesTable,
 		InstanceName:   cfg.WorkerName,
@@ -433,10 +434,16 @@ func (w *worker) checkReadOnly(ctx context.Context) error {
 	}
 	// A warning rather than a refusal, because a scratch database is a
 	// legitimate way to develop against this. In production, set
-	// require_read_only.
-	w.log.Warn().Str("role", role).Msg(
-		"the Synapse database role can WRITE; production should use a read-only role " +
-			"(deploy/readonly-role.sql) and set database.require_read_only")
+	// require_read_only -- which means naming a read-only role in
+	// database.dsn, since homeserver.yaml can only ever give us Synapse's own.
+	msg := "the Synapse database role can WRITE; production should use a read-only role " +
+		"(deploy/readonly-role.sql) and set database.require_read_only"
+	if w.cfg.DatabaseFromSynapse {
+		msg = "the Synapse database connection comes from homeserver.yaml, so it is " +
+			"Synapse's own read-write role; a shadow should name a read-only role in " +
+			"database.dsn (deploy/readonly-role.sql)"
+	}
+	w.log.Warn().Str("role", role).Msg(msg)
 	return nil
 }
 

@@ -40,6 +40,14 @@ The startup check asserts the role really is read-only and exposes it as a
 gauge, following the precedent in gosync-worker. It warns rather than refuses,
 because a deployment may legitimately point at a scratch database.
 
+This is the one thing a shadow should not inherit from `homeserver.yaml`.
+Leaving `database.dsn` unset builds the connection from Synapse's own
+`database:` block, which means Synapse's own read-write role, and the guarantee
+above becomes a warning in the log rather than a `SELECT`-only grant. A shadow
+deployment names `gofed_ro` in `database.dsn` and sets `require_read_only`; the
+two are refused together with a derived connection, so the combination cannot
+silently mean nothing.
+
 Three tables would be actively destructive to touch:
 
 - `federation_stream_position` — see `docs/synapse-reference.md` §7. Synapse

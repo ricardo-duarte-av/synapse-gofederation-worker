@@ -135,6 +135,13 @@ type ShadowConfig struct {
 type DatabaseConfig struct {
 	// DSN is a libpq keyword string, not a URI, matching the sibling workers:
 	//   host=/var/sockets user=gofed_ro dbname=synapse-db
+	//
+	// Empty is the normal case: the connection is then built from
+	// homeserver.yaml's `database:` block, so there is one statement of where
+	// the homeserver's data lives rather than two that can drift. Set it only
+	// to connect differently from Synapse -- under a read-only role, or
+	// bypassing a pooler -- and see RequireReadOnly, which the derived
+	// connection cannot satisfy because it is Synapse's own read-write role.
 	DSN                   string `yaml:"dsn"`
 	MaxConns              int32  `yaml:"max_conns"`
 	ConnectTimeoutSeconds int    `yaml:"connect_timeout_seconds"`
@@ -152,17 +159,19 @@ type DatabaseConfig struct {
 	//
 	// Kept separate from DSN, under its own role, so the reading path stays
 	// provably read-only and a shadow deployment has no writable handle to
-	// Synapse's tables anywhere in the process. Required in primary mode and
-	// refused in shadow mode.
+	// Synapse's tables anywhere in the process. Refused in shadow mode; in
+	// primary mode it may be left empty, which falls back to homeserver.yaml's
+	// own connection -- definitionally able to write, since it is what Synapse
+	// writes with.
 	WriteDSN string `yaml:"write_dsn"`
 }
 
 // StateConfig is our own cursor storage -- the only thing this worker writes.
 type StateConfig struct {
 	// DSN is a separate connection, under a separate role with write access to
-	// exactly one table and nothing else. Empty means reuse the read-only
-	// database connection, which only works if that role can write, so it is
-	// really only for tests.
+	// exactly one table and nothing else. Empty means reuse whatever the
+	// Synapse database connection resolved to, which only works if that role
+	// can write to our schema.
 	DSN string `yaml:"dsn"`
 	// Table is the qualified name of our cursor table.
 	Table string `yaml:"table"`
@@ -324,10 +333,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: mode %q is not %q or %q", c.Mode, ModeShadow, ModePrimary)
 	}
 	if c.Mode == ModePrimary {
-		if c.Database.WriteDSN == "" {
-			return fmt.Errorf("config: database.write_dsn is required in primary mode; " +
-				"a sender's bookkeeping is a set of deletions and it cannot be done read-only")
-		}
+		// database.write_dsn is not required here: an empty one falls back to
+		// homeserver.yaml's connection in Resolve, which is the role Synapse
+		// itself writes with. Whether anything writable exists at all is
+		// checked there, where homeserver.yaml has been read.
 		if c.Database.RequireReadOnly {
 			return fmt.Errorf("config: database.require_read_only cannot be set in primary " +
 				"mode; the worker must write its own bookkeeping")
@@ -352,9 +361,6 @@ func (c *Config) validate() error {
 	if c.Mode == ModeShadow && c.Shadow.Instance == "" {
 		return fmt.Errorf("config: shadow.instance is required in shadow mode; it names the " +
 			"federation sender whose shard this worker takes")
-	}
-	if c.Database.DSN == "" {
-		return fmt.Errorf("config: database.dsn is required")
 	}
 	if c.Database.MaxConns < 1 {
 		return fmt.Errorf("config: database.max_conns must be at least 1, got %d", c.Database.MaxConns)

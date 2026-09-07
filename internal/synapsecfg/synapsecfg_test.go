@@ -3,6 +3,7 @@ package synapsecfg
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -240,5 +241,114 @@ func TestParseSigningKeysSkipsBlanksAndComments(t *testing.T) {
 	}
 	if len(keys) != 2 {
 		t.Fatalf("parsed %d keys, want 2", len(keys))
+	}
+}
+
+func TestDatabaseArgsBecomeALibpqDSN(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimal+`
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    password: "hunter2"
+    database: synapse-db
+    host: /var/sockets
+    cp_min: 5
+    cp_max: 10
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Database.Present {
+		t.Fatal("database block was not read")
+	}
+	// cp_min and cp_max are Twisted pool sizes and must not leak into the DSN.
+	want := "host=/var/sockets user=synapse password=hunter2 dbname=synapse-db"
+	if got := cfg.Database.DSN(); got != want {
+		t.Errorf("DSN() = %q, want %q", got, want)
+	}
+	if got := cfg.Database.Redacted(); got == want || !strings.Contains(got, "xxxxx") {
+		t.Errorf("Redacted() = %q, want the password hidden", got)
+	}
+}
+
+// psycopg2 takes either spelling, and a TCP host needs the port carried over.
+func TestDatabaseAcceptsDBNameAndPort(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimal+`
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    dbname: synapse
+    host: db.internal
+    port: 6432
+    sslmode: require
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "host=db.internal port=6432 user=synapse dbname=synapse sslmode=require"
+	if got := cfg.Database.DSN(); got != want {
+		t.Errorf("DSN() = %q, want %q", got, want)
+	}
+}
+
+// A password with a space or a quote in it is exactly what an unescaped
+// keyword string gets wrong, and it fails at connect time with a message about
+// the wrong keyword.
+func TestDatabasePasswordIsQuoted(t *testing.T) {
+	d := Database{Present: true, User: "u", DBName: "d", Password: `a b'c\d`}
+	want := `user=u password='a b\'c\\d' dbname=d`
+	if got := d.DSN(); got != want {
+		t.Errorf("DSN() = %q, want %q", got, want)
+	}
+}
+
+func TestSqliteIsRefused(t *testing.T) {
+	_, err := Load(writeConfig(t, minimal+"database:\n  name: sqlite3\n  args:\n    database: /data/homeserver.db\n"))
+	if err == nil {
+		t.Error("a sqlite3 database was accepted")
+	}
+}
+
+func TestNoDatabaseBlockIsNotAnError(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Present || cfg.Database.DSN() != "" {
+		t.Errorf("Database = %+v, want absent", cfg.Database)
+	}
+}
+
+// homeserver.yaml names the key by the path inside SYNAPSE's container. When
+// the whole config directory is mounted elsewhere read-only, the key is beside
+// the homeserver.yaml we just read, and that is where the fallback looks.
+func TestAbsoluteSigningKeyPathFallsBackBesideTheConfig(t *testing.T) {
+	p := writeConfig(t, "server_name: \"example.com\"\nsigning_key_path: /data/signing.key\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.SigningKeys) != 2 {
+		t.Fatalf("SigningKeys = %v", cfg.SigningKeys)
+	}
+	if cfg.SigningKeys[0].Version != "a_Yofy" {
+		t.Errorf("first key = %q, want the one Synapse signs with", cfg.SigningKeys[0].Version)
+	}
+}
+
+// The fallback only looks for the basename Synapse named, in the directory
+// homeserver.yaml came from. A key that is in neither place is an error naming
+// both, not a silently different key.
+func TestSigningKeyMissingInBothPlacesNamesBoth(t *testing.T) {
+	p := writeConfig(t, "server_name: \"example.com\"\nsigning_key_path: /data/other.signing.key\n")
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("a missing signing key was accepted")
+	}
+	if !strings.Contains(err.Error(), "/data/other.signing.key") ||
+		!strings.Contains(err.Error(), filepath.Dir(p)) {
+		t.Errorf("error names only one location: %v", err)
 	}
 }

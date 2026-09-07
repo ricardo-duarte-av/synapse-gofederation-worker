@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -89,7 +91,6 @@ func TestRequiredFields(t *testing.T) {
 		"no worker_name":     "synapse_config: /h.yaml\nshadow:\n  instance: w1\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
 		"no synapse_config":  "worker_name: w\nshadow:\n  instance: w1\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
 		"no shadow.instance": "worker_name: w\nsynapse_config: /h.yaml\nshadow:\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
-		"no database.dsn":    "worker_name: w\nsynapse_config: /h.yaml\nshadow:\n  instance: w1\n  difflog_dir: /d\n",
 		"no difflog while shadowing": "worker_name: w\nsynapse_config: /h.yaml\nshadow:\n  instance: w1\n" +
 			"database:\n  dsn: x\n",
 	} {
@@ -217,8 +218,11 @@ database:
   dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
 `
 	// A primary must be able to write; its bookkeeping is a set of deletions.
-	if _, err := Parse([]byte(base)); err == nil {
-		t.Error("primary mode was accepted with no write_dsn")
+	// An absent write_dsn is not refused here, though: it falls back to
+	// homeserver.yaml's own connection, which is checked in Resolve where that
+	// file has been read. See TestPrimaryWithoutAWriteDSNTakesSynapses.
+	if _, err := Parse([]byte(base)); err != nil {
+		t.Errorf("primary mode with no write_dsn should parse: %v", err)
 	}
 
 	withWrite := base + `  write_dsn: "host=/var/sockets user=gofed_rw dbname=synapse-db"
@@ -265,5 +269,30 @@ func TestShadowModeRefusesAWriteDSN(t *testing.T) {
 func TestUnknownModeIsRejected(t *testing.T) {
 	if _, err := Parse([]byte(minimal + "\nmode: sortof\n")); err == nil {
 		t.Error("an unknown mode was accepted")
+	}
+}
+
+// The example is what every deployment starts from, so a key that no longer
+// parses -- KnownFields makes any stale one a hard error -- should fail here
+// rather than at the first `docker compose up`.
+func TestTheExampleConfigParses(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "deploy",
+		"gofederation-worker.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The example must ship inert. Everything else in it is a matter of taste;
+	// this is not.
+	if !cfg.ShadowEnabled() {
+		t.Error("the example config is not in shadow mode")
+	}
+	// database.dsn is commented out in the example: the connection comes from
+	// homeserver.yaml, which is the change this documents.
+	if cfg.Database.DSN != "" {
+		t.Errorf("database.dsn = %q, want it left to homeserver.yaml", cfg.Database.DSN)
 	}
 }

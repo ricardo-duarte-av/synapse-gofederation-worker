@@ -37,6 +37,21 @@ type Resolved struct {
 	// RedisAddress and RedisChannel are what the subscriber connects to.
 	RedisAddress string
 	RedisChannel string
+
+	// DatabaseDSN, StateDSN and WriteDSN are the connections the worker opens,
+	// with the fallbacks already applied: our own dsn if set, otherwise
+	// homeserver.yaml's `database:` block. Read these rather than
+	// Config.Database.DSN, which is only what the file said.
+	DatabaseDSN string
+	StateDSN    string
+	// WriteDSN is empty in shadow mode, and that is the guarantee: no writable
+	// handle to Synapse's tables is constructed anywhere in the process.
+	WriteDSN string
+
+	// DatabaseFromSynapse records that DatabaseDSN was derived rather than
+	// configured, which changes what a writable role means -- Synapse's own
+	// role can write by definition, so require_read_only cannot hold.
+	DatabaseFromSynapse bool
 }
 
 // Resolve merges the worker config with Synapse's and validates the pair.
@@ -128,7 +143,68 @@ func Resolve(cfg *Config, scfg *synapsecfg.Config) (*Resolved, error) {
 		return nil, fmt.Errorf("config: no signing keys were loaded")
 	}
 
+	if err := resolveDatabases(r, cfg, scfg); err != nil {
+		return nil, err
+	}
+
 	return r, nil
+}
+
+// resolveDatabases decides the three connection strings.
+//
+// Ours wins where it is set; otherwise the homeserver's, for the same reason as
+// everything else read from homeserver.yaml -- the worker reads Synapse's
+// database to reproduce Synapse's decisions, and a second copy of where that
+// database is can only ever be wrong later.
+func resolveDatabases(r *Resolved, cfg *Config, scfg *synapsecfg.Config) error {
+	derived := scfg.Database.DSN()
+
+	r.DatabaseDSN = cfg.Database.DSN
+	if r.DatabaseDSN == "" {
+		if derived == "" {
+			return fmt.Errorf(
+				"config: database.dsn is unset and %s has no usable database block; "+
+					"there is nothing to connect to", scfg.Path)
+		}
+		r.DatabaseDSN = derived
+		r.DatabaseFromSynapse = true
+	}
+
+	// The derived connection is Synapse's own role, which writes to these
+	// tables for a living. Saying require_read_only over it would be a check
+	// that cannot pass, so it is refused at startup rather than at the first
+	// query -- and the fix is named, since it is a different role, not a
+	// different flag.
+	if r.DatabaseFromSynapse && cfg.Database.RequireReadOnly {
+		return fmt.Errorf(
+			"config: database.require_read_only is set but the connection comes from %s, "+
+				"which is Synapse's own read-write role; set database.dsn to a read-only "+
+				"role (deploy/readonly-role.sql) or drop the requirement", scfg.Path)
+	}
+
+	// Empty state.dsn reuses whatever the Synapse connection resolved to. That
+	// only works where that role can write to our schema, which is why the
+	// deployments that mean it give state its own role.
+	r.StateDSN = cfg.State.DSN
+	if r.StateDSN == "" {
+		r.StateDSN = r.DatabaseDSN
+	}
+
+	// In shadow mode this stays empty, and nothing writable is opened at all.
+	if cfg.Mode == ModePrimary {
+		r.WriteDSN = cfg.Database.WriteDSN
+		if r.WriteDSN == "" {
+			if derived == "" {
+				return fmt.Errorf(
+					"config: mode is primary but database.write_dsn is unset and %s has no "+
+						"usable database block; a sender's bookkeeping is a set of deletions "+
+						"and cannot be done read-only", scfg.Path)
+			}
+			r.WriteDSN = derived
+		}
+	}
+
+	return nil
 }
 
 // ShouldHandle reports whether this worker owns a destination.
