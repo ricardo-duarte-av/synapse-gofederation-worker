@@ -38,6 +38,17 @@ var (
 		Help: "1 while the replication subscription is connected.",
 	})
 
+	// EDUsDropped counts ephemeral EDUs abandoned because their destination is
+	// in a long outage.
+	//
+	// Worth a counter of its own because the alternative is invisible: a queue
+	// that stops growing looks identical to a queue that is draining, and this
+	// is the only place read receipts are knowingly thrown away.
+	EDUsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gofed_edus_dropped_total",
+		Help: "Ephemeral EDUs dropped because the destination is in a long outage.",
+	}, []string{"destination"})
+
 	// ReplicationRows counts rows by stream, which is how you find out that a
 	// stream you thought you handled is not arriving.
 	ReplicationRows = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -159,7 +170,7 @@ var (
 func All() []prometheus.Collector {
 	return []prometheus.Collector{
 		BuildInfo, ShadowMode, DatabaseReadOnly,
-		ReplicationLive, ReplicationRows, StreamPosition,
+		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped,
 		EventsProcessed, EventsSkipped, EventsRouted, DestinationsPerEvent,
 		ApproximateRoutes, BatchDuration,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,

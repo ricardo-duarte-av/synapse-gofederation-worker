@@ -32,10 +32,12 @@ type Manager struct {
 	// goroutine parked on the same socket timeout.
 	sem chan struct{}
 
-	onSuccess  func(destination string, streamOrdering int64)
-	onEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
-	onOutcome  func(destination string, delivered bool)
-	due        func(destination string) bool
+	onSuccess     func(destination string, streamOrdering int64)
+	onEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
+	onOutcome     func(destination string, delivered bool)
+	due           func(destination string) bool
+	longBackoff   func(destination string) bool
+	onEDUsDropped func(destination string, n int)
 
 	mu    sync.RWMutex
 	dests map[string]*Destination
@@ -64,6 +66,12 @@ type ManagerConfig struct {
 	OnEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	OnOutcome     func(destination string, delivered bool)
 	Due           func(destination string) bool
+	// LongBackoff reports whether a destination will not be retried for at
+	// least CatchUpRetryInterval, which is when its ephemeral EDUs are dropped
+	// rather than held forever. See Destination.Run.
+	LongBackoff func(destination string) bool
+	// OnEDUsDropped reports what such an outage cost.
+	OnEDUsDropped func(destination string, n int)
 }
 
 // NewManager builds a Manager.
@@ -73,18 +81,20 @@ func NewManager(cfg ManagerConfig) *Manager {
 		maxConcurrent = 2000
 	}
 	return &Manager{
-		limits:     cfg.Limits,
-		signer:     cfg.Signer,
-		ids:        cfg.IDs,
-		sink:       cfg.Sink,
-		log:        cfg.Log,
-		sem:        make(chan struct{}, maxConcurrent),
-		onSuccess:  cfg.OnSuccess,
-		onEDUsSent: cfg.OnEDUsSent,
-		onOutcome:  cfg.OnOutcome,
-		due:        cfg.Due,
-		dests:      map[string]*Destination{},
-		base:       context.Background(),
+		limits:        cfg.Limits,
+		signer:        cfg.Signer,
+		ids:           cfg.IDs,
+		sink:          cfg.Sink,
+		log:           cfg.Log,
+		sem:           make(chan struct{}, maxConcurrent),
+		onSuccess:     cfg.OnSuccess,
+		onEDUsSent:    cfg.OnEDUsSent,
+		onOutcome:     cfg.OnOutcome,
+		due:           cfg.Due,
+		longBackoff:   cfg.LongBackoff,
+		onEDUsDropped: cfg.OnEDUsDropped,
+		dests:         map[string]*Destination{},
+		base:          context.Background(),
 	}
 }
 
@@ -119,16 +129,18 @@ func (m *Manager) Get(name string) *Destination {
 		return d
 	}
 	d = NewDestination(Config{
-		Name:       name,
-		Limits:     m.limits,
-		Signer:     m.signer,
-		IDs:        m.ids,
-		Sink:       m.sink,
-		Log:        m.log,
-		OnSuccess:  m.onSuccess,
-		OnEDUsSent: m.onEDUsSent,
-		OnOutcome:  m.onOutcome,
-		Due:        m.due,
+		Name:          name,
+		Limits:        m.limits,
+		Signer:        m.signer,
+		IDs:           m.ids,
+		Sink:          m.sink,
+		Log:           m.log,
+		OnSuccess:     m.onSuccess,
+		OnEDUsSent:    m.onEDUsSent,
+		OnOutcome:     m.onOutcome,
+		Due:           m.due,
+		LongBackoff:   m.longBackoff,
+		OnEDUsDropped: m.onEDUsDropped,
 	})
 	m.dests[name] = d
 	return d

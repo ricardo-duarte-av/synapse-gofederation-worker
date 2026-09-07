@@ -139,6 +139,10 @@ type Destination struct {
 	// backoff only slows down how often a dead server is enqueued for, not how
 	// often it is actually dialled.
 	due func(destination string) bool
+	// longBackoff reports a destination in a real outage rather than a blip.
+	longBackoff func(destination string) bool
+	// onEDUsDropped reports what a long outage cost.
+	onEDUsDropped func(destination string, n int)
 }
 
 // Config builds a Destination.
@@ -153,6 +157,14 @@ type Config struct {
 	OnEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	OnOutcome  func(destination string, delivered bool)
 	Due        func(destination string) bool
+	// LongBackoff reports whether a destination's backoff has grown past
+	// CatchUpRetryInterval -- i.e. that it will not be tried again for at least
+	// an hour. See the drop in Run.
+	LongBackoff func(destination string) bool
+	// OnEDUsDropped reports ephemeral EDUs abandoned because the destination
+	// is in a long outage, so the count is visible rather than inferred from a
+	// queue that stopped growing.
+	OnEDUsDropped func(destination string, n int)
 }
 
 // NewDestination builds a queue for one remote server.
@@ -169,16 +181,18 @@ func NewDestination(cfg Config) *Destination {
 		// Starts TRUE, as in Synapse. A sender that has been down cannot know
 		// what it missed from the live stream alone, so every destination
 		// begins by assuming it is behind and proves otherwise.
-		catchingUp: true,
-		limits:     limits,
-		signer:     cfg.Signer,
-		ids:        cfg.IDs,
-		sink:       cfg.Sink,
-		log:        cfg.Log.With().Str("destination", cfg.Name).Logger(),
-		onSuccess:  cfg.OnSuccess,
-		onEDUsSent: cfg.OnEDUsSent,
-		onOutcome:  cfg.OnOutcome,
-		due:        cfg.Due,
+		catchingUp:    true,
+		limits:        limits,
+		signer:        cfg.Signer,
+		ids:           cfg.IDs,
+		sink:          cfg.Sink,
+		longBackoff:   cfg.LongBackoff,
+		onEDUsDropped: cfg.OnEDUsDropped,
+		log:           cfg.Log.With().Str("destination", cfg.Name).Logger(),
+		onSuccess:     cfg.OnSuccess,
+		onEDUsSent:    cfg.OnEDUsSent,
+		onOutcome:     cfg.OnOutcome,
+		due:           cfg.Due,
 	}
 }
 
@@ -276,6 +290,33 @@ func (d *Destination) Run(ctx context.Context) {
 		// The queued units stay queued: they are what catch-up and the next
 		// attempt will send. Only the attempt is abandoned.
 		if d.due != nil && !d.due(d.name) {
+			// A destination we will not try again for at least an hour is in a
+			// real outage, and holding its ephemeral EDUs until it returns is
+			// both useless and unbounded: presence and receipts for a dead
+			// server accumulate for as long as it stays dead. Synapse drops
+			// them at exactly this point and for exactly this reason --
+			// "otherwise they will rack up indefinitely"
+			// (per_destination_queue.py:423).
+			//
+			// Only the EDUs we can afford to lose go: typing, receipts and
+			// presence say something about NOW, and a presence update delivered
+			// after an hour is not stale, it is wrong. The ones carrying a
+			// durable mark are left alone -- they are a cursor into a table,
+			// and dropping them would advance nothing but lose the poke.
+			//
+			// The PDUs go too, via catch-up, which is Synapse's
+			// _start_catching_up: they are recoverable from destination_rooms,
+			// so holding them in memory buys nothing.
+			if d.longBackoff != nil && d.longBackoff(d.name) {
+				if n := d.dropEphemeralEDUs(); n > 0 {
+					d.log.Info().Int("edus", n).
+						Msg("destination is in a long outage; dropping its ephemeral EDUs and catching up later")
+					if d.onEDUsDropped != nil {
+						d.onEDUsDropped(d.name, n)
+					}
+				}
+				d.RestartCatchUp()
+			}
 			d.log.Debug().Msg("destination is backing off; not attempting")
 			return
 		}
@@ -403,6 +444,36 @@ func (d *Destination) takeLocked() (taken, error) {
 		}
 	}
 	return t, nil
+}
+
+// CatchUpRetryInterval is the backoff past which a destination is treated as
+// being in a real outage rather than a blip: Synapse's CATCHUP_RETRY_INTERVAL
+// (per_destination_queue.py:75).
+const CatchUpRetryInterval = time.Hour
+
+// dropEphemeralEDUs discards the queued EDUs that say something about NOW.
+//
+// Typing, receipts and presence: the ones Synapse names as affordable to lose
+// (per_destination_queue.py:427). An EDU carrying a to-device or device-list
+// mark is kept, because that mark is a cursor into a table and the row it
+// stands for is still owed.
+func (d *Destination) dropEphemeralEDUs() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	kept := d.pendingEDUs[:0]
+	dropped := 0
+	for _, e := range d.pendingEDUs {
+		if e.ToDeviceUpTo == 0 && e.DeviceListUpTo == 0 {
+			dropped++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	// Reslicing in place would leave the dropped entries reachable through the
+	// backing array; a fresh slice lets them be collected, which is the point.
+	d.pendingEDUs = append([]EDU(nil), kept...)
+	return dropped
 }
 
 func (d *Destination) dequeue(pdus, edus int) {

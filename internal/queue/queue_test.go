@@ -511,3 +511,80 @@ func boolText(b bool) string {
 	}
 	return "false"
 }
+
+// A destination in a real outage must not hold its ephemeral EDUs forever.
+// Observed in production: 5,265 backing-off destinations between them held
+// 11,537 queued EDUs, having nearly doubled in five minutes, because presence
+// and receipts for a dead server accumulate for as long as it stays dead.
+// Synapse drops them at this exact point (per_destination_queue.py:423).
+func TestLongOutageDropsEphemeralEDUs(t *testing.T) {
+	s := &recordingSink{}
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dropped int
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		Due:           func(string) bool { return false },
+		LongBackoff:   func(string) bool { return true },
+		OnEDUsDropped: func(_ string, n int) { dropped = n },
+	})
+
+	// Two we can afford to lose, and two that are a cursor into a table.
+	d.EnqueueKeyedEDU("!r|@a:x", txn.EDU{Type: txn.EDUTypeTyping, Content: []byte(`{}`)})
+	d.EnqueueEDU(txn.EDU{Type: txn.EDUTypeReceipt, Content: []byte(`{}`)})
+	d.EnqueueMarkedEDU(EDU{
+		Unit: txn.EDU{Type: "m.direct_to_device", Content: []byte(`{}`)}, ToDeviceUpTo: 7,
+	})
+	d.EnqueueMarkedEDU(EDU{
+		Unit: txn.EDU{Type: "m.device_list_update", Content: []byte(`{}`)}, DeviceListUpTo: 9,
+	})
+	d.EnqueuePDU(pdu("$a", 1))
+
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+
+	if dropped != 2 {
+		t.Errorf("dropped = %d, want the 2 ephemeral EDUs", dropped)
+	}
+	pdus, edus := d.Pending()
+	if edus != 2 {
+		t.Errorf("%d EDUs left, want the 2 carrying a durable mark", edus)
+	}
+	// The PDUs go through catch-up instead, which is Synapse's
+	// _start_catching_up: they are recoverable from destination_rooms.
+	if pdus != 0 {
+		t.Errorf("%d PDUs left, want them handed to catch-up", pdus)
+	}
+	if !d.CatchingUp() {
+		t.Error("the destination was not put into catch-up")
+	}
+}
+
+// A short backoff is a blip. Dropping there would throw away receipts for a
+// server that is about to answer.
+func TestShortBackoffKeepsEphemeralEDUs(t *testing.T) {
+	s := &recordingSink{}
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		Due:         func(string) bool { return false },
+		LongBackoff: func(string) bool { return false },
+	})
+	d.EnqueueEDU(txn.EDU{Type: txn.EDUTypeReceipt, Content: []byte(`{}`)})
+	d.EnqueuePDU(pdu("$a", 1))
+
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+
+	pdus, edus := d.Pending()
+	if edus != 1 || pdus != 1 {
+		t.Errorf("pending = %d pdus %d edus, want everything kept on a short backoff", pdus, edus)
+	}
+}

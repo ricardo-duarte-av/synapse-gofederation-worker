@@ -339,6 +339,16 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			defer cancel()
 			return w.limiter.Due(ctx, destination)
 		},
+		// A destination that will not be tried again for an hour is in a real
+		// outage, not a blip, and holding its presence and receipts until it
+		// returns is both useless and unbounded.
+		LongBackoff: func(destination string) bool {
+			t := w.limiter.Timings(destination)
+			return time.Duration(t.RetryInterval)*time.Millisecond > queue.CatchUpRetryInterval
+		},
+		OnEDUsDropped: func(destination string, n int) {
+			metrics.EDUsDropped.WithLabelValues(destination).Add(float64(n))
+		},
 	})
 
 	w.sender = sender.New(sender.Config{
