@@ -1,0 +1,58 @@
+# Deployed as its own compose project alongside Synapse's, the way the other Go
+# workers are: /opt/matrix/synapse-gofederation-worker/docker-compose.yaml.
+#
+# Note what is absent. A federation sender has no listeners -- it is driven
+# entirely by Redis and the database -- so there is no socket in
+# /var/sockets/nginx/ and nothing routes to it. The metrics port is scraped by
+# container name.
+
+services:
+  gofederation-worker:
+    image: ghcr.io/ricardo-duarte-av/synapse-gofederation-worker:latest
+    container_name: av-gofederation-worker-1
+    restart: unless-stopped
+
+    # Synapse's uid. Needed for peer authentication on the PostgreSQL unix
+    # socket and to read the shared socket directory.
+    user: "991:991"
+
+    volumes:
+      - ./gofederation-worker.yaml:/data/gofederation-worker.yaml:ro
+      # Synapse's own config is the source of truth for server_name, the sender
+      # instance list, Redis and the retry tuning. Read-only: we never write it.
+      - /opt/matrix/synapse/synapse/homeserver.yaml:/etc/synapse/homeserver.yaml:ro
+      # Unlike the read-only workers, a federation SENDER needs the private
+      # signing key: transactions are signed even in shadow mode, so that a
+      # signature computed over the wrong bytes is caught now rather than on the
+      # day this goes live.
+      - /opt/matrix/synapse/synapse/aguiarvieira.pt.signing.key:/data/signing.key:ro
+      # The PostgreSQL socket and the rest of the shared socket directory.
+      - /var/sockets:/var/sockets
+      # The persisted shadow record. This MUST outlive the container: the
+      # promotion decision is read from counters measured in weeks, and a
+      # volume that resets on redeploy would make that unanswerable.
+      - ./difflog:/data/difflog
+
+    networks:
+      - npm-nw
+      - npm-nw6
+
+    # Distroless, so there is no curl; the binary probes itself.
+    healthcheck:
+      test: ["CMD", "/gofederation-worker", "-healthcheck", "-config", "/data/gofederation-worker.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+networks:
+  npm-nw:
+    external: true
+  npm-nw6:
+    external: true

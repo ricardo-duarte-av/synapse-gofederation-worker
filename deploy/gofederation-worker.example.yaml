@@ -9,6 +9,16 @@
 #
 # Unknown keys are a startup error, so a typo is reported rather than ignored.
 
+# This process's own identity on the replication bus, and the key its cursors
+# are stored under. It must NOT be one of homeserver.yaml's
+# federation_sender_instances -- startup refuses that.
+#
+# This is not the same as shadow.instance below, and the difference is not
+# cosmetic: the bus suppresses a worker's own echo by instance name, so a shadow
+# calling itself by the name of the sender it shadows would discard that
+# sender's rows and process nothing at all, while looking perfectly healthy.
+worker_name: av-gofederation-worker-1
+
 # Synapse's homeserver.yaml, mounted read-only.
 synapse_config: /etc/synapse/homeserver.yaml
 
@@ -28,7 +38,10 @@ shadow:
   # the only switch that does that. Defaults to true if omitted.
   enabled: true
 
-  # The federation sender whose shard we take. Must be one of the names in
+  # The federation sender whose SHARD we take -- which destinations are ours.
+  # Not our identity; see worker_name above.
+  #
+  # Must be one of the names in
   # homeserver.yaml's federation_sender_instances -- startup fails otherwise,
   # because a name that is not in the list owns no destinations at all and the
   # worker would run perfectly while doing nothing.
