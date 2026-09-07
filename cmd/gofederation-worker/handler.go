@@ -42,10 +42,20 @@ func (h *handler) OnRows(stream string, position int64, rows []replication.Row) 
 	case replication.StreamPresenceFederation:
 		h.handlePresenceFederation(rows)
 
+	case replication.StreamTyping:
+		// Typing is built HERE, from the room's typing set, rather than
+		// arriving ready-made on the federation stream. Being the federation
+		// sender means doing that work: on every other instance Synapse's
+		// typing handler has no federation sender to hand an EDU to and does
+		// nothing at all (typing.py:89 and replication/tcp/client.py:148).
+		h.handleTyping(position, rows)
+
 	case replication.StreamFederation:
-		// Typing and arbitrary EDUs reach a sender through here rather than
-		// off their own streams: the handler that produced them runs on
-		// another worker and hands them over (handlers/typing.py:188).
+		// Arbitrary EDUs relayed by FederationRemoteSendQueue. In practice
+		// nothing arrives: its only producer is build_and_send_edu, which
+		// typing alone calls, and only on an instance that is already a
+		// federation sender. Handled regardless, since a queue that is empty
+		// by accident of who calls it is not a guarantee.
 		h.handleFederation(rows)
 	}
 }
@@ -166,6 +176,28 @@ func (h *handler) handlePresenceFederation(rows []replication.Row) {
 					Msg("failed to route presence")
 			}
 		}
+	}()
+}
+
+// handleTyping turns the room typing sets into federation EDUs.
+func (h *handler) handleTyping(position int64, rows []replication.Row) {
+	parsed := make([]sender.TypingRow, 0, len(rows))
+	for _, row := range rows {
+		r, ok := replication.ParseTypingRow(row.JSON)
+		if !ok {
+			continue
+		}
+		parsed = append(parsed, sender.TypingRow{RoomID: r.RoomID, UserIDs: r.UserIDs})
+	}
+	if len(parsed) == 0 {
+		return
+	}
+	// Off the replication goroutine: this resolves room membership from the
+	// database, and blocking the subscriber would stall every other stream.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), replicationWorkTimeout)
+		defer cancel()
+		h.worker.typing.HandleRows(ctx, position, parsed)
 	}()
 }
 

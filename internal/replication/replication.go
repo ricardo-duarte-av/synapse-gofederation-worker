@@ -33,9 +33,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Stream names carried on the replication channel. A federation sender consumes
-// the first four; the rest are here so an unrecognised stream can be reported
-// as "not ours" rather than "unknown".
+// Stream names carried on the replication channel. The rest are here so an
+// unrecognised stream can be reported as "not ours" rather than "unknown".
 const (
 	// StreamEvents is a poke only. The row says an event exists; the sender
 	// re-reads the events table for the content
@@ -48,11 +47,20 @@ const (
 	// The destinations are not in the row; they come from
 	// device_lists_outbound_pokes for that stream id.
 	StreamDeviceLists = "device_lists"
-	// StreamFederation carries EDUs relayed from the main process. Out of
-	// scope for phase 1, but recognised so its arrival is not a surprise.
+	// StreamFederation carries EDUs relayed from the main process by
+	// FederationRemoteSendQueue.
+	//
+	// Note what is NOT here: typing. build_and_send_edu is only ever called on
+	// an instance that is itself a federation sender (typing.py:89), so in
+	// practice nothing reaches this stream and typing must be built from
+	// StreamTyping instead. Consumed anyway, because the queue exists and a
+	// future Synapse could use it.
 	StreamFederation = "federation"
 
-	StreamReceipts           = "receipts"
+	StreamReceipts = "receipts"
+	// StreamTyping rows are [room_id, [user_id, ...]] -- the WHOLE set of users
+	// typing in that room. A federation sender diffs it against the previous
+	// set and builds the EDUs itself; see internal/sender.Typing.
 	StreamTyping             = "typing"
 	StreamPresence           = "presence"
 	StreamPresenceFederation = "presence_federation"

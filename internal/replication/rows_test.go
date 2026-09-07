@@ -140,3 +140,34 @@ func TestParseFederationRowTyping(t *testing.T) {
 		t.Errorf("Content did not survive: %s", r.Content)
 	}
 }
+
+// A typing row is the whole set for a room, and an EMPTY set is the message
+// that everybody stopped. Treating an empty list as a parse failure would drop
+// every stop and leave remote indicators on until they timed out.
+func TestParseTypingRow(t *testing.T) {
+	r, ok := ParseTypingRow(`["!room:example.com", ["@alice:example.com", "@bob:example.com"]]`)
+	if !ok {
+		t.Fatal("a typing row did not parse")
+	}
+	if r.RoomID != "!room:example.com" || len(r.UserIDs) != 2 {
+		t.Errorf("parsed %+v", r)
+	}
+
+	empty, ok := ParseTypingRow(`["!room:example.com", []]`)
+	if !ok {
+		t.Fatal("an empty typing set did not parse")
+	}
+	if empty.UserIDs == nil {
+		t.Error("an empty set must stay non-nil: it means everybody stopped")
+	}
+	if len(empty.UserIDs) != 0 {
+		t.Errorf("UserIDs = %v", empty.UserIDs)
+	}
+
+	if _, ok := ParseTypingRow(`{"room_id": "!r"}`); ok {
+		t.Error("an object parsed as a positional row")
+	}
+	if _, ok := ParseTypingRow(`["", []]`); ok {
+		t.Error("a row with no room id was accepted")
+	}
+}

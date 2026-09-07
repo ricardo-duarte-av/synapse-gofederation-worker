@@ -13,6 +13,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/difflog"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sender"
 )
 
 func (w *worker) registerMetrics() {
@@ -90,6 +91,7 @@ func (w *worker) run(ctx context.Context) error {
 	// been down, and the comparison stops meaning anything.
 	g.Go(func() error { return w.catchup.Run(gctx) })
 	g.Go(func() error { return w.sampleGauges(gctx) })
+	g.Go(func() error { return w.typingKeepAlive(gctx) })
 
 	if w.cfg.Metrics.Addr != "" {
 		g.Go(func() error { return w.serveMetrics(gctx) })
@@ -101,6 +103,30 @@ func (w *worker) run(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// typingKeepAlive re-announces users who are still typing.
+//
+// A remote server expires a typing indicator after Synapse's FederationTimeout
+// of one minute, so a user composing a long message would appear to stop typing
+// mid-sentence. Synapse re-pokes on a wheel timer keyed per member
+// (typing.py:143); a ticker is the same thing at this scale, since the work is
+// bounded by the number of people typing right now and is usually zero.
+//
+// The tick is deliberately shorter than FederationPingInterval: a ticker that
+// matched it exactly would drift into announcing at 40s + one tick, which is
+// past the point the remote gives up.
+func (w *worker) typingKeepAlive(ctx context.Context) error {
+	ticker := time.NewTicker(sender.FederationPingInterval / 4)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			w.typing.KeepAlive(ctx)
+		}
+	}
 }
 
 // sampleGauges refreshes the values that are cheaper to sample than to track,

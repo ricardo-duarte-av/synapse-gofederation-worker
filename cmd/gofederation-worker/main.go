@@ -162,6 +162,7 @@ type worker struct {
 	devices   *sender.Devices
 	catchup   *sender.CatchUp
 	ephemeral *sender.Ephemeral
+	typing    *sender.Typing
 	sub       *replication.Subscriber
 	metrics   *http.Server
 }
@@ -381,6 +382,19 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		Log:          log,
 		ServerName:   cfg.ServerName,
 		ShouldHandle: cfg.ShouldHandle,
+	})
+
+	w.typing = sender.NewTyping(sender.TypingConfig{
+		Hosts:        w.db,
+		Queues:       w.queues,
+		Log:          log,
+		ServerName:   cfg.ServerName,
+		ShouldHandle: cfg.ShouldHandle,
+		Due: func(destination string) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return w.limiter.Due(ctx, destination)
+		},
 	})
 
 	w.catchup = sender.NewCatchUp(sender.CatchUpConfig{

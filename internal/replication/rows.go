@@ -299,3 +299,39 @@ func ParseFederationRow(row string) (FederationRow, bool) {
 	}
 	return FederationRow{}, false
 }
+
+// TypingRow is one row of the typing stream: [room_id, [user_id, ...]]
+// (replication/tcp/streams/_base.py:413).
+//
+// The list is the WHOLE set of users typing in that room, not a delta. A user
+// who stops typing arrives as a new row listing everyone except them, so the
+// start/stop distinction exists only in the diff against the previous set.
+type TypingRow struct {
+	RoomID  string
+	UserIDs []string
+}
+
+// ParseTypingRow reads one row of the typing stream.
+func ParseTypingRow(row string) (TypingRow, bool) {
+	r := gjson.Parse(row)
+	if !r.IsArray() {
+		return TypingRow{}, false
+	}
+	a := r.Array()
+	if len(a) < 2 {
+		return TypingRow{}, false
+	}
+	roomID := a[0].String()
+	if roomID == "" {
+		return TypingRow{}, false
+	}
+	// An empty list is meaningful -- it says nobody is typing any more -- so
+	// the slice stays non-nil to keep "nobody" distinct from "unparseable".
+	users := []string{}
+	for _, u := range a[1].Array() {
+		if s := u.String(); s != "" {
+			users = append(users, s)
+		}
+	}
+	return TypingRow{RoomID: roomID, UserIDs: users}, true
+}
