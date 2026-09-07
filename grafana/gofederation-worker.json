@@ -1472,7 +1472,7 @@
       "id": 24,
       "type": "timeseries",
       "title": "Stream position lag behind Synapse",
-      "description": "Two senders walking the same stream. A widening gap is this worker falling behind.",
+      "description": "Two senders walking the same stream. A widening gap is this worker falling behind. NO Synapse line means there is no Python federation sender on this homeserver -- which is the point of primary mode, not a scrape failure. The positions are stream orderings of ONE homeserver and are not comparable across deployments: a new test server sits in the tens while a server with years of history sits in the millions.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -2091,14 +2091,14 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "query": "label_values(synapse_federation_client_sent_transactions_total, server_name)",
+        "query": "label_values(gofed_build_info{job=~\"$job\",instance=~\"$instance\"}, deployment)",
         "current": {},
         "refresh": 2,
         "includeAll": true,
         "multi": false,
         "label": "Synapse server_name",
         "sort": 1,
-        "description": "Used only by the panels that compare against Synapse's own senders."
+        "description": "The homeserver the SELECTED WORKER serves, taken from its own deployment label rather than from the list of homeservers Synapse exports. Those are not the same set: a homeserver whose only federation sender is this worker exports no sender metrics at all, so picking from Synapse's list can only ever name a DIFFERENT homeserver, and every panel that compares the two would then plot two unrelated servers on one chart."
       }
     ]
   },

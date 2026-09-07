@@ -53,10 +53,27 @@ them, which is how the rest of this deployment is wired.
 | `Datasource` | which Prometheus |
 | `Job` | the scrape job, if you run several |
 | `Worker` | which worker instance, when more than one is running |
-| `Synapse server_name` | which homeserver the comparison panels compare against |
+| `Synapse server_name` | the homeserver the selected worker serves |
 
-`Synapse server_name` is used **only** by the panels that compare with Synapse.
-If you are not scraping Synapse, leave it and ignore those series.
+`Synapse server_name` is used **only** by the five panels that compare with
+Synapse. It is populated from the selected worker's own `deployment` label, not
+from the homeservers Synapse exports, and that distinction has already produced
+one wrong reading worth describing.
+
+Those are not the same set. A homeserver whose only federation sender is this
+worker exports no `synapse_..._federation_sender` metrics at all, so it never
+appears in Synapse's list -- and picking from that list can then only ever name
+a **different** homeserver. The comparison panels would plot two unrelated
+servers against each other, with nothing on the chart to say so: on this
+deployment, a test homeserver's events position of 42 next to production's
+14,081,652, read as a catastrophic lag when the two numbers simply count
+different servers' events.
+
+So an **empty** Synapse series is the correct output on a homeserver this worker
+is the only sender for. That is primary mode working, not a scrape failure.
+Stream positions in particular are one homeserver's stream orderings and are
+never comparable across deployments: a new test server sits in the tens while a
+server with years of history sits in the millions.
 
 ## What each row answers
 
