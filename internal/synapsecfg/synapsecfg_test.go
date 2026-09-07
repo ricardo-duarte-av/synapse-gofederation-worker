@@ -410,3 +410,23 @@ func TestANonNumericPortIsAnError(t *testing.T) {
 		t.Errorf("error does not name the key: %v", err)
 	}
 }
+
+// The override is read literally: it exists to say where the file really is,
+// so a fallback beside homeserver.yaml would defeat it. The error names the
+// override as the thing to remove, because a path that came from the worker's
+// own config looks identical in a log to one that came from Synapse's.
+func TestAMissingOverrideNamesItself(t *testing.T) {
+	p := writeConfig(t, minimal)
+	_, err := LoadWithOptions(p, Options{SigningKeyPath: "/data/signing.key"})
+	if err == nil {
+		t.Fatal("a missing override was accepted")
+	}
+	if !strings.Contains(err.Error(), "OVERRIDE") {
+		t.Errorf("error does not say the path was an override: %v", err)
+	}
+	// It must not have quietly found signing.key beside homeserver.yaml, which
+	// is exactly what writeConfig puts there.
+	if !strings.Contains(err.Error(), "/data/signing.key") {
+		t.Errorf("error does not name the path that failed: %v", err)
+	}
+}

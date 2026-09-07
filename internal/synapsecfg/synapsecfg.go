@@ -381,13 +381,18 @@ func instanceMap(r raw) (map[string]Instance, error) {
 // resolved against homeserver.yaml's directory, which is how Synapse's
 // config-directory handling behaves for the deployments this runs in.
 //
-// An ABSOLUTE path gets a second chance beside homeserver.yaml. The path in
-// the file is the one inside SYNAPSE's container -- /data/<server_name>.signing.key
-// here -- while this worker mounts Synapse's config directory somewhere of its
-// own (/etc/synapse). Since the key lives in that same directory, looking for
-// its basename next to the homeserver.yaml we just read finds it, and means a
-// deployment that mounts the directory read-only says where the key is exactly
-// once: in Synapse's own config. See resolveSigningKeyPath.
+// An ABSOLUTE path from homeserver.yaml gets a second chance beside it. The
+// path in that file is the one inside SYNAPSE's container --
+// /data/<server_name>.signing.key here -- while this worker mounts Synapse's
+// config directory somewhere of its own (/etc/synapse). Since the key lives in
+// that same directory, looking for its basename next to the homeserver.yaml we
+// just read finds it, and a deployment that mounts the directory read-only says
+// where the key is exactly once: in Synapse's own config.
+//
+// An OVERRIDE gets no such fallback and is read literally. It exists to say
+// where the file really is, so guessing at a second location would defeat it --
+// and the failure is then a plain "that path is not there", naming the override
+// as the thing to remove.
 func loadSigningKeys(r raw, cfgPath, override string) ([]SigningKey, error) {
 	body := r.SigningKey
 	// An explicit override wins even over an inline signing_key, so a
@@ -396,20 +401,28 @@ func loadSigningKeys(r raw, cfgPath, override string) ([]SigningKey, error) {
 		body = ""
 	}
 	if body == "" {
-		p := override
-		if p == "" {
-			p = r.SigningKeyPath
+		if override != "" {
+			b, err := os.ReadFile(override)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"synapsecfg: reading signing key: %w; this path is the signing_key_path "+
+						"OVERRIDE, not %s's -- remove it to use the key Synapse itself signs with",
+					err, cfgPath)
+			}
+			body = string(b)
+		} else {
+			p := r.SigningKeyPath
+			if p == "" {
+				// Synapse's default is "<server_name>.signing.key" in the
+				// config directory.
+				p = r.ServerName + ".signing.key"
+			}
+			b, err := readSigningKeyFile(p, cfgPath)
+			if err != nil {
+				return nil, err
+			}
+			body = string(b)
 		}
-		if p == "" {
-			// Synapse's default is "<server_name>.signing.key" in the config
-			// directory.
-			p = r.ServerName + ".signing.key"
-		}
-		b, err := readSigningKeyFile(p, cfgPath)
-		if err != nil {
-			return nil, err
-		}
-		body = string(b)
 	}
 	keys, err := ParseSigningKeys(body)
 	if err != nil {
@@ -418,7 +431,8 @@ func loadSigningKeys(r raw, cfgPath, override string) ([]SigningKey, error) {
 	return keys, nil
 }
 
-// readSigningKeyFile resolves p against homeserver.yaml and reads it.
+// readSigningKeyFile resolves homeserver.yaml's own signing_key_path and reads
+// it. Overrides do not come through here; see loadSigningKeys.
 //
 // The fallback only ever looks in the directory homeserver.yaml itself came
 // from, and only for the basename Synapse's own config named. It cannot pick up
