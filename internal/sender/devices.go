@@ -20,6 +20,7 @@ type DeviceStore interface {
 	GetDestinationsForDevice(ctx context.Context, streamID int64) ([]string, error)
 	GetDeviceDetails(ctx context.Context, userIDs, deviceIDs []string) (map[string]store.DeviceDetail, error)
 	GetLastDeviceUpdateForRemoteUser(ctx context.Context, destination, userID string, fromStreamID int64) (int64, error)
+	GetCrossSigningKeys(ctx context.Context, userIDs []string) ([]store.CrossSigningKey, error)
 	MaxDeviceOutboxStreamID(ctx context.Context) (int64, error)
 	MaxDeviceListOutboundStreamID(ctx context.Context) (int64, error)
 	GetDestinationRetryTimings(ctx context.Context, destinations []string) (map[string]store.RetryTimings, error)

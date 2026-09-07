@@ -56,9 +56,14 @@ const (
 	EDUTypeDirectToDevice   = "m.direct_to_device"
 	EDUTypeDeviceListUpdate = "m.device_list_update"
 	EDUTypeSigningKeyUpdate = "m.signing_key_update"
-	EDUTypePresence         = "m.presence"
-	EDUTypeReceipt          = "m.receipt"
-	EDUTypeTyping           = "m.typing"
+	// EDUTypeUnstableSigningKeyUpdate is the pre-stabilisation name. Synapse
+	// still sends both, because a server that predates the stable name
+	// understands only this one and would otherwise never learn of a key
+	// rotation.
+	EDUTypeUnstableSigningKeyUpdate = "org.matrix.signing_key_update"
+	EDUTypePresence                 = "m.presence"
+	EDUTypeReceipt                  = "m.receipt"
+	EDUTypeTyping                   = "m.typing"
 )
 
 // IDGenerator hands out transaction ids.

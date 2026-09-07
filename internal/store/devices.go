@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 // ToDeviceMessage is one row of device_federation_outbox.
@@ -220,4 +223,83 @@ func (s *Store) GetLastDeviceUpdateForRemoteUser(ctx context.Context, destinatio
 		return 0, fmt.Errorf("store: last device update: %w", err)
 	}
 	return id, nil
+}
+
+// CrossSigningKey is one of a user's cross-signing keys.
+type CrossSigningKey struct {
+	UserID string
+	// KeyType is "master" or "self_signing".
+	KeyType string
+	// KeyData is the key object as stored, sent verbatim as the EDU's
+	// master_key or self_signing_key.
+	KeyData []byte
+	// PseudoDeviceID is the version part of the key's id -- everything after
+	// "ed25519:".
+	//
+	// This is what makes cross-signing updates findable at all. Synapse
+	// records a key change as a row in device_lists_outbound_pokes whose
+	// device_id is this value rather than a real device
+	// (devices.py:636). A sender that does not recognise it sends an
+	// m.device_list_update for a device that does not exist, and the real
+	// key change is never announced -- so the far side keeps trusting a
+	// signature that has been rotated away.
+	PseudoDeviceID string
+}
+
+// GetCrossSigningKeys loads the master and self-signing keys for a set of users.
+func (s *Store) GetCrossSigningKeys(ctx context.Context, userIDs []string) ([]CrossSigningKey, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	// DISTINCT ON keeps the newest row per (user, keytype): a rotated key
+	// leaves the old one behind, and announcing that would tell the far side
+	// to trust a key the user has replaced.
+	const q = `
+		SELECT DISTINCT ON (user_id, keytype) user_id, keytype, keydata
+		FROM e2e_cross_signing_keys
+		WHERE user_id = ANY($1) AND keytype IN ('master', 'self_signing')
+		ORDER BY user_id, keytype, stream_id DESC`
+
+	rows, err := s.pool.Query(ctx, q, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: cross-signing keys: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CrossSigningKey
+	for rows.Next() {
+		var k CrossSigningKey
+		if err := rows.Scan(&k.UserID, &k.KeyType, &k.KeyData); err != nil {
+			return nil, fmt.Errorf("store: cross-signing keys: %w", err)
+		}
+		k.PseudoDeviceID = crossSigningPseudoDeviceID(k.KeyData)
+		if k.PseudoDeviceID == "" {
+			// A key with no usable id cannot be matched against a poke, so it
+			// would silently never be announced. Skipping it is the same
+			// outcome, but at least it does not masquerade as a match.
+			continue
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// crossSigningPseudoDeviceID extracts the version from a cross-signing key.
+//
+// The key object carries exactly one entry in `keys`, of the form
+// "ed25519:<version>": "<public key>". signedjson calls that version the key's
+// device id, and Synapse compares device pokes against it directly.
+func crossSigningPseudoDeviceID(keyData []byte) string {
+	keys := gjson.GetBytes(keyData, "keys")
+	if !keys.IsObject() {
+		return ""
+	}
+	var version string
+	keys.ForEach(func(key, _ gjson.Result) bool {
+		if _, v, ok := strings.Cut(key.String(), ":"); ok {
+			version = v
+		}
+		return false // exactly one key; take the first and stop
+	})
+	return version
 }

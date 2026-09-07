@@ -113,8 +113,10 @@ type EDUDiff struct {
 // what produces the bug: a type nobody happened to send in the sample window
 // is indistinguishable from one that was never built.
 var eduImplemented = map[string]bool{
-	"m.direct_to_device":   true,
-	"m.device_list_update": true,
+	"m.direct_to_device":            true,
+	"m.device_list_update":          true,
+	"m.signing_key_update":          true,
+	"org.matrix.signing_key_update": true,
 }
 
 // eduComparable says whether an EDU type's content can be compared at all.
@@ -132,6 +134,8 @@ var eduComparable = map[string]struct {
 	"m.device_list_update": {true,
 		"content is built from the device tables; ours is deliberately incomplete in phase 1"},
 	"m.signing_key_update": {true, "content is the user's cross-signing keys"},
+	"org.matrix.signing_key_update": {true,
+		"the pre-stabilisation name, sent alongside the stable one for servers that predate it"},
 	"m.receipt": {false,
 		"batched by arrival, so the grouping differs between senders even when the receipts do not"},
 	"m.typing":   {false, "a snapshot of who was typing when the transaction was built"},

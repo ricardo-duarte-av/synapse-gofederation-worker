@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -403,4 +404,75 @@ func sameSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestLiveCrossSigningKeys checks the pseudo device id derivation against real
+// keys.
+//
+// That derivation is the whole mechanism for recognising a cross-signing
+// rotation: Synapse records one as a device poke whose device_id is the key's
+// version. Derive it wrongly and every rotation is sent as an
+// m.device_list_update for a device that does not exist, while the rotation
+// itself is never announced -- so the far side keeps trusting a replaced key.
+// A unit test with a hand-made key would only check the string split.
+func TestLiveCrossSigningKeys(t *testing.T) {
+	s := liveStore(t)
+	ctx := context.Background()
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT user_id FROM e2e_cross_signing_keys LIMIT 20`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var users []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			t.Fatal(err)
+		}
+		users = append(users, u)
+	}
+	rows.Close()
+	if len(users) == 0 {
+		t.Skip("no cross-signing keys in this database")
+	}
+
+	keys, err := s.GetCrossSigningKeys(ctx, users)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) == 0 {
+		t.Fatal("no keys returned for users that have them")
+	}
+
+	seen := map[string]bool{}
+	for _, k := range keys {
+		if k.KeyType != "master" && k.KeyType != "self_signing" {
+			t.Errorf("unexpected keytype %q; only these two become EDUs", k.KeyType)
+		}
+		if k.PseudoDeviceID == "" {
+			t.Errorf("%s/%s has no pseudo device id, so a rotation could never be matched",
+				k.UserID, k.KeyType)
+		}
+		if strings.Contains(k.PseudoDeviceID, ":") {
+			t.Errorf("%s/%s pseudo device id %q still carries the algorithm prefix",
+				k.UserID, k.KeyType, k.PseudoDeviceID)
+		}
+		// The derived id must be the version of the key actually inside the
+		// blob, not something adjacent to it.
+		if !strings.Contains(string(k.KeyData), "ed25519:"+k.PseudoDeviceID) {
+			t.Errorf("%s/%s: derived %q does not appear in the key data",
+				k.UserID, k.KeyType, k.PseudoDeviceID)
+		}
+		// One row per (user, keytype): a rotated key leaves the old one
+		// behind, and announcing that would tell the far side to trust a key
+		// the user has replaced.
+		id := k.UserID + "/" + k.KeyType
+		if seen[id] {
+			t.Errorf("%s returned more than once; the newest must win", id)
+		}
+		seen[id] = true
+	}
+	t.Logf("%d cross-signing keys across %d users, all with a usable version",
+		len(keys), len(users))
 }

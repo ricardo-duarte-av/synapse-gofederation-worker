@@ -40,6 +40,22 @@ func (d *Devices) buildDeviceListEDUs(
 		userIDs = append(userIDs, p.UserID)
 		deviceIDs = append(deviceIDs, p.DeviceID)
 	}
+
+	// A poke whose device_id is a user's cross-signing key version is a KEY
+	// change, not a device change (devices.py:692). Treating it as a device
+	// sends an m.device_list_update for a device that does not exist and never
+	// announces the rotation -- so the far side goes on trusting a signing key
+	// the user has replaced, which is an E2EE trust failure rather than a
+	// missing feature.
+	crossSigning, err := d.store.GetCrossSigningKeys(ctx, userIDs)
+	if err != nil {
+		return nil, fromStreamID, err
+	}
+	keyByPseudoDevice := map[string]store.CrossSigningKey{}
+	for _, k := range crossSigning {
+		keyByPseudoDevice[store.DeviceDetailKey(k.UserID, k.PseudoDeviceID)] = k
+	}
+
 	details, err := d.store.GetDeviceDetails(ctx, userIDs, deviceIDs)
 	if err != nil {
 		return nil, fromStreamID, err
@@ -57,6 +73,10 @@ func (d *Devices) buildDeviceListEDUs(
 
 	var edus []txn.EDU
 	highest := fromStreamID
+	// Accumulated per user, because one user's master and self-signing keys
+	// arrive as two separate pokes and Synapse sends them as ONE EDU carrying
+	// both (devices.py:717).
+	signing := map[string]map[string]json.RawMessage{}
 
 	for _, userID := range order {
 		// The first update's prev_id is the last one already delivered to this
@@ -72,6 +92,16 @@ func (d *Devices) buildDeviceListEDUs(
 		sort.Slice(ups, func(i, j int) bool { return ups[i].StreamID < ups[j].StreamID })
 
 		for _, p := range ups {
+			// Cross-signing key changes short-circuit the device path
+			// entirely: they carry no prev_id chain and no device fields.
+			if k, ok := keyByPseudoDevice[store.DeviceDetailKey(p.UserID, p.DeviceID)]; ok {
+				signing[p.UserID] = mergeSigningKey(signing[p.UserID], k)
+				if p.StreamID > highest {
+					highest = p.StreamID
+				}
+				continue
+			}
+
 			body := map[string]any{
 				"user_id":   p.UserID,
 				"device_id": p.DeviceID,
@@ -111,7 +141,52 @@ func (d *Devices) buildDeviceListEDUs(
 			}
 		}
 	}
+
+	// Emitted last, and twice each. Synapse sends both m.signing_key_update
+	// and the legacy org.matrix.signing_key_update with identical content
+	// (devices.py:760), because servers that predate the stable name only
+	// understand the unstable one. Sending just the stable name would leave
+	// those servers trusting a rotated key.
+	for _, userID := range sortedKeys(signing) {
+		body := map[string]any{"user_id": userID}
+		for field, key := range signing[userID] {
+			body[field] = key
+		}
+		content, err := json.Marshal(body)
+		if err != nil {
+			return nil, fromStreamID, fmt.Errorf("sender: encoding signing key update: %w", err)
+		}
+		edus = append(edus,
+			txn.EDU{Type: txn.EDUTypeSigningKeyUpdate, Content: content},
+			txn.EDU{Type: txn.EDUTypeUnstableSigningKeyUpdate, Content: content})
+	}
+
 	return edus, highest, nil
+}
+
+// mergeSigningKey folds one cross-signing key into a user's pending update.
+func mergeSigningKey(into map[string]json.RawMessage, k store.CrossSigningKey) map[string]json.RawMessage {
+	if into == nil {
+		into = map[string]json.RawMessage{}
+	}
+	switch k.KeyType {
+	case "master":
+		into["master_key"] = k.KeyData
+	case "self_signing":
+		into["self_signing_key"] = k.KeyData
+	}
+	return into
+}
+
+// sortedKeys gives a stable emission order, so two runs over the same pokes
+// produce the same transaction and a capture comparison stays readable.
+func sortedKeys(m map[string]map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // prevIDs is Synapse's `[prev_id] if prev_id else []`.

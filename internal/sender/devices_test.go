@@ -28,8 +28,9 @@ type fakeDeviceStore struct {
 	// "never re-read the same rows" property is checked.
 	reads map[string]int
 	// details and lastSuccess back the m.device_list_update body.
-	details     map[string]store.DeviceDetail
-	lastSuccess map[string]int64
+	details      map[string]store.DeviceDetail
+	lastSuccess  map[string]int64
+	crossSigning map[string][]store.CrossSigningKey
 }
 
 func newDeviceStore() *fakeDeviceStore {
@@ -41,6 +42,7 @@ func newDeviceStore() *fakeDeviceStore {
 		reads:          map[string]int{},
 		details:        map[string]store.DeviceDetail{},
 		lastSuccess:    map[string]int64{},
+		crossSigning:   map[string][]store.CrossSigningKey{},
 	}
 }
 
@@ -126,6 +128,16 @@ func (f *fakeDeviceStore) GetLastDeviceUpdateForRemoteUser(_ context.Context, de
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lastSuccess[dest+"|"+user], nil
+}
+
+func (f *fakeDeviceStore) GetCrossSigningKeys(_ context.Context, users []string) ([]store.CrossSigningKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.CrossSigningKey
+	for _, u := range users {
+		out = append(out, f.crossSigning[u]...)
+	}
+	return out, nil
 }
 
 func (f *fakeDeviceStore) GetDestinationRetryTimings(_ context.Context, dests []string) (map[string]store.RetryTimings, error) {
@@ -448,5 +460,155 @@ func TestFilterDueDropsBackedOffDestinations(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "up.example" {
 		t.Errorf("FilterDue = %v, want [up.example]", got)
+	}
+}
+
+// A poke whose device_id is a user's cross-signing key version is a KEY
+// rotation, not a device change.
+//
+// Getting this wrong is not a missing feature, it is an E2EE trust failure:
+// the far side is told about a device that does not exist, never learns the
+// signing key was replaced, and goes on trusting the old one.
+func TestCrossSigningPokeBecomesASigningKeyUpdate(t *testing.T) {
+	const user = "@u:a.example"
+	const masterVersion = "LSndJVYdqFXULiUjSdyaoR"
+	masterKey := []byte(`{"user_id":"` + user + `","usage":["master"],` +
+		`"keys":{"ed25519:` + masterVersion + `":"` + masterVersion + `"}}`)
+
+	st := newDeviceStore()
+	st.destsForStream[7] = []string{"b.example"}
+	// The poke carries the KEY VERSION where a device id would normally be.
+	st.pokes["b.example"] = []store.DevicePoke{
+		{UserID: user, DeviceID: masterVersion, StreamID: 7},
+	}
+	st.crossSigning[user] = []store.CrossSigningKey{
+		{UserID: user, KeyType: "master", KeyData: masterKey, PseudoDeviceID: masterVersion},
+	}
+
+	d, m, _ := newDevices(t, st, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.HandleDeviceLists(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	edus := m.Get("b.example").PeekEDUs()
+	// Both names, with identical content: a server predating the stable name
+	// understands only the unstable one and would otherwise never learn of the
+	// rotation.
+	if len(edus) != 2 {
+		t.Fatalf("%d EDUs, want the stable and unstable signing key updates", len(edus))
+	}
+	types := map[string]string{}
+	for _, e := range edus {
+		types[e.Type] = string(e.Content)
+	}
+	stable, ok := types[txn.EDUTypeSigningKeyUpdate]
+	if !ok {
+		t.Fatalf("no %s emitted: %v", txn.EDUTypeSigningKeyUpdate, types)
+	}
+	unstable, ok := types[txn.EDUTypeUnstableSigningKeyUpdate]
+	if !ok {
+		t.Fatalf("no %s emitted: %v", txn.EDUTypeUnstableSigningKeyUpdate, types)
+	}
+	if stable != unstable {
+		t.Errorf("the two names carry different content:\n %s\n %s", stable, unstable)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal([]byte(stable), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["user_id"] != user {
+		t.Errorf("user_id = %v", body["user_id"])
+	}
+	if _, ok := body["master_key"]; !ok {
+		t.Error("master_key missing")
+	}
+	// Emphatically not a device update.
+	for _, absent := range []string{"device_id", "prev_id", "stream_id", "deleted"} {
+		if _, ok := body[absent]; ok {
+			t.Errorf("%q is present; this is a key update, not a device update", absent)
+		}
+	}
+}
+
+// A user's master and self-signing keys arrive as two separate pokes and must
+// be sent as ONE update carrying both, not two updates each carrying half.
+func TestMasterAndSelfSigningMergeIntoOneUpdate(t *testing.T) {
+	const user = "@u:a.example"
+	const masterV, selfV = "MMMMmaster", "SSSSself"
+
+	st := newDeviceStore()
+	st.destsForStream[9] = []string{"b.example"}
+	st.pokes["b.example"] = []store.DevicePoke{
+		{UserID: user, DeviceID: masterV, StreamID: 8},
+		{UserID: user, DeviceID: selfV, StreamID: 9},
+	}
+	st.crossSigning[user] = []store.CrossSigningKey{
+		{UserID: user, KeyType: "master", PseudoDeviceID: masterV,
+			KeyData: []byte(`{"usage":["master"],"keys":{"ed25519:` + masterV + `":"k"}}`)},
+		{UserID: user, KeyType: "self_signing", PseudoDeviceID: selfV,
+			KeyData: []byte(`{"usage":["self_signing"],"keys":{"ed25519:` + selfV + `":"k"}}`)},
+	}
+
+	d, m, _ := newDevices(t, st, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.HandleDeviceLists(ctx, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	edus := m.Get("b.example").PeekEDUs()
+	if len(edus) != 2 {
+		t.Fatalf("%d EDUs, want one update under each name", len(edus))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(edus[0].Content, &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["master_key"]; !ok {
+		t.Error("master_key missing from the merged update")
+	}
+	if _, ok := body["self_signing_key"]; !ok {
+		t.Error("self_signing_key missing from the merged update")
+	}
+}
+
+// A real device and a key rotation in the same batch must produce both kinds,
+// and the device's prev_id chain must not be disturbed by the key poke.
+func TestDeviceAndKeyUpdatesCoexist(t *testing.T) {
+	const user = "@u:a.example"
+	const keyV = "KKKKkey"
+
+	st := newDeviceStore()
+	st.destsForStream[11] = []string{"b.example"}
+	st.pokes["b.example"] = []store.DevicePoke{
+		{UserID: user, DeviceID: "REALDEVICE", StreamID: 10},
+		{UserID: user, DeviceID: keyV, StreamID: 11},
+	}
+	st.details[store.DeviceDetailKey(user, "REALDEVICE")] = store.DeviceDetail{
+		UserID: user, DeviceID: "REALDEVICE", Exists: true}
+	st.crossSigning[user] = []store.CrossSigningKey{
+		{UserID: user, KeyType: "master", PseudoDeviceID: keyV,
+			KeyData: []byte(`{"usage":["master"],"keys":{"ed25519:` + keyV + `":"k"}}`)},
+	}
+
+	d, m, _ := newDevices(t, st, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.HandleDeviceLists(ctx, 11); err != nil {
+		t.Fatal(err)
+	}
+
+	counts := map[string]int{}
+	for _, e := range m.Get("b.example").PeekEDUs() {
+		counts[e.Type]++
+	}
+	if counts[txn.EDUTypeDeviceListUpdate] != 1 {
+		t.Errorf("%d device list updates, want 1", counts[txn.EDUTypeDeviceListUpdate])
+	}
+	if counts[txn.EDUTypeSigningKeyUpdate] != 1 || counts[txn.EDUTypeUnstableSigningKeyUpdate] != 1 {
+		t.Errorf("signing key updates = %v", counts)
 	}
 }
