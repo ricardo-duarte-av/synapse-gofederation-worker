@@ -1,8 +1,18 @@
 # Dashboard and scraping
 
-`gofederation-worker.json` is a Grafana dashboard for this worker, with panels
-that put it side by side with Synapse's own federation senders where the two
-export comparable numbers.
+`gofederation-worker.json` is a Grafana dashboard for this worker. It shows
+this worker's own numbers only -- there are no panels comparing it against
+Synapse's senders.
+
+That was a deliberate removal rather than a simplification. The comparison was
+built for a shadow running beside a Python sender on the SAME homeserver, and
+it stops meaning anything anywhere else: a homeserver whose only sender is this
+worker exports no sender metrics at all, so a comparison panel there can only
+draw a line from a different homeserver. It did exactly that once -- a test
+homeserver's events position of 42 beside production's 14,081,652, which reads
+as a catastrophic lag when the two numbers simply count different servers'
+events. `git log -- grafana/` has the panels if a side-by-side is ever wanted
+back for a shadow deployment.
 
 Import it through **Dashboards → New → Import → Upload JSON file**. It asks for
 a Prometheus datasource on import; everything else is driven by the template
@@ -31,16 +41,6 @@ scrape_configs:
         labels:
           deployment: testing.aguiarvieira.pt
 
-  # Synapse's own senders, for the comparison panels. Without this job the
-  # dashboard still works, but every "vs synapse" series is empty.
-  - job_name: synapse
-    metrics_path: /_synapse/metrics
-    scrape_interval: 15s
-    static_configs:
-      - targets:
-          - av-federation-sender-worker-1:9101
-          - av-federation-sender-worker-2:9101
-          - synapse-matrix-synapse-1:9099
 ```
 
 Container names work as targets when Prometheus shares a Docker network with
@@ -53,27 +53,16 @@ them, which is how the rest of this deployment is wired.
 | `Datasource` | which Prometheus |
 | `Job` | the scrape job, if you run several |
 | `Worker` | which worker instance, when more than one is running |
-| `Synapse server_name` | the homeserver the selected worker serves |
 
-`Synapse server_name` is used **only** by the five panels that compare with
-Synapse. It is populated from the selected worker's own `deployment` label, not
-from the homeservers Synapse exports, and that distinction has already produced
-one wrong reading worth describing.
 
-Those are not the same set. A homeserver whose only federation sender is this
-worker exports no `synapse_..._federation_sender` metrics at all, so it never
-appears in Synapse's list -- and picking from that list can then only ever name
-a **different** homeserver. The comparison panels would plot two unrelated
-servers against each other, with nothing on the chart to say so: on this
-deployment, a test homeserver's events position of 42 next to production's
-14,081,652, read as a catastrophic lag when the two numbers simply count
-different servers' events.
+The dashboard is for a worker that is SENDING. Panels that only meant something
+while shadowing -- the persisted shadow record, its age, its restart count --
+are gone; the Mode tile stays, because "is this putting traffic on the
+internet?" is the one question worth answering at a glance either way.
 
-So an **empty** Synapse series is the correct output on a homeserver this worker
-is the only sender for. That is primary mode working, not a scrape failure.
-Stream positions in particular are one homeserver's stream orderings and are
-never comparable across deployments: a new test server sits in the tens while a
-server with years of history sits in the millions.
+Stream positions are one homeserver's stream orderings and are never comparable
+across deployments: a new test server sits in the tens while a server with years
+of history sits in the millions.
 
 ## What each row answers
 
@@ -81,27 +70,19 @@ server with years of history sits in the millions.
 most important number on the dashboard: 1 means every transaction is built,
 signed and then logged, 0 means it is on the wire.
 
-**Throughput** — how much it is doing, against Synapse. Two honest caveats are
-written into the panel descriptions: while shadowing this worker covers ONE
-shard and Synapse's line covers every sender, so compare shapes rather than
-heights; and the gap between "examined" and "routed" is expected to be large,
-because most events on a homeserver are other servers' and are correctly
-skipped.
+**Throughput** — how much it is doing. The gap between "examined" and "routed"
+is expected to be large: most events on a homeserver are other servers' and are
+correctly skipped, and `gofed_events_skipped_total` breaks down why.
 
-**Latency** — the headline comparison, and the panel that says where to
-optimise. Both lag histograms are in seconds and measure the same thing: from
-the event being persisted to routing finishing.
+**Latency** — where the time goes, and the panel that says where to optimise.
+The lag histogram is seconds from an event being persisted to routing
+finishing, which is what a user waits for.
 
-Two things worth knowing before reading it:
-
-- Synapse also exports `synapse_event_processing_lag`, a **millisecond gauge**.
-  It is not the same measurement. The dashboard uses
-  `synapse_event_processing_lag_by_event`, which is a seconds histogram and is
-  the real counterpart.
-- The lag panels are only meaningful while **following** the stream. During a
-  replay — a restart with a backlog, or a cursor rewound by hand — every event
-  is hours old by construction and the histogram says nothing about speed.
-  `gofed_stage_duration_seconds` is unaffected, so read that instead.
+One thing worth knowing before reading it: the lag panels are only meaningful
+while **following** the stream. During a replay — a restart with a backlog, or a
+cursor rewound by hand — every event is hours old by construction and the
+histogram says nothing about speed. `gofed_stage_duration_seconds` is
+unaffected, so read that instead.
 
 The stage panel has already earned its place: on first measurement the
 goroutine fan-out this design bets on cost roughly **5 µs** per event while
@@ -112,20 +93,16 @@ knowing before optimising the wrong half.
 **Queues and delivery** — whether delivery keeps up with routing. The queue
 depths are sampled rather than tracked by counter, deliberately: a leak shows
 up even when the counters that should have caught it are themselves the buggy
-part.
+part. `Events stream position` is this worker's own progress through the
+events stream, not a comparison.
 
-**Shadow record** — what the promotion decision is read from. These counters are
-restored from disk at startup and are cumulative across deploys, because "has
-this agreed with the real sender for a month?" cannot be answered from numbers
-that reset. `gofed_approximate_routes_total` is the one to watch: it counts
-routing decisions that fell back to current room state rather than resolving
-the state before the event, which is the one known difference from Synapse's
-algorithm rather than a bug we hope is absent.
+**Routing accuracy** — `gofed_approximate_routes_total` counts routing decisions
+that fell back to current room state rather than resolving the state before the
+event. That is the one known difference from Synapse's algorithm rather than a
+bug we hope is absent, so it is worth a panel of its own.
 
-**Primary mode** — bookkeeping written to Synapse's tables. Always zero while
-shadowing, and being able to see that is the point: a shadow that started
-writing would be changing the real senders' behaviour. In primary mode a
-non-zero failure rate means delivery is working while the bookkeeping is not —
+**Bookkeeping** — the writes to Synapse's tables that a primary sender's
+position IS. A non-zero failure rate means delivery is working while the bookkeeping is not —
 rows re-read forever, the outbox growing without bound, `prev_id` chaining
 silently lagging. Nothing else reports it.
 
