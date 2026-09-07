@@ -87,6 +87,16 @@ func (f *fakeStore) CurrentJoinedHosts(_ context.Context, roomID string) ([]stri
 	return f.hosts[roomID], nil
 }
 
+// No state groups, so the resolver takes the current-state fallback. The exact
+// path is tested in internal/destinations.
+func (f *fakeStore) GetStateGroupsForEvents(context.Context, []string) (map[string]int64, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) JoinedHostsAtStateGroup(context.Context, int64) ([]string, error) {
+	return nil, nil
+}
+
 type memCursors struct {
 	mu sync.Mutex
 	m  map[string]int64
@@ -136,7 +146,7 @@ func (o *recordingObserver) OnEventSkipped(id string, r destinations.SkipReason)
 	o.mu.Unlock()
 }
 
-func (o *recordingObserver) OnEventRouted(id string, all, ours []string, _ bool) {
+func (o *recordingObserver) OnEventRouted(id string, all, ours []string, _ destinations.FallbackReason) {
 	o.mu.Lock()
 	o.all[id] = all
 	o.routed[id] = ours

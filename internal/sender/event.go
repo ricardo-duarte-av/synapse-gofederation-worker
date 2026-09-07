@@ -64,7 +64,7 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 	}
 
 	if s.cfg.Observer != nil {
-		s.cfg.Observer.OnEventRouted(e.EventID, res.Destinations, ours, res.Approximate)
+		s.cfg.Observer.OnEventRouted(e.EventID, res.Destinations, ours, res.Fallback)
 	}
 	if len(ours) == 0 {
 		return false, nil

@@ -25,7 +25,7 @@ func TestTotalsSurviveRestart(t *testing.T) {
 	dir := t.TempDir()
 
 	w := writer(t, dir, 0)
-	w.RecordRoute("$a", []string{"b.example", "c.example"}, []string{"b.example"}, true)
+	w.RecordRoute("$a", []string{"b.example", "c.example"}, []string{"b.example"}, true, "forked dag")
 	w.RecordSkip("remote origin")
 	w.RecordTransaction(3, 1)
 	if err := w.Close(); err != nil {
@@ -44,6 +44,11 @@ func TestTotalsSurviveRestart(t *testing.T) {
 	}
 	if got.ApproximateRoutes != 1 {
 		t.Errorf("approximate = %d", got.ApproximateRoutes)
+	}
+	// The cause survives the restart too, so the remaining gap can be read by
+	// reason rather than as one number.
+	if got.ApproximateBy["forked dag"] != 1 {
+		t.Errorf("ApproximateBy = %v", got.ApproximateBy)
 	}
 	if got.EventsSkipped["remote origin"] != 1 {
 		t.Errorf("skipped = %v", got.EventsSkipped)
@@ -112,7 +117,7 @@ func TestSamplingWritesOneInN(t *testing.T) {
 	dir := t.TempDir()
 	w := writer(t, dir, 5)
 	for i := 0; i < 20; i++ {
-		w.RecordRoute("$e", []string{"b.example"}, []string{"b.example"}, false)
+		w.RecordRoute("$e", []string{"b.example"}, []string{"b.example"}, false, "")
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -150,7 +155,7 @@ func TestSamplingWritesOneInN(t *testing.T) {
 func TestSamplingDisabledWritesNoFile(t *testing.T) {
 	dir := t.TempDir()
 	w := writer(t, dir, 0)
-	w.RecordRoute("$e", []string{"b.example"}, []string{"b.example"}, false)
+	w.RecordRoute("$e", []string{"b.example"}, []string{"b.example"}, false, "")
 	w.Close()
 	if _, err := os.Stat(filepath.Join(dir, "samples.jsonl")); !os.IsNotExist(err) {
 		t.Error("a sample file was created with sampling disabled")
@@ -167,7 +172,7 @@ func TestSampleFileRotates(t *testing.T) {
 	}
 	for i := 0; i < 200; i++ {
 		w.RecordRoute("$event-with-a-longish-id", []string{"b.example", "c.example"},
-			[]string{"b.example"}, false)
+			[]string{"b.example"}, false, "")
 	}
 	w.Close()
 

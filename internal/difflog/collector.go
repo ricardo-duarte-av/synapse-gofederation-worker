@@ -40,7 +40,7 @@ func NewCollector(w *Writer) *Collector {
 		skipped:     d("events_skipped_total", "Events not federated, by reason.", "reason"),
 		resolved:    d("destinations_resolved_total", "Destinations resolved across all events."),
 		ours:        d("destinations_ours_total", "Resolved destinations belonging to our shard."),
-		approximate: d("approximate_routes_total", "Events routed from current state rather than state before the event."),
+		approximate: d("approximate_routes_total", "Events routed from current state rather than state before the event.", "cause"),
 		rescinded:   d("rescinded_invites_total", "Events where the rescinded-invite rule added a destination."),
 		txns:        d("transactions_total", "Transactions assembled."),
 		pdus:        d("pdus_total", "PDUs placed in transactions."),
@@ -73,7 +73,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	counter(c.resolved, t.DestinationsResolved)
 	counter(c.ours, t.DestinationsOurs)
-	counter(c.approximate, t.ApproximateRoutes)
+	for cause, n := range t.ApproximateBy {
+		counter(c.approximate, n, cause)
+	}
 	counter(c.rescinded, t.RescindedInvites)
 	counter(c.txns, t.Transactions)
 	counter(c.pdus, t.PDUs)

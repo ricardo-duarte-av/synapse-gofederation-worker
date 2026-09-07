@@ -83,15 +83,17 @@ var (
 	})
 
 	// ApproximateRoutes counts events routed from CURRENT room state rather
-	// than the state before the event.
+	// than the state before the event, by why.
 	//
 	// The most important number in the shadow, because it is the one known
 	// difference from Synapse's algorithm rather than a bug we are hoping is
-	// not there. See internal/destinations.
-	ApproximateRoutes = prometheus.NewCounter(prometheus.CounterOpts{
+	// not there. Labelled by cause: a forked DAG is work we have not done, an
+	// outlier prev event is one we could not have resolved anyway. See
+	// internal/destinations.
+	ApproximateRoutes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "gofed_approximate_routes_total",
-		Help: "Events whose destinations came from current state rather than state before the event.",
-	})
+		Help: "Events routed from current state rather than state before the event, by cause.",
+	}, []string{"cause"})
 
 	// BatchDuration is how long one pickup pass took.
 	BatchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{

@@ -78,14 +78,44 @@ func TestDomainOf(t *testing.T) {
 }
 
 type fakeHosts struct {
+	// hosts is the CURRENT state answer, used only when we fall back.
 	hosts []string
 	err   error
+	// groups maps prev event id to state group; exactHosts is what that group
+	// resolves to. Together they drive the exact path.
+	groups     map[string]int64
+	exactHosts []string
+	// exactCalls counts state-group resolutions, so a test can assert the
+	// exact path was taken rather than inferring it from the answer.
+	exactCalls *int
 }
 
 func (f fakeHosts) CurrentJoinedHosts(context.Context, string) ([]string, error) {
 	return f.hosts, f.err
 }
 
+func (f fakeHosts) GetStateGroupsForEvents(_ context.Context, ids []string) (map[string]int64, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[string]int64{}
+	for _, id := range ids {
+		if g, ok := f.groups[id]; ok {
+			out[id] = g
+		}
+	}
+	return out, nil
+}
+
+func (f fakeHosts) JoinedHostsAtStateGroup(context.Context, int64) ([]string, error) {
+	if f.exactCalls != nil {
+		*f.exactCalls++
+	}
+	return f.exactHosts, f.err
+}
+
+// resolver builds a Resolver whose prev events have no state group, so it takes
+// the current-state fallback. The exact path has tests of its own.
 func resolver(hosts []string, whitelist map[string]bool) *Resolver {
 	return NewResolver(fakeHosts{hosts: hosts}, "a.example", whitelist)
 }

@@ -256,3 +256,151 @@ func TestLiveFederationOutPos(t *testing.T) {
 		t.Errorf("an unknown instance returned %d, want 0", pos)
 	}
 }
+
+// TestLiveStateBeforeEvent exercises the exact destination path against real
+// state groups.
+//
+// This is the query that replaced the current-state approximation, and it is
+// the expensive one: state_groups_state is the largest table in a Synapse
+// database by a wide margin and the planner picks a sequential scan over it
+// without the seqscan hint. A unit test with hand-made rows would prove neither
+// the recursive walk nor that the hint is doing its job.
+func TestLiveStateBeforeEvent(t *testing.T) {
+	s := liveStore(t)
+	ctx := context.Background()
+
+	// A recent non-outlier event that actually has a state group.
+	var eventID string
+	err := s.pool.QueryRow(ctx, `
+		SELECT e.event_id FROM events e
+		JOIN event_to_state_groups etsg USING (event_id)
+		WHERE e.outlier = false
+		ORDER BY e.stream_ordering DESC LIMIT 1`).Scan(&eventID)
+	if err != nil {
+		t.Skipf("no event with a state group: %v", err)
+	}
+
+	groups, err := s.GetStateGroupsForEvents(ctx, []string{eventID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, ok := groups[eventID]
+	if !ok {
+		t.Fatalf("%s has no state group", eventID)
+	}
+
+	started := time.Now()
+	hosts, err := s.JoinedHostsAtStateGroup(ctx, group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(started)
+	t.Logf("state group %d resolves to %d joined hosts in %s", group, len(hosts), took)
+
+	if len(hosts) == 0 {
+		t.Error("no joined hosts at a state group taken from a live event")
+	}
+	seen := map[string]bool{}
+	for _, h := range hosts {
+		if h == "" {
+			t.Error("empty host in the result")
+		}
+		if seen[h] {
+			t.Errorf("duplicate host %q; the query should return each once", h)
+		}
+		seen[h] = true
+	}
+	// The seqscan hint is the difference between milliseconds and minutes here.
+	if took > 10*time.Second {
+		t.Errorf("resolving one state group took %s; the seqscan hint is probably not "+
+			"being applied", took)
+	}
+
+	// An unknown event has no state group, and that is not an error: an
+	// outlier legitimately has none.
+	missing, err := s.GetStateGroupsForEvents(ctx, []string{"$definitely-not-an-event"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("an unknown event returned %v", missing)
+	}
+}
+
+// TestLiveStateBeforeMatchesCurrentStateForSettledRooms is a sanity check
+// rather than a proof.
+//
+// For an event at the tip of a room whose membership has not changed since, the
+// state before it and the current state should name the same hosts. Where they
+// differ, the event itself changed the membership -- which is exactly the case
+// the exact path exists to get right, so a difference is informative rather
+// than a failure.
+func TestLiveStateBeforeMatchesCurrentStateForSettledRooms(t *testing.T) {
+	s := liveStore(t)
+	ctx := context.Background()
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT e.event_id, e.room_id, etsg.state_group
+		FROM events e
+		JOIN event_to_state_groups etsg USING (event_id)
+		WHERE e.outlier = false AND e.type = 'm.room.message'
+		ORDER BY e.stream_ordering DESC LIMIT 20`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type sample struct {
+		eventID, roomID string
+		group           int64
+	}
+	var samples []sample
+	for rows.Next() {
+		var sm sample
+		if err := rows.Scan(&sm.eventID, &sm.roomID, &sm.group); err != nil {
+			t.Fatal(err)
+		}
+		samples = append(samples, sm)
+	}
+	rows.Close()
+	if len(samples) == 0 {
+		t.Skip("no message events to compare")
+	}
+
+	agreed := 0
+	for _, sm := range samples {
+		before, err := s.JoinedHostsAtStateGroup(ctx, sm.group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current, err := s.CurrentJoinedHosts(ctx, sm.roomID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sameSet(before, current) {
+			agreed++
+		}
+	}
+	t.Logf("%d of %d message events agree with current state", agreed, len(samples))
+	// A message event does not change membership, so for a room with no
+	// membership churn since, these should mostly agree. Mostly, not always --
+	// the room may have moved on.
+	if agreed == 0 {
+		t.Error("not one message event agreed with current state; the state-group walk " +
+			"is probably resolving the wrong thing")
+	}
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := make(map[string]bool, len(a))
+	for _, s := range a {
+		m[s] = true
+	}
+	for _, s := range b {
+		if !m[s] {
+			return false
+		}
+	}
+	return true
+}

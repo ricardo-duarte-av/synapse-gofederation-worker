@@ -49,6 +49,10 @@ type Totals struct {
 	// rather than state before the event. This is the known difference from
 	// Synapse's algorithm, and sizing it is the main thing the shadow is for.
 	ApproximateRoutes int64 `json:"approximate_routes"`
+	// ApproximateBy breaks that down by cause, so "we have not implemented
+	// state resolution for forked DAGs" can be told apart from "that prev
+	// event was an outlier".
+	ApproximateBy map[string]int64 `json:"approximate_by"`
 	// RescindedInvites counts the rare rule firing, because its absence from a
 	// diff would otherwise be indistinguishable from it never happening.
 	RescindedInvites int64 `json:"rescinded_invites"`
@@ -108,7 +112,8 @@ func Open(cfg Config) (*Writer, error) {
 	// stop the worker: losing the history is bad, refusing to start over it is
 	// worse. The loss is reported by the Since field jumping forward.
 	if err := w.load(); err != nil {
-		w.totals = Totals{Since: time.Now(), EventsSkipped: map[string]int64{}}
+		w.totals = Totals{Since: time.Now(), EventsSkipped: map[string]int64{},
+			ApproximateBy: map[string]int64{}}
 	}
 	w.totals.Restarts++
 
@@ -142,6 +147,9 @@ func (w *Writer) load() error {
 	if t.EventsSkipped == nil {
 		t.EventsSkipped = map[string]int64{}
 	}
+	if t.ApproximateBy == nil {
+		t.ApproximateBy = map[string]int64{}
+	}
 	if t.Since.IsZero() {
 		t.Since = time.Now()
 	}
@@ -159,6 +167,11 @@ func (w *Writer) Totals() Totals {
 		skipped[k] = v
 	}
 	t.EventsSkipped = skipped
+	by := make(map[string]int64, len(t.ApproximateBy))
+	for k, v := range t.ApproximateBy {
+		by[k] = v
+	}
+	t.ApproximateBy = by
 	return t
 }
 
@@ -178,12 +191,13 @@ type Route struct {
 	// All is every destination in the room; Ours is our shard's share.
 	All  []string `json:"all"`
 	Ours []string `json:"ours"`
-	// Approximate says the answer came from current state.
-	Approximate bool `json:"approximate"`
+	// Approximate says the answer came from current state, and Cause says why.
+	Approximate bool   `json:"approximate"`
+	Cause       string `json:"cause,omitempty"`
 }
 
 // RecordRoute counts a routing decision and may sample it.
-func (w *Writer) RecordRoute(eventID string, all, ours []string, approximate bool) {
+func (w *Writer) RecordRoute(eventID string, all, ours []string, approximate bool, cause string) {
 	w.mu.Lock()
 	w.totals.EventsExamined++
 	w.totals.DestinationsResolved += int64(len(all))
@@ -193,6 +207,10 @@ func (w *Writer) RecordRoute(eventID string, all, ours []string, approximate boo
 	}
 	if approximate {
 		w.totals.ApproximateRoutes++
+		if w.totals.ApproximateBy == nil {
+			w.totals.ApproximateBy = map[string]int64{}
+		}
+		w.totals.ApproximateBy[cause]++
 	}
 	w.dirty = true
 
@@ -207,7 +225,7 @@ func (w *Writer) RecordRoute(eventID string, all, ours []string, approximate boo
 		// are hot.
 		_ = sampler.write(Route{
 			Time: time.Now(), EventID: eventID, All: all, Ours: ours,
-			Approximate: approximate,
+			Approximate: approximate, Cause: cause,
 		})
 	}
 }

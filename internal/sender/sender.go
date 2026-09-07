@@ -48,8 +48,10 @@ type Observer interface {
 	// OnEventSkipped reports an event that will not be federated.
 	OnEventSkipped(eventID string, reason destinations.SkipReason)
 	// OnEventRouted reports an event's resolved destinations, before and after
-	// the shard filter, plus whether the answer was approximate.
-	OnEventRouted(eventID string, all, ours []string, approximate bool)
+	// the shard filter, and how the answer was reached. fallback is empty when
+	// the destinations came from the state before the event, i.e. exactly as
+	// Synapse would have computed them.
+	OnEventRouted(eventID string, all, ours []string, fallback destinations.FallbackReason)
 	// OnBatch reports one pass of the pickup loop.
 	OnBatch(events, routed int, from, to int64, took time.Duration)
 }

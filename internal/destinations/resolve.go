@@ -9,8 +9,15 @@ import (
 )
 
 // RoomHosts is the database access this package needs.
+//
+// The two host lookups answer different questions and the difference is the
+// whole point of this file. CurrentJoinedHosts is who is in the room NOW;
+// JoinedHostsAtStateGroup is who was in it at a particular point in the DAG,
+// which is what Synapse actually uses.
 type RoomHosts interface {
 	CurrentJoinedHosts(ctx context.Context, roomID string) ([]string, error)
+	GetStateGroupsForEvents(ctx context.Context, eventIDs []string) (map[string]int64, error)
+	JoinedHostsAtStateGroup(ctx context.Context, group int64) ([]string, error)
 }
 
 // Resolver works out where a PDU goes.
@@ -36,13 +43,27 @@ type Result struct {
 	// Approximate is true when the answer came from CURRENT room state rather
 	// than the state before the event.
 	//
-	// Synapse resolves the state at the event's prev_events
+	// Synapse resolves state at the event's prev_events
 	// (federation/sender/__init__.py:661), specifically so that the last member
-	// on a server still receives their own ban. We use current state, which
-	// differs exactly when the event itself changes who is in the room. This
-	// flag is what lets the shadow MEASURE that gap instead of guessing at it;
-	// see internal/difflog.
+	// on a server still receives their own ban. We do the same whenever the
+	// prev events share a single state group, which is the overwhelming
+	// majority of events -- 98% of local events on this deployment have exactly
+	// one prev event.
+	//
+	// It stays true only for the cases below, where an exact answer would need
+	// full state resolution:
+	//
+	//   - the prev events sit on two or more distinct state groups, i.e. a
+	//     genuine DAG fork
+	//   - a prev event has no state group at all, which means it is an outlier
+	//
+	// Keeping the flag rather than hiding the fallback is what lets the shadow
+	// MEASURE the remaining gap instead of guessing at it; see internal/difflog.
 	Approximate bool
+
+	// Fallback names why an approximate answer was given, so the two causes can
+	// be told apart in the record. Empty when the answer was exact.
+	Fallback FallbackReason
 	// RescindedInvite records that the rescinded-invite rule added a domain,
 	// because it is rare enough that its absence from the diff would be
 	// indistinguishable from it never firing.
@@ -65,9 +86,10 @@ func (r *Resolver) Resolve(ctx context.Context, eventJSON []byte, authEvents fun
 		return Result{}, nil
 	}
 
-	hosts, err := r.hosts.CurrentJoinedHosts(ctx, roomID)
+	prevIDs := prevEventIDs(ev)
+	hosts, approximate, fallback, err := r.hostsBeforeEvent(ctx, roomID, prevIDs)
 	if err != nil {
-		return Result{}, fmt.Errorf("destinations: %s: %w", roomID, err)
+		return Result{}, err
 	}
 
 	set := make(map[string]bool, len(hosts))
@@ -75,7 +97,7 @@ func (r *Resolver) Resolve(ctx context.Context, eventJSON []byte, authEvents fun
 		set[h] = true
 	}
 
-	res := Result{Approximate: true}
+	res := Result{Approximate: approximate, Fallback: fallback}
 
 	// The rescinded-invite rule (federation/sender/__init__.py:674). A leave
 	// whose sender is not its subject is a kick, a ban, an unban, or the

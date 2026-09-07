@@ -27,17 +27,21 @@ func (o *observer) OnEventSkipped(_ string, reason destinations.SkipReason) {
 	}
 }
 
-func (o *observer) OnEventRouted(eventID string, all, ours []string, approximate bool) {
+func (o *observer) OnEventRouted(eventID string, all, ours []string, fallback destinations.FallbackReason) {
 	metrics.EventsProcessed.Inc()
 	if len(ours) > 0 {
 		metrics.EventsRouted.Inc()
 		metrics.DestinationsPerEvent.Observe(float64(len(ours)))
 	}
+	// Labelled by cause, because the two fallbacks mean different things: a
+	// forked DAG is work we have not done, while a missing state group is an
+	// outlier we could not have resolved anyway.
+	approximate := fallback != ""
 	if approximate {
-		metrics.ApproximateRoutes.Inc()
+		metrics.ApproximateRoutes.WithLabelValues(string(fallback)).Inc()
 	}
 	if o.diff != nil {
-		o.diff.RecordRoute(eventID, all, ours, approximate)
+		o.diff.RecordRoute(eventID, all, ours, approximate, string(fallback))
 	}
 }
 
