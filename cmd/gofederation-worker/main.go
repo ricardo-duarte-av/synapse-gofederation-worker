@@ -291,6 +291,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 
 	w.devices = sender.NewDevices(sender.DevicesConfig{
 		Store:        w.db,
+		Log:          log,
 		Cursors:      w.cursors,
 		Queues:       w.queues,
 		ShouldHandle: cfg.ShouldHandle,

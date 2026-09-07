@@ -498,3 +498,60 @@ func TestEventTimeWindowMakesAReplayComparable(t *testing.T) {
 		t.Errorf("got %+v, want the replayed event matched", d)
 	}
 }
+
+// The false green this exists to prevent.
+//
+// The recorder captures every transaction arriving at the test homeserver,
+// which once this worker is live includes its own. Comparing that file against
+// the worker's capture is then the worker against itself: both halves match
+// perfectly, the report is green, and it means nothing. Nothing else would
+// catch it, because there is no disagreement to find.
+func TestOurOwnTransactionsAreExcludedFromGroundTruth(t *testing.T) {
+	ourSend := rec(SourceSynapse, "b.example", "gofed-1", []string{pdu("$a", "x")})
+	synapseSend := rec(SourceSynapse, "b.example", "1788623071739", []string{pdu("$a", "x")})
+	ours := rec(SourceWorker, "b.example", "gofed-1", []string{pdu("$a", "x")})
+
+	kept, removed := ExcludeOurOwn([]Record{ourSend, synapseSend}, "gofed-")
+	if removed != 1 || len(kept) != 1 {
+		t.Fatalf("kept %d removed %d, want 1 and 1", len(kept), removed)
+	}
+	if kept[0].TxnID != "1788623071739" {
+		t.Errorf("kept the wrong record: %q", kept[0].TxnID)
+	}
+
+	// With the exclusion the comparison is against Synapse's copy, which is
+	// the only one that proves anything.
+	d, err := Compare("b.example", Window{}, kept, []Record{ours})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Agreed() || d.PDUsBoth != 1 {
+		t.Errorf("got %+v", d)
+	}
+
+	// An empty prefix disables it, for a deployment that has turned the
+	// namespacing off.
+	if _, removed := ExcludeOurOwn([]Record{ourSend}, ""); removed != 0 {
+		t.Error("an empty prefix should exclude nothing")
+	}
+}
+
+// Removing our own records must not leave a self-comparison looking like
+// agreement over real data: if the ground truth becomes empty, that is
+// inconclusive, not a pass.
+func TestExclusionCanMakeAComparisonInconclusive(t *testing.T) {
+	ourSend := rec(SourceSynapse, "b.example", "gofed-1", []string{pdu("$a", "x")})
+	ours := rec(SourceWorker, "b.example", "gofed-1", []string{pdu("$a", "x")})
+
+	// Before exclusion this looks like perfect agreement.
+	d, _ := Compare("b.example", Window{}, []Record{ourSend}, []Record{ours})
+	if !d.Agreed() || d.Inconclusive() {
+		t.Fatal("the self-comparison should look like a clean pass; that is the danger")
+	}
+
+	kept, _ := ExcludeOurOwn([]Record{ourSend}, "gofed-")
+	d, _ = Compare("b.example", Window{}, kept, []Record{ours})
+	if !d.Inconclusive() && d.Agreed() {
+		t.Error("after exclusion the comparison has no ground truth and must not pass")
+	}
+}

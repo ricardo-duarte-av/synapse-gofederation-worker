@@ -35,6 +35,10 @@ func main() {
 		destination = flag.String("destination", "", "limit to one destination (recommended)")
 		since       = flag.String("since", "", "ignore records before this RFC3339 time (default: the overlap of the two captures)")
 		until       = flag.String("until", "", "ignore records after this RFC3339 time (default: the overlap of the two captures)")
+		ourPrefix   = flag.String("our-txn-prefix", "gofed-",
+			"transaction id prefix identifying this worker's own sends, which the recorder also "+
+				"captures once the worker is live; they are removed from the synapse side so the "+
+				"comparison is not the worker against itself")
 		byEventTime = flag.Bool("by-event-time", false,
 			"window on the events' own origin_server_ts rather than on when each side processed them; "+
 				"needed when either capture is a replay of history rather than a live follow")
@@ -52,7 +56,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	code, err := run(*synapsePath, *workerPath, *destination, *since, *until, *byEventTime, *asJSON)
+	code, err := run(*synapsePath, *workerPath, *destination, *since, *until, *ourPrefix, *byEventTime, *asJSON)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fedcompare: %v\n", err)
 		os.Exit(1)
@@ -60,7 +64,7 @@ func main() {
 	os.Exit(code)
 }
 
-func run(synapsePath, workerPath, destination, since, until string, byEventTime, asJSON bool) (int, error) {
+func run(synapsePath, workerPath, destination, since, until, ourPrefix string, byEventTime, asJSON bool) (int, error) {
 	synapse, synSkipped, err := capture.ReadFile(synapsePath)
 	if err != nil {
 		return 0, err
@@ -91,6 +95,24 @@ func run(synapsePath, workerPath, destination, since, until string, byEventTime,
 			return 0, fmt.Errorf("parsing -until: %w", err)
 		}
 		window.Until = t
+	}
+
+	// Strip our own transactions from the ground-truth side. The recorder
+	// captures everything that reaches the test homeserver, including ours
+	// once we are live, and comparing those against ourselves always passes.
+	synapse, ourOwn := capture.ExcludeOurOwn(synapse, ourPrefix)
+	if ourOwn > 0 && !asJSON {
+		fmt.Printf("excluded %d of our own transactions from the synapse capture "+
+			"(prefix %q)\n", ourOwn, ourPrefix)
+	}
+
+	// Recompute the window after the exclusion: our own records were shaping it.
+	if since == "" && until == "" {
+		if byEventTime {
+			window = capture.OverlapByEventTime(synapse, worker)
+		} else {
+			window = capture.Overlap(synapse, worker)
+		}
 	}
 
 	diff, err := capture.Compare(destination, window, synapse, worker)

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/queue"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/state"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/store"
@@ -39,6 +41,7 @@ type Devices struct {
 	store   DeviceStore
 	cursors Cursors
 	queues  *queue.Manager
+	log     zerolog.Logger
 
 	shouldHandle func(destination string) bool
 	// edusPerTransaction is the per-destination read limit. Synapse budgets
@@ -53,6 +56,7 @@ type DevicesConfig struct {
 	Store        DeviceStore
 	Cursors      Cursors
 	Queues       *queue.Manager
+	Log          zerolog.Logger
 	ShouldHandle func(destination string) bool
 	EDUsPerRead  int
 }
@@ -66,7 +70,7 @@ func NewDevices(cfg DevicesConfig) *Devices {
 		n = 90
 	}
 	return &Devices{
-		store: cfg.Store, cursors: cfg.Cursors, queues: cfg.Queues,
+		store: cfg.Store, cursors: cfg.Cursors, queues: cfg.Queues, log: cfg.Log,
 		shouldHandle: cfg.ShouldHandle, edusPerRead: n,
 	}
 }
@@ -77,7 +81,14 @@ func NewDevices(cfg DevicesConfig) *Devices {
 // an entity that is either a user id or a remote server name; only the latter
 // concern a sender (replication/tcp/client.py:472).
 func (d *Devices) HandleToDevice(ctx context.Context, servers []string) error {
+	// Logged before the shard filter as well as after. This path is a race
+	// against Synapse's own sender, which DELETES the rows it sends, so "we
+	// saw nothing" and "we were too late" are different facts and only a log
+	// taken at both points can tell them apart.
+	all := servers
 	servers = d.ourShare(servers)
+	d.log.Debug().Strs("servers", all).Strs("ours", servers).
+		Msg("to-device poke")
 	if len(servers) == 0 {
 		return nil
 	}
@@ -105,6 +116,10 @@ func (d *Devices) toDeviceFor(ctx context.Context, server string, current int64)
 	if err != nil {
 		return err
 	}
+	d.log.Debug().
+		Str("destination", server).Int64("from", last).Int64("current", current).
+		Int("messages", len(msgs)).
+		Msg("read to-device outbox")
 	if len(msgs) == 0 {
 		// Still advance: the gap is other destinations' rows, and leaving the
 		// cursor behind them would re-scan the same range forever.
@@ -140,7 +155,11 @@ func (d *Devices) HandleDeviceLists(ctx context.Context, streamID int64) error {
 	if err != nil {
 		return err
 	}
+	all := servers
 	servers = d.ourShare(servers)
+	d.log.Debug().Int64("stream_id", streamID).
+		Strs("servers", all).Strs("ours", servers).
+		Msg("device list poke")
 	if len(servers) == 0 {
 		return nil
 	}

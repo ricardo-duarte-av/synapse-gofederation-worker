@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local test credentials and captures. Never committed.
+/secrets/
+/captures/
+/difflog/

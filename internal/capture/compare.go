@@ -261,7 +261,35 @@ func timeRange(records []Record) (min, max time.Time) {
 	return min, max
 }
 
+// ExcludeOurOwn removes records whose transaction id carries our prefix.
+//
+// The recorder sits in front of the test homeserver and captures EVERY
+// transaction that arrives, which once this worker is sending for real
+// includes its own. Comparing that file against the worker's would then be
+// comparing the worker with itself -- a green light that means nothing and that
+// nothing else would catch, because both halves genuinely match.
+//
+// The transaction id prefix is what makes the two separable, which is a second
+// reason to keep it beyond avoiding id collisions.
+func ExcludeOurOwn(records []Record, prefix string) (kept []Record, removed int) {
+	if prefix == "" {
+		return records, 0
+	}
+	kept = make([]Record, 0, len(records))
+	for _, r := range records {
+		if strings.HasPrefix(r.TxnID, prefix) {
+			removed++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, removed
+}
+
 // Compare diffs two sets of records for one destination, within a window.
+//
+// The synapse side must not contain this worker's own transactions; pass it
+// through ExcludeOurOwn first.
 func Compare(destination string, window Window, synapse, worker []Record) (Diff, error) {
 	d := Diff{Destination: destination, Window: window}
 

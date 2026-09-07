@@ -49,6 +49,11 @@ func (h *handler) handleToDevice(rows []replication.Row) {
 		seen[entity] = true
 		servers = append(servers, entity)
 	}
+	// Logged even when nothing survives the filter: a to_device row naming a
+	// local user looks identical, in a metrics counter, to one naming a remote
+	// server we then failed to act on.
+	h.log.Debug().Int("rows", len(rows)).Strs("remote_servers", servers).
+		Msg("to_device replication rows")
 	if len(servers) == 0 {
 		return
 	}
