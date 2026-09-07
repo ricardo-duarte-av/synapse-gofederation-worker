@@ -23,6 +23,23 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
 )
 
+// Mode is how this worker relates to the homeserver it serves.
+type Mode string
+
+const (
+	// ModeShadow is the default: this worker impersonates the shard of an
+	// EXISTING sender, writes nothing to Synapse's tables and sends nothing
+	// unless a destination is explicitly allowlisted. worker_name must NOT be
+	// one of federation_sender_instances.
+	ModeShadow Mode = "shadow"
+
+	// ModePrimary means this worker IS one of the homeserver's configured
+	// federation senders. worker_name MUST be in federation_sender_instances,
+	// and the read-only guarantee no longer applies: a sender's bookkeeping is
+	// a set of deletions, so it needs a role that can write.
+	ModePrimary Mode = "primary"
+)
+
 // Config is the whole file.
 type Config struct {
 	// WorkerName is THIS process's own identity, and must differ from every
@@ -35,6 +52,13 @@ type Config struct {
 	// exactly the ones it needs. It also keeps our cursors from colliding if
 	// two shadows of the same sender ever run.
 	WorkerName string `yaml:"worker_name"`
+
+	// Mode says whether this worker is a shadow of somebody else's sender or a
+	// homeserver's own.
+	//
+	// It inverts several checks rather than merely enabling a feature, which is
+	// why it is a mode and not a set of booleans -- see Resolve.
+	Mode Mode `yaml:"mode"`
 
 	// SynapseConfig points at Synapse's homeserver.yaml. Everything derivable
 	// from it -- server_name, the sender instance list, the signing key path,
@@ -118,8 +142,19 @@ type DatabaseConfig struct {
 	// RequireReadOnly makes a role with write grants on Synapse's tables a
 	// startup failure rather than a warning. Default false, matching
 	// gosync-worker: a scratch database is a legitimate way to develop against
-	// this. Set it true in production.
+	// this. Set it true in production -- but only in shadow mode, where it is
+	// meaningful.
 	RequireReadOnly bool `yaml:"require_read_only"`
+
+	// WriteDSN is the connection a PRIMARY sender does its bookkeeping on:
+	// deleting consumed to-device rows and device pokes, recording retry
+	// timings and catch-up cursors.
+	//
+	// Kept separate from DSN, under its own role, so the reading path stays
+	// provably read-only and a shadow deployment has no writable handle to
+	// Synapse's tables anywhere in the process. Required in primary mode and
+	// refused in shadow mode.
+	WriteDSN string `yaml:"write_dsn"`
 }
 
 // StateConfig is our own cursor storage -- the only thing this worker writes.
@@ -281,6 +316,31 @@ func (c *Config) ConnectTimeout() time.Duration {
 }
 
 func (c *Config) validate() error {
+	switch c.Mode {
+	case "", ModeShadow:
+		c.Mode = ModeShadow
+	case ModePrimary:
+	default:
+		return fmt.Errorf("config: mode %q is not %q or %q", c.Mode, ModeShadow, ModePrimary)
+	}
+	if c.Mode == ModePrimary {
+		if c.Database.WriteDSN == "" {
+			return fmt.Errorf("config: database.write_dsn is required in primary mode; " +
+				"a sender's bookkeeping is a set of deletions and it cannot be done read-only")
+		}
+		if c.Database.RequireReadOnly {
+			return fmt.Errorf("config: database.require_read_only cannot be set in primary " +
+				"mode; the worker must write its own bookkeeping")
+		}
+		if c.ShadowEnabled() {
+			return fmt.Errorf("config: a primary sender cannot run with shadow.enabled true; " +
+				"it is the homeserver's only sender and dry-running would drop all its traffic")
+		}
+	}
+	if c.Mode == ModeShadow && c.Database.WriteDSN != "" {
+		return fmt.Errorf("config: database.write_dsn is set in shadow mode; a shadow must " +
+			"have no writable handle to Synapse's tables at all")
+	}
 	if c.WorkerName == "" {
 		return fmt.Errorf("config: worker_name is required; it is this process's own " +
 			"identity on the replication bus and must differ from every federation sender")
@@ -289,9 +349,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: synapse_config is required; it is where server_name, " +
 			"federation_sender_instances and the signing key come from")
 	}
-	if c.Shadow.Instance == "" {
-		return fmt.Errorf("config: shadow.instance is required; it names the federation " +
-			"sender whose shard this worker takes")
+	if c.Mode == ModeShadow && c.Shadow.Instance == "" {
+		return fmt.Errorf("config: shadow.instance is required in shadow mode; it names the " +
+			"federation sender whose shard this worker takes")
 	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("config: database.dsn is required")
@@ -337,7 +397,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: shadow.capture_file is required when " +
 			"shadow.capture_destinations is set")
 	}
-	if c.ShadowEnabled() && c.Shadow.DiffLogDir == "" {
+	if c.Mode == ModeShadow && c.ShadowEnabled() && c.Shadow.DiffLogDir == "" {
 		return fmt.Errorf("config: shadow.difflog_dir is required while shadowing; " +
 			"the comparison record is the only output that matters in dry-run")
 	}

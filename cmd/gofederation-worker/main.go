@@ -251,6 +251,12 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			MaxDelay:  cfg.Synapse.MaxLongRetryDelay,
 		})
 		live.SetOnSent(w.countTransaction)
+		live.SetObservers(
+			func(outcome string, took time.Duration) {
+				metrics.SendDuration.WithLabelValues(outcome).Observe(took.Seconds())
+			},
+			func(delta int) { metrics.InFlightSends.Add(float64(delta)) },
+		)
 		if w.capture != nil {
 			live.SetCapture(w.capture)
 		}

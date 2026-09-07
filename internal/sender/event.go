@@ -22,6 +22,7 @@ const catchupRetryInterval = time.Hour
 // handleEvent decides where one event goes and queues it. It reports whether
 // the event was routed anywhere.
 func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
+	started := time.Now()
 	meta := destinations.ParseMetadata(e.InternalMetadata)
 
 	if ok, reason := destinations.Eligible(e.Sender, s.cfg.ServerName, meta, e.RejectionReason); !ok {
@@ -38,10 +39,12 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 		return s.loadAuthEvents(ctx, e)
 	}
 
+	resolveStart := time.Now()
 	res, err := s.cfg.Resolver.Resolve(ctx, e.JSON, authEvents)
 	if err != nil {
 		return false, err
 	}
+	s.stage("resolve", resolveStart)
 	if len(res.Destinations) == 0 {
 		if s.cfg.Observer != nil {
 			s.cfg.Observer.OnEventSkipped(e.EventID, destinations.SkipNoDestinations)
@@ -79,10 +82,12 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 	// down still has the event recorded as owed to it. We cannot write that
 	// table, which means our catch-up is driven by our own cursors instead --
 	// see docs/shadow-safety.md and internal/state.
+	retryStart := time.Now()
 	timings, err := s.cfg.Store.GetDestinationRetryTimings(ctx, ours)
 	if err != nil {
 		return false, err
 	}
+	s.stage("retry_filter", retryStart)
 	due := store.FilterDestinationsByRetryLimiter(ours, timings, time.Now(), catchupRetryInterval)
 
 	// Serialise as Synapse does before queueing, so a PDU it would drop is
@@ -112,11 +117,27 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 		return false, err
 	}
 
+	// The fan-out itself, timed separately: it is the thing this worker's
+	// design is a bet on, so "did it help?" has to be answerable directly
+	// rather than inferred from end-to-end latency.
+	fanOut := time.Now()
 	p := queue.PDU{EventID: e.EventID, StreamOrdering: e.StreamOrdering, JSON: body}
 	for _, d := range due {
 		q := s.cfg.Queues.Get(d)
 		q.EnqueuePDU(p)
 		s.cfg.Queues.Wake(q)
 	}
+	if s.cfg.Observer != nil {
+		s.cfg.Observer.OnStage("fanout", time.Since(fanOut))
+		s.cfg.Observer.OnStage("event_total", time.Since(started))
+		s.cfg.Observer.OnEventLag(e.ReceivedTS, time.Now())
+	}
 	return len(due) > 0, nil
+}
+
+// stage reports a stage's duration, if anyone is listening.
+func (s *Sender) stage(name string, since time.Time) {
+	if s.cfg.Observer != nil {
+		s.cfg.Observer.OnStage(name, time.Since(since))
+	}
 }

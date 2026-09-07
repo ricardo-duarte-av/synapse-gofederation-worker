@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -39,6 +40,12 @@ type HTTP struct {
 	timeout  time.Duration
 	onSent   func(pdus, edus, bytes int)
 	capture  Capturer
+
+	// observe reports one attempt's duration and outcome, and inFlight tracks
+	// concurrency. Hooks rather than an import of the metrics package, so this
+	// stays testable without a Prometheus registry.
+	observe  func(outcome string, took time.Duration)
+	inFlight func(delta int)
 }
 
 // HTTPConfig builds an HTTP sink.
@@ -104,6 +111,15 @@ func (h *HTTP) SetOnSent(f func(pdus, edus, bytes int)) { h.onSent = f }
 // SetCapture registers a full-request recorder.
 func (h *HTTP) SetCapture(c Capturer) { h.capture = c }
 
+// SetObservers registers timing callbacks.
+//
+// Outcome is labelled because a fast failure and a fast success look identical
+// in a duration histogram, and a remote that refuses instantly would otherwise
+// read as excellent performance.
+func (h *HTTP) SetObservers(observe func(outcome string, took time.Duration), inFlight func(delta int)) {
+	h.observe, h.inFlight = observe, inFlight
+}
+
 // Mode identifies this sink.
 func (h *HTTP) Mode() string { return "http (REALLY SENDING)" }
 
@@ -164,8 +180,14 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 	httpReq.Header.Set("User-Agent", h.userAgent)
 	httpReq.ContentLength = int64(len(req.Body))
 
+	if h.inFlight != nil {
+		h.inFlight(1)
+		defer h.inFlight(-1)
+	}
+	started := time.Now()
 	resp, err := h.client.Do(httpReq)
 	if err != nil {
+		h.observed("error", started)
 		// A connection failure is worth retrying: the remote may be
 		// restarting, and Synapse retries these too.
 		return Result{}, true, fmt.Errorf("sink: %s: %w", req.Destination, err)
@@ -180,6 +202,7 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		h.observed("http_"+strconv.Itoa(resp.StatusCode), started)
 		// Synapse retries 5xx and 429 and gives up on everything else
 		// (matrixfederationclient.py:833). A 400 means the remote has made a
 		// decision about this transaction and will make the same one again.
@@ -203,6 +226,7 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 		})
 	}
 
+	h.observed("ok", started)
 	pdus, edus := countUnits(req.Body)
 	if h.onSent != nil {
 		h.onSent(pdus, edus, len(req.Body))
@@ -228,6 +252,12 @@ func (h *HTTP) backoff(attempt int) time.Duration {
 	}
 	jitter := 0.8 + rand.Float64()*0.6
 	return time.Duration(float64(delay) * jitter)
+}
+
+func (h *HTTP) observed(outcome string, since time.Time) {
+	if h.observe != nil {
+		h.observe(outcome, time.Since(since))
+	}
 }
 
 func truncate(b []byte, n int) string {

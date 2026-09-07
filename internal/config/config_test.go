@@ -201,3 +201,69 @@ database:
 		t.Errorf("SendOnlyTo = %v", cfg.Shadow.SendOnlyTo)
 	}
 }
+
+// The two modes invert several checks rather than one enabling a feature, and
+// getting the inversion wrong is a worker that runs healthily while doing
+// nothing.
+func TestPrimaryModeRequirements(t *testing.T) {
+	base := `
+mode: primary
+worker_name: testing-gofederation-worker-1
+synapse_config: /etc/synapse/homeserver.yaml
+shadow:
+  enabled: false
+  send_to_all: true
+database:
+  dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+`
+	// A primary must be able to write; its bookkeeping is a set of deletions.
+	if _, err := Parse([]byte(base)); err == nil {
+		t.Error("primary mode was accepted with no write_dsn")
+	}
+
+	withWrite := base + `  write_dsn: "host=/var/sockets user=gofed_rw dbname=synapse-db"
+`
+	cfg, err := Parse([]byte(withWrite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mode != ModePrimary {
+		t.Errorf("Mode = %q", cfg.Mode)
+	}
+
+	// require_read_only contradicts primary mode outright.
+	if _, err := Parse([]byte(withWrite + "  require_read_only: true\n")); err == nil {
+		t.Error("primary mode accepted require_read_only")
+	}
+
+	// A primary that dry-runs would drop the homeserver's entire federation
+	// traffic, since nothing else is sending it.
+	shadowing := `
+mode: primary
+worker_name: testing-gofederation-worker-1
+synapse_config: /etc/synapse/homeserver.yaml
+shadow:
+  enabled: true
+  difflog_dir: /d
+database:
+  dsn: x
+  write_dsn: y
+`
+	if _, err := Parse([]byte(shadowing)); err == nil {
+		t.Error("a primary sender was allowed to run in shadow (dry-run) mode")
+	}
+}
+
+// A shadow must have no writable handle to Synapse's tables anywhere in the
+// process, so configuring one is refused rather than ignored.
+func TestShadowModeRefusesAWriteDSN(t *testing.T) {
+	if _, err := Parse([]byte(minimal + "  write_dsn: \"host=/var/sockets user=rw\"\n")); err == nil {
+		t.Error("shadow mode accepted a write_dsn")
+	}
+}
+
+func TestUnknownModeIsRejected(t *testing.T) {
+	if _, err := Parse([]byte(minimal + "\nmode: sortof\n")); err == nil {
+		t.Error("an unknown mode was accepted")
+	}
+}

@@ -88,6 +88,11 @@ type Event struct {
 	// JSON is the event body as stored, which is what gets serialised into a
 	// transaction.
 	JSON []byte
+	// ReceivedTS is when Synapse persisted the event, in milliseconds. It is
+	// the baseline for the processing-lag metric, which is the number directly
+	// comparable with Synapse's own. Zero when unknown, which the metric reads
+	// as "cannot measure" rather than "arrived at the epoch".
+	ReceivedTS int64
 	// InternalMetadata carries the three flags the eligibility filter needs --
 	// out_of_band_membership, proactively_send and send_on_behalf_of -- none of
 	// which are in the event body.
@@ -107,7 +112,7 @@ func (s *Store) GetEvents(ctx context.Context, ids []string) ([]Event, error) {
 	const q = `
 		SELECT e.event_id, e.room_id, e.type, COALESCE(e.state_key, ''),
 		       COALESCE(e.sender, ''), e.stream_ordering, e.outlier,
-		       COALESCE(e.rejection_reason, ''),
+		       COALESCE(e.rejection_reason, ''), COALESCE(e.received_ts, 0),
 		       ej.json, ej.internal_metadata
 		FROM events AS e
 		JOIN event_json AS ej USING (event_id)
@@ -123,7 +128,8 @@ func (s *Store) GetEvents(ctx context.Context, ids []string) ([]Event, error) {
 	for rows.Next() {
 		var e Event
 		if err := rows.Scan(&e.EventID, &e.RoomID, &e.Type, &e.StateKey, &e.Sender,
-			&e.StreamOrdering, &e.Outlier, &e.RejectionReason, &e.JSON, &e.InternalMetadata); err != nil {
+			&e.StreamOrdering, &e.Outlier, &e.RejectionReason, &e.ReceivedTS,
+			&e.JSON, &e.InternalMetadata); err != nil {
 			return nil, fmt.Errorf("store: get events: %w", err)
 		}
 		byID[e.EventID] = e

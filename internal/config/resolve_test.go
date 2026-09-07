@@ -168,3 +168,53 @@ func TestWorkerNameAndShardInstanceAreDistinct(t *testing.T) {
 		t.Error("ShouldHandle owns nothing; the shard is being computed from worker_name")
 	}
 }
+
+// The inversion, stated as a test because it is the clearest description of
+// what the two modes are.
+func TestModeInvertsTheWorkerNameCheck(t *testing.T) {
+	scfg := synapse()
+	scfg.SenderInstances = []string{"testing-gofederation-worker-1"}
+
+	primary := worker(t, "")
+	primary.Mode = ModePrimary
+	primary.WorkerName = "testing-gofederation-worker-1"
+	primary.Shadow.Enabled = new(bool) // false
+	primary.Shadow.SendToAll = true
+	primary.Database.WriteDSN = "host=/var/sockets user=rw"
+
+	r, err := Resolve(primary, scfg)
+	if err != nil {
+		t.Fatalf("a primary named as the configured sender was refused: %v", err)
+	}
+	// In primary mode the shard we take is our own, not somebody else's.
+	if r.ShardInstance != "testing-gofederation-worker-1" {
+		t.Errorf("ShardInstance = %q, want our own name", r.ShardInstance)
+	}
+	// And with one sender, every destination is ours.
+	if !r.ShouldHandle("matrix.org") || !r.ShouldHandle("example.com") {
+		t.Error("the sole configured sender does not own every destination")
+	}
+
+	// The same name in shadow mode is refused, for the opposite reason.
+	shadow := worker(t, "")
+	shadow.WorkerName = "testing-gofederation-worker-1"
+	if _, err := Resolve(shadow, scfg); err == nil {
+		t.Error("a shadow was allowed to claim the configured sender's name")
+	}
+
+	// And a primary NOT in the list is refused: it would own no destinations
+	// and the homeserver would federate with nobody.
+	orphan := worker(t, "")
+	orphan.Mode = ModePrimary
+	orphan.WorkerName = "not-a-configured-sender"
+	orphan.Shadow.Enabled = new(bool)
+	orphan.Shadow.SendToAll = true
+	orphan.Database.WriteDSN = "host=/var/sockets user=rw"
+	_, err = Resolve(orphan, scfg)
+	if err == nil {
+		t.Fatal("a primary absent from federation_sender_instances was accepted")
+	}
+	if !strings.Contains(err.Error(), "federate with nobody") {
+		t.Errorf("unhelpful error: %v", err)
+	}
+}

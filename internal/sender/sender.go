@@ -57,6 +57,12 @@ type Observer interface {
 	OnEventRouted(eventID string, all, ours []string, fallback destinations.FallbackReason)
 	// OnBatch reports one pass of the pickup loop.
 	OnBatch(events, routed int, from, to int64, took time.Duration)
+	// OnStage reports how long one stage of the pipeline took, so a change in
+	// throughput can be attributed rather than merely noticed.
+	OnStage(stage string, took time.Duration)
+	// OnEventLag reports the age of an event when routing finished, which is
+	// the number directly comparable with Synapse's event_processing_lag.
+	OnEventLag(receivedTS int64, at time.Time)
 }
 
 // Config builds a Sender.

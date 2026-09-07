@@ -55,21 +55,48 @@ func Resolve(cfg *Config, scfg *synapsecfg.Config) (*Resolved, error) {
 	// would start cleanly, consume replication, and decide that every single
 	// event is somebody else's -- running perfectly while doing nothing. That
 	// is the hardest failure to notice by watching it, so it is refused here.
-	if !contains(scfg.SenderInstances, cfg.Shadow.Instance) {
+	// The worker_name check INVERTS with the mode, and that inversion is the
+	// clearest statement of what the two modes are.
+	//
+	// A shadow must not claim a real sender's name: the replication bus
+	// suppresses a worker's own echo by instance name, so it would discard the
+	// rows of the very sender it is shadowing and process nothing while looking
+	// healthy.
+	//
+	// A primary must claim its own, because that name is what Synapse shards
+	// on.
+	inList := contains(scfg.SenderInstances, cfg.WorkerName)
+	if cfg.Mode != ModePrimary && inList {
+		return nil, fmt.Errorf(
+			"config: worker_name %q is one of %s's federation_sender_instances; "+
+				"a shadow must have an identity of its own",
+			cfg.WorkerName, scfg.Path)
+	}
+
+	// In primary mode the shard we take is our own; in shadow mode it is the
+	// sender being impersonated.
+	if cfg.Mode == ModePrimary {
+		r.ShardInstance = cfg.WorkerName
+	}
+
+	// The name we shard on has to be one Synapse actually shards to. The
+	// consequence of it not being is the same in both modes -- we own no
+	// destinations -- but what that means differs enough to be worth saying
+	// separately: a shadow quietly compares nothing, a primary leaves the
+	// homeserver federating with nobody.
+	if !contains(scfg.SenderInstances, r.ShardInstance) {
+		known := strings.Join(quoted(scfg.SenderInstances), ", ")
+		if cfg.Mode == ModePrimary {
+			return nil, fmt.Errorf(
+				"config: mode is primary but worker_name %q is not in %s's "+
+					"federation_sender_instances (%s); it would own no destinations and the "+
+					"homeserver would federate with nobody",
+				r.ShardInstance, scfg.Path, known)
+		}
 		return nil, fmt.Errorf(
 			"config: shadow.instance %q is not in %s's federation_sender_instances (%s); "+
 				"it would own no destinations and the worker would silently do nothing",
-			cfg.Shadow.Instance, scfg.Path, strings.Join(quoted(scfg.SenderInstances), ", "))
-	}
-
-	// Claiming a real sender's name would make the bus suppress that sender's
-	// rows as our own echo, and would put us in a config Synapse believes
-	// describes one of its own workers.
-	if contains(scfg.SenderInstances, cfg.WorkerName) {
-		return nil, fmt.Errorf(
-			"config: worker_name %q is one of %s's federation_sender_instances; "+
-				"this worker must have an identity of its own",
-			cfg.WorkerName, scfg.Path)
+			r.ShardInstance, scfg.Path, known)
 	}
 
 	// Redis: ours wins if set, otherwise Synapse's. Synapse's is the normal

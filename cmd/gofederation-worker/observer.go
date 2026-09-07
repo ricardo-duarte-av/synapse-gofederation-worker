@@ -64,3 +64,35 @@ func (w *worker) countTransaction(pdus, edus, bytes int) {
 		w.diff.RecordTransaction(pdus, edus)
 	}
 }
+
+// OnStage records how long one stage of the pipeline took.
+//
+// Separate from the end-to-end duration because the question this worker exists
+// to answer is not only "is it faster?" but "where did the time go?" -- a
+// goroutine fan-out that merely moves a bottleneck from one stage to another is
+// not an improvement, and one aggregate number cannot tell the two apart.
+func (o *observer) OnStage(stage string, took time.Duration) {
+	metrics.StageDuration.WithLabelValues(stage).Observe(took.Seconds())
+	if stage == "fanout" {
+		metrics.FanOutDuration.Observe(took.Seconds())
+	}
+}
+
+// OnEventLag records how old an event was when routing finished.
+//
+// The headline number, and the one that is directly comparable with Synapse's
+// synapse_event_processing_lag. A zero received_ts means Synapse never recorded
+// one, which is "cannot measure" rather than "arrived at the epoch" -- recording
+// it would put a decades-long lag in the histogram and wreck every quantile.
+func (o *observer) OnEventLag(receivedTS int64, at time.Time) {
+	if receivedTS <= 0 {
+		return
+	}
+	lag := at.Sub(time.UnixMilli(receivedTS))
+	if lag < 0 {
+		// Clock skew between the database and this process. Discarded rather
+		// than clamped to zero, which would quietly bias the low quantiles.
+		return
+	}
+	metrics.EventProcessingLag.Observe(lag.Seconds())
+}

@@ -164,6 +164,8 @@ func All() []prometheus.Collector {
 		ApproximateRoutes, BatchDuration,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,
 		Transactions, TransactionPDUs, TransactionEDUs, TransactionBytes,
+		EventProcessingLag, StageDuration, FanOutDuration, SendDuration,
+		InFlightSends, DestinationGoroutines, WriteOps,
 	}
 }
 
@@ -171,3 +173,91 @@ func All() []prometheus.Collector {
 func MustRegister() {
 	prometheus.MustRegister(All()...)
 }
+
+// Performance metrics.
+//
+// The reason this worker exists is that Synapse fans one event out to a
+// thousand destinations on a single reactor. Claiming an improvement needs
+// numbers that are comparable with Synapse's own, so these deliberately mirror
+// the shape of the metrics Synapse exposes rather than inventing a private
+// vocabulary:
+//
+//	gofed_event_processing_lag_seconds  <-> synapse_event_processing_lag
+//	gofed_events_processed_total        <-> synapse_federation_client_sent_pdu_destinations
+//
+// Read them alongside the Python senders' on the same dashboard; a number with
+// no counterpart cannot answer "is this faster?".
+var (
+	// EventProcessingLag is the age of an event when we finish routing it:
+	// now minus its received_ts.
+	//
+	// The headline number. It is what a user would feel as "my message took a
+	// while to reach the other server", and it is directly comparable with
+	// Synapse's synapse_event_processing_lag for the same stream.
+	//
+	// Only meaningful while FOLLOWING the stream. During a replay -- a restart
+	// with a backlog, or a cursor rewound by hand -- every event is hours old
+	// by construction and the histogram says nothing about how fast the worker
+	// is. Synapse's own metric has the same property. Read it alongside
+	// gofed_stage_duration_seconds, which is unaffected.
+	EventProcessingLag = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "gofed_event_processing_lag_seconds",
+		Help: "Age of an event when routing finished: now minus received_ts.",
+		// Bucketed for a healthy server in the tens of milliseconds and a
+		// struggling one in the tens of seconds, since both ends matter.
+		Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60},
+	})
+
+	// StageDuration times each stage of the pipeline separately.
+	//
+	// One number for "how long did it take" cannot say WHERE the time went,
+	// and the whole question here is whether the goroutine fan-out actually
+	// moves the bottleneck. Labelled by stage: pickup, resolve, shard, queue,
+	// build, send.
+	StageDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gofed_stage_duration_seconds",
+		Help:    "Time spent in each stage of the pipeline.",
+		Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 5},
+	}, []string{"stage"})
+
+	// FanOutDuration is how long one event takes to reach every one of its
+	// destinations' queues.
+	//
+	// The number the design is a bet on: Synapse does this on one reactor and
+	// we do it across goroutines, so this is where an improvement should show
+	// up if there is one.
+	FanOutDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gofed_fanout_duration_seconds",
+		Help:    "Time to fan one event out to every destination queue in this shard.",
+		Buckets: []float64{.0001, .0005, .001, .005, .01, .05, .1, .5, 1, 5},
+	})
+
+	// SendDuration is one HTTP transaction, labelled by outcome so a fast
+	// failure is not mistaken for a fast success.
+	SendDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gofed_send_duration_seconds",
+		Help:    "Duration of one outbound transaction, by outcome.",
+		Buckets: []float64{.01, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60},
+	}, []string{"outcome"})
+
+	// InFlightSends is how many transactions are on the wire right now,
+	// against the concurrency bound.
+	InFlightSends = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gofed_in_flight_sends",
+		Help: "Transactions currently being sent.",
+	})
+
+	// Goroutines is our own count rather than the Go runtime's total, so the
+	// fan-out can be seen without the runtime's own noise.
+	DestinationGoroutines = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gofed_destination_goroutines",
+		Help: "Destination transmission loops currently running.",
+	})
+
+	// WriteOps counts the bookkeeping a primary sender performs, by operation.
+	// Zero in shadow mode, and that is worth being able to see.
+	WriteOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gofed_write_operations_total",
+		Help: "Writes to Synapse's tables, by operation. Always zero in shadow mode.",
+	}, []string{"operation", "outcome"})
+)

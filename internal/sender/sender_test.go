@@ -161,6 +161,9 @@ func (o *recordingObserver) OnEventRouted(id string, all, ours []string, _ desti
 	o.mu.Unlock()
 }
 
+func (o *recordingObserver) OnStage(string, time.Duration) {}
+func (o *recordingObserver) OnEventLag(int64, time.Time)   {}
+
 func (o *recordingObserver) OnBatch(int, int, int64, int64, time.Duration) {
 	o.mu.Lock()
 	o.batches++
