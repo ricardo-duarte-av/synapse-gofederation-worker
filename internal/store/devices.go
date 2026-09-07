@@ -146,3 +146,78 @@ func (s *Store) maxStreamID(ctx context.Context, q string) (int64, error) {
 	}
 	return v, nil
 }
+
+// DeviceDetail is what a device list update needs about one device.
+type DeviceDetail struct {
+	UserID   string
+	DeviceID string
+	// Exists is false when the device row is gone, which Synapse reports as
+	// "deleted": true rather than by omitting the update
+	// (devices.py:877). A receiver that never learns a device was deleted
+	// keeps encrypting to it.
+	Exists bool
+	// DisplayName is only sent when allow_device_name_lookup_over_federation
+	// is on; the caller applies that, since it is a config question.
+	DisplayName string
+	// KeysJSON is the device's e2e keys, verbatim from e2e_device_keys_json.
+	// Nil when the device has never uploaded any.
+	KeysJSON []byte
+}
+
+// GetDeviceDetails loads the device rows and e2e keys behind a set of pokes.
+//
+// Deleted devices are included with Exists false, which is why this is a LEFT
+// JOIN from the requested pairs rather than a lookup in devices: the whole
+// point of a device list update is often that the device is gone.
+func (s *Store) GetDeviceDetails(ctx context.Context, userIDs, deviceIDs []string) (map[string]DeviceDetail, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	const q = `
+		SELECT p.user_id, p.device_id,
+		       d.user_id IS NOT NULL AS exists_now,
+		       COALESCE(d.display_name, ''),
+		       k.key_json
+		FROM unnest($1::text[], $2::text[]) AS p(user_id, device_id)
+		LEFT JOIN devices d USING (user_id, device_id)
+		LEFT JOIN e2e_device_keys_json k USING (user_id, device_id)`
+
+	rows, err := s.pool.Query(ctx, q, userIDs, deviceIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: device details: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]DeviceDetail, len(userIDs))
+	for rows.Next() {
+		var d DeviceDetail
+		if err := rows.Scan(&d.UserID, &d.DeviceID, &d.Exists, &d.DisplayName, &d.KeysJSON); err != nil {
+			return nil, fmt.Errorf("store: device details: %w", err)
+		}
+		out[d.UserID+"\x00"+d.DeviceID] = d
+	}
+	return out, rows.Err()
+}
+
+// DeviceDetailKey is how GetDeviceDetails keys its result.
+func DeviceDetailKey(userID, deviceID string) string { return userID + "\x00" + deviceID }
+
+// GetLastDeviceUpdateForRemoteUser is Synapse's
+// _get_last_device_update_for_remote_user (devices.py:892): the stream id of the
+// newest update already delivered to this destination for this user, at or
+// below fromStreamID.
+//
+// It is the `prev_id` of the first update in a batch, and it is what lets the
+// receiving server notice a gap and resync rather than silently missing a
+// device. Zero means there is no predecessor, which Synapse sends as an empty
+// prev_id list.
+func (s *Store) GetLastDeviceUpdateForRemoteUser(ctx context.Context, destination, userID string, fromStreamID int64) (int64, error) {
+	const q = `
+		SELECT COALESCE(MAX(stream_id), 0) FROM device_lists_outbound_last_success
+		WHERE destination = $1 AND user_id = $2 AND stream_id <= $3`
+	var id int64
+	if err := s.pool.QueryRow(ctx, q, destination, userID, fromStreamID).Scan(&id); err != nil {
+		return 0, fmt.Errorf("store: last device update: %w", err)
+	}
+	return id, nil
+}

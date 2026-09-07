@@ -121,6 +121,12 @@ type Config struct {
 	MaxLongRetries    int
 	MaxLongRetryDelay time.Duration
 
+	// AllowDeviceNameLookup is allow_device_name_lookup_over_federation. It
+	// decides whether a device list update may carry device_display_name, so
+	// reading it rather than assuming is the difference between matching
+	// Synapse's EDU and leaking a display name it would have withheld.
+	AllowDeviceNameLookup bool
+
 	// DomainWhitelist is federation_domain_whitelist. Nil means no whitelist
 	// (send to everyone); an empty non-nil map means send to nobody, which is
 	// a configuration Synapse allows and we must not confuse with the former.
@@ -174,6 +180,7 @@ type raw struct {
 	} `yaml:"federation"`
 
 	FederationDomainWhitelist []string `yaml:"federation_domain_whitelist"`
+	AllowDeviceNameLookup     *bool    `yaml:"allow_device_name_lookup_over_federation"`
 }
 
 // Options adjusts how homeserver.yaml is resolved.
@@ -269,6 +276,10 @@ func LoadWithOptions(path string, opts Options) (*Config, error) {
 	if r.Federation.MaxLongRetries != nil {
 		cfg.MaxLongRetries = *r.Federation.MaxLongRetries
 	}
+
+	// Defaults to false in Synapse (config/federation.py), so an absent key
+	// means device names are NOT sent.
+	cfg.AllowDeviceNameLookup = r.AllowDeviceNameLookup != nil && *r.AllowDeviceNameLookup
 
 	// Nil and empty mean opposite things here, so the map is only allocated
 	// when the key was actually present.

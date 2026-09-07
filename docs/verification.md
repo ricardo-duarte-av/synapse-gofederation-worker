@@ -149,9 +149,17 @@ indistinguishable from a verified one:
   Until then the honest statement is that device EDU *routing and timing* are
   verified (question 1 covers them) and device EDU *content* is not.
 
-- **`m.device_list_update` body.** Separately from the above, ours is
-  deliberately incomplete: no `prev_id`, `deleted`, `keys` or
-  `device_display_name`.
+- ~~**`m.device_list_update` body.**~~ Now complete: `prev_id` (chained within
+  a batch and seeded from `device_lists_outbound_last_success`), `deleted`,
+  `keys`, and `device_display_name` gated on Synapse's own
+  `allow_device_name_lookup_over_federation`.
+
+  Found by comparing a live update against Synapse's. Ours carried
+  `{user_id, device_id, stream_id}` where Synapse sent
+  `{device_display_name, device_id, prev_id, stream_id, user_id}`. `prev_id` is
+  the one that mattered: it chains the updates so a receiver can notice a gap
+  and resync, and without it a missed update is never repaired -- the receiver
+  keeps encrypting to a device that may be gone.
 - **Catch-up.** Not implemented, so not compared.
 - **Forked-DAG destination resolution.** 4.4% of routing decisions still fall
   back to current room state. Those pairs can still be compared by question 1 —

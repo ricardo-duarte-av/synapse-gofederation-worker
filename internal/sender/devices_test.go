@@ -27,6 +27,9 @@ type fakeDeviceStore struct {
 	// reads counts outbox reads per destination, which is how the
 	// "never re-read the same rows" property is checked.
 	reads map[string]int
+	// details and lastSuccess back the m.device_list_update body.
+	details     map[string]store.DeviceDetail
+	lastSuccess map[string]int64
 }
 
 func newDeviceStore() *fakeDeviceStore {
@@ -36,6 +39,8 @@ func newDeviceStore() *fakeDeviceStore {
 		destsForStream: map[int64][]string{},
 		timings:        map[string]store.RetryTimings{},
 		reads:          map[string]int{},
+		details:        map[string]store.DeviceDetail{},
+		lastSuccess:    map[string]int64{},
 	}
 }
 
@@ -102,6 +107,25 @@ func (f *fakeDeviceStore) MaxDeviceListOutboundStreamID(context.Context) (int64,
 		}
 	}
 	return max, nil
+}
+
+func (f *fakeDeviceStore) GetDeviceDetails(_ context.Context, users, devices []string) (map[string]store.DeviceDetail, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]store.DeviceDetail{}
+	for i := range users {
+		k := store.DeviceDetailKey(users[i], devices[i])
+		if d, ok := f.details[k]; ok {
+			out[k] = d
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeDeviceStore) GetLastDeviceUpdateForRemoteUser(_ context.Context, dest, user string, from int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastSuccess[dest+"|"+user], nil
 }
 
 func (f *fakeDeviceStore) GetDestinationRetryTimings(_ context.Context, dests []string) (map[string]store.RetryTimings, error) {
@@ -253,17 +277,35 @@ func TestDeviceListsResolvesDestinationsFromTheTable(t *testing.T) {
 // purpose: the shadow's question is WHICH destinations get an update and WHEN,
 // and nothing here is ever put on a wire. This test pins what IS produced so
 // filling in the rest is a visible change rather than a silent one.
-func TestDeviceListEDUShape(t *testing.T) {
+// The body Synapse actually sends, taken from a real capture.
+//
+// Comparing a live device list update against Synapse's own showed ours
+// carrying only user_id, device_id and stream_id where Synapse sent:
+//
+//	{"device_display_name":"gofed-test-harness","device_id":"KRGIBNAWGL",
+//	 "prev_id":[],"stream_id":40958034,"user_id":"@test:aguiarvieira.pt"}
+//
+// The missing fields are not cosmetic. prev_id chains the updates so a
+// receiver can notice a gap and resync; without it a missed update is never
+// repaired and the receiver keeps encrypting to a device that may be gone.
+func TestDeviceListEDUMatchesSynapsesBody(t *testing.T) {
 	st := newDeviceStore()
-	st.destsForStream[7] = []string{"b.example"}
+	st.destsForStream[40958034] = []string{"b.example"}
 	st.pokes["b.example"] = []store.DevicePoke{
-		{UserID: "@alice:a.example", DeviceID: "DEV1", StreamID: 7},
+		{UserID: "@test:a.example", DeviceID: "KRGIBNAWGL", StreamID: 40958034},
 	}
+	st.details[store.DeviceDetailKey("@test:a.example", "KRGIBNAWGL")] = store.DeviceDetail{
+		UserID: "@test:a.example", DeviceID: "KRGIBNAWGL", Exists: true,
+		DisplayName: "gofed-test-harness",
+		KeysJSON:    []byte(`{"algorithms":["m.olm.v1.curve25519-aes-sha2"]}`),
+	}
+
 	d, m, _ := newDevices(t, st, nil)
+	d.allowDeviceNameLookup = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := d.HandleDeviceLists(ctx, 7); err != nil {
+	if err := d.HandleDeviceLists(ctx, 40958034); err != nil {
 		t.Fatal(err)
 	}
 
@@ -271,21 +313,125 @@ func TestDeviceListEDUShape(t *testing.T) {
 	if len(edus) != 1 {
 		t.Fatalf("%d EDUs queued, want 1", len(edus))
 	}
-	if edus[0].Type != txn.EDUTypeDeviceListUpdate {
-		t.Errorf("edu_type = %q, want %q", edus[0].Type, txn.EDUTypeDeviceListUpdate)
-	}
-
-	var content map[string]any
-	if err := json.Unmarshal(edus[0].Content, &content); err != nil {
+	var got map[string]any
+	if err := json.Unmarshal(edus[0].Content, &got); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]any{
-		"user_id": "@alice:a.example", "device_id": "DEV1", "stream_id": float64(7),
+
+	if got["user_id"] != "@test:a.example" || got["device_id"] != "KRGIBNAWGL" {
+		t.Errorf("identity wrong: %v", got)
 	}
-	for key, v := range want {
-		if content[key] != v {
-			t.Errorf("content[%q] = %v, want %v", key, content[key], v)
+	if got["stream_id"] != float64(40958034) {
+		t.Errorf("stream_id = %v", got["stream_id"])
+	}
+	// No predecessor delivered yet, so an empty list -- present, not absent.
+	prev, ok := got["prev_id"].([]any)
+	if !ok || len(prev) != 0 {
+		t.Errorf("prev_id = %v, want an empty list", got["prev_id"])
+	}
+	if got["device_display_name"] != "gofed-test-harness" {
+		t.Errorf("device_display_name = %v", got["device_display_name"])
+	}
+	if _, ok := got["keys"]; !ok {
+		t.Error("keys missing; the receiver cannot encrypt to a device without them")
+	}
+	if _, ok := got["deleted"]; ok {
+		t.Error("deleted set for a device that exists")
+	}
+}
+
+// prev_id chains WITHIN a batch, so the second update points at the first.
+// A flat prev_id would let a receiver accept them out of order.
+func TestDeviceListPrevIDChainsWithinTheBatch(t *testing.T) {
+	st := newDeviceStore()
+	st.destsForStream[20] = []string{"b.example"}
+	st.pokes["b.example"] = []store.DevicePoke{
+		{UserID: "@u:a.example", DeviceID: "D1", StreamID: 10},
+		{UserID: "@u:a.example", DeviceID: "D2", StreamID: 20},
+	}
+	for _, id := range []string{"D1", "D2"} {
+		st.details[store.DeviceDetailKey("@u:a.example", id)] = store.DeviceDetail{
+			UserID: "@u:a.example", DeviceID: id, Exists: true}
+	}
+	// One already delivered, so the first update chains from it.
+	st.lastSuccess["b.example|@u:a.example"] = 5
+
+	d, m, _ := newDevices(t, st, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.HandleDeviceLists(ctx, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	edus := m.Get("b.example").PeekEDUs()
+	if len(edus) != 2 {
+		t.Fatalf("%d EDUs, want 2", len(edus))
+	}
+	want := []float64{5, 10}
+	for i, e := range edus {
+		var body map[string]any
+		if err := json.Unmarshal(e.Content, &body); err != nil {
+			t.Fatal(err)
 		}
+		prev := body["prev_id"].([]any)
+		if len(prev) != 1 || prev[0] != want[i] {
+			t.Errorf("update %d prev_id = %v, want [%v]", i, body["prev_id"], want[i])
+		}
+	}
+}
+
+// A device that no longer exists is reported as deleted rather than as one
+// with no keys. Without it the receiver keeps encrypting to a device that is
+// gone.
+func TestDeletedDeviceIsMarkedDeleted(t *testing.T) {
+	st := newDeviceStore()
+	st.destsForStream[7] = []string{"b.example"}
+	st.pokes["b.example"] = []store.DevicePoke{
+		{UserID: "@u:a.example", DeviceID: "GONE", StreamID: 7},
+	}
+	// Deliberately no details entry: the device row is gone.
+
+	d, m, _ := newDevices(t, st, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.HandleDeviceLists(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(m.Get("b.example").PeekEDUs()[0].Content, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["deleted"] != true {
+		t.Errorf("deleted = %v, want true", body["deleted"])
+	}
+	if _, ok := body["keys"]; ok {
+		t.Error("keys sent for a deleted device")
+	}
+}
+
+// The display name is only sent when Synapse's own config allows it. Sending
+// it otherwise leaks a name the homeserver had chosen to withhold.
+func TestDisplayNameRespectsSynapsesConfig(t *testing.T) {
+	st := newDeviceStore()
+	st.destsForStream[7] = []string{"b.example"}
+	st.pokes["b.example"] = []store.DevicePoke{
+		{UserID: "@u:a.example", DeviceID: "D1", StreamID: 7},
+	}
+	st.details[store.DeviceDetailKey("@u:a.example", "D1")] = store.DeviceDetail{
+		UserID: "@u:a.example", DeviceID: "D1", Exists: true, DisplayName: "secret laptop"}
+
+	d, m, _ := newDevices(t, st, nil) // lookup disabled by default
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.HandleDeviceLists(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(m.Get("b.example").PeekEDUs()[0].Content, &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["device_display_name"]; ok {
+		t.Error("a display name was sent although the homeserver disallows the lookup")
 	}
 }
 

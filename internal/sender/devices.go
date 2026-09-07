@@ -3,7 +3,6 @@ package sender
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,6 +18,8 @@ type DeviceStore interface {
 	GetNewDeviceMsgsForRemote(ctx context.Context, destination string, last, current int64, limit int) ([]store.ToDeviceMessage, int64, error)
 	GetDeviceUpdatesByRemote(ctx context.Context, destination string, from, now int64, limit int) ([]store.DevicePoke, error)
 	GetDestinationsForDevice(ctx context.Context, streamID int64) ([]string, error)
+	GetDeviceDetails(ctx context.Context, userIDs, deviceIDs []string) (map[string]store.DeviceDetail, error)
+	GetLastDeviceUpdateForRemoteUser(ctx context.Context, destination, userID string, fromStreamID int64) (int64, error)
 	MaxDeviceOutboxStreamID(ctx context.Context) (int64, error)
 	MaxDeviceListOutboundStreamID(ctx context.Context) (int64, error)
 	GetDestinationRetryTimings(ctx context.Context, destinations []string) (map[string]store.RetryTimings, error)
@@ -44,6 +45,9 @@ type Devices struct {
 	log     zerolog.Logger
 
 	shouldHandle func(destination string) bool
+	// allowDeviceNameLookup mirrors Synapse's
+	// allow_device_name_lookup_over_federation.
+	allowDeviceNameLookup bool
 	// edusPerTransaction is the per-destination read limit. Synapse budgets
 	// MAX_EDUS_PER_TRANSACTION minus ten reserved for to-device messages
 	// (per_destination_queue.py:794); the same budget is applied here so a
@@ -59,6 +63,8 @@ type DevicesConfig struct {
 	Log          zerolog.Logger
 	ShouldHandle func(destination string) bool
 	EDUsPerRead  int
+	// AllowDeviceNameLookup comes from Synapse's config, not ours.
+	AllowDeviceNameLookup bool
 }
 
 // NewDevices builds the device EDU path.
@@ -72,6 +78,7 @@ func NewDevices(cfg DevicesConfig) *Devices {
 	return &Devices{
 		store: cfg.Store, cursors: cfg.Cursors, queues: cfg.Queues, log: cfg.Log,
 		shouldHandle: cfg.ShouldHandle, edusPerRead: n,
+		allowDeviceNameLookup: cfg.AllowDeviceNameLookup,
 	}
 }
 
@@ -191,28 +198,14 @@ func (d *Devices) deviceListsFor(ctx context.Context, server string, current int
 		return d.cursors.Set(ctx, name, current)
 	}
 
+	edus, highest, err := d.buildDeviceListEDUs(ctx, server, last, pokes)
+	if err != nil {
+		return err
+	}
+
 	q := d.queues.Get(server)
-	highest := last
-	for _, p := range pokes {
-		content, err := json.Marshal(map[string]any{
-			"user_id":   p.UserID,
-			"device_id": p.DeviceID,
-			"stream_id": p.StreamID,
-		})
-		if err != nil {
-			return fmt.Errorf("sender: encoding device list update: %w", err)
-		}
-		// A faithful m.device_list_update also carries prev_id, deleted, keys
-		// and device_display_name, assembled from the device tables and
-		// device_lists_outbound_last_success. Phase 1 queues the shape without
-		// them: the shadow's question is WHICH destinations get an update and
-		// WHEN, and that is answered by this. Filling in the body is what turns
-		// this from a shadow into a sender, and is deliberately not done while
-		// the answer is never put on a wire.
-		q.EnqueueEDU(txn.EDU{Type: txn.EDUTypeDeviceListUpdate, Content: content})
-		if p.StreamID > highest {
-			highest = p.StreamID
-		}
+	for _, e := range edus {
+		q.EnqueueEDU(e)
 	}
 	d.queues.Wake(q)
 
