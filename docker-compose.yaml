@@ -42,6 +42,9 @@ services:
       # These MUST outlive the container. The difflog is the promotion record,
       # measured in weeks; the captures are half of the byte-level comparison
       # and are read long after they are written.
+      #
+      # Owned by uid 991 here, matching the user: line above:
+      #     mkdir -p difflog captures && chown 991:991 difflog captures
       - ./difflog:/data/difflog
       - ./captures:/data/captures
 
@@ -78,6 +81,15 @@ services:
     volumes:
       # Written by the recorder, read by fedcompare. Same directory the worker
       # writes its own half into, so the two files sit side by side.
+      #
+      # The image is distroless nonroot, so this runs as uid 65532 and the
+      # directory must be writable by it. Create it before the first start:
+      #
+      #     mkdir -p captures && chown 65532:65532 captures
+      #
+      # Otherwise the recorder exits at startup with a permission error --
+      # deliberately, since a recorder that is not recording is useless and
+      # silently so, and a deploy is when you want to find that out.
       - ./captures:/data/captures
 
     networks: [npm-nw, npm-nw6]

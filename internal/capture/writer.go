@@ -89,7 +89,16 @@ func (w *Writer) Captures(destination string) bool {
 func (w *Writer) reopen() error {
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return fmt.Errorf("capture: opening %s: %w", w.path, err)
+		// Name the uid and the directory. This runs in a distroless image as
+		// uid 65532 against a bind mount the host usually owns as root, so
+		// "permission denied" on its own sends the reader looking at the
+		// wrong thing; what they need is the chown command.
+		return fmt.Errorf(
+			"capture: opening %s as uid %d/gid %d: %w "+
+				"(if this is a bind mount, the directory must be writable by that uid: "+
+				"chown %d:%d %s)",
+			w.path, os.Getuid(), os.Getgid(), err,
+			os.Getuid(), os.Getgid(), filepath.Dir(w.path))
 	}
 	info, err := f.Stat()
 	if err != nil {

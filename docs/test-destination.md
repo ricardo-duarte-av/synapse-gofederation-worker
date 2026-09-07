@@ -93,6 +93,26 @@ covers the request URI, so a proxy that strips or rewrites a prefix turns every
 transaction into a signature failure -- a 401 that looks like a signing bug and
 is not.
 
+This nginx location does the right thing, and is what the deployment uses:
+
+```nginx
+location ~ ^/_matrix/federation/v1/send/ {
+    include /data/nginx/custom/matrix-config.conf;
+    proxy_pass http://fedrecorder:8449;
+}
+```
+
+Two details carry the whole thing. It is a **regex** location, so it takes
+precedence over any `location /_matrix` prefix block that would otherwise catch
+these requests. And `proxy_pass` has **no URI part** -- just scheme, host and
+port -- which is what makes nginx forward the original request URI untouched.
+Adding even a trailing slash would make nginx substitute the path and break
+every signature.
+
+Verified through the live path: a signed transaction sent to
+`https://testing.aguiarvieira.pt` was accepted with 200 and recorded with its
+path intact.
+
 `X-Forwarded-Host` should reach the recorder, since that is how it learns which
 name the sender addressed; nginx-proxy-manager sets it by default, and without
 it the recorder falls back to the `Host` header.
@@ -111,6 +131,20 @@ fedrecorder \
   -out /data/captures/synapse.jsonl \
   -origin aguiarvieira.pt
 ```
+
+The image is distroless nonroot, so the capture directory must be writable by
+uid 65532:
+
+```sh
+mkdir -p captures && chown 65532:65532 captures
+```
+
+Without that the recorder exits at startup rather than proxying without
+recording. The asymmetry is deliberate: a capture failure at RUNTIME never
+fails a request, because a test homeserver broken by its own instrumentation is
+worse than no instrumentation -- but a capture file it could never open at all
+is a deploy-time mistake, and finding that out immediately beats discovering
+weeks later that the comparison has been empty the whole time.
 
 `-origin` filters on the origin in the **body**, which is what was signed,
 rather than the one in the `Authorization` header, which is not.

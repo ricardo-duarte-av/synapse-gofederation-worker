@@ -144,7 +144,25 @@ file. Two fields decide whether it works at all:
   looking perfectly healthy.
 - **`shadow.instance`** is the sender whose *shard* it takes. Different thing.
 
-### 3. Bring it up
+### 3. Writable volumes
+
+Both containers run as non-root, so the bind mounts have to be owned by the
+uid each runs as — otherwise the process exits at startup with a permission
+error. That is deliberate: a recorder that is not recording is useless and
+silently so, and a deploy is when you want to find that out.
+
+```sh
+# the worker runs as Synapse's uid
+mkdir -p difflog captures && chown 991:991 difflog captures
+# the recorder is a distroless nonroot image
+chown 65532:65532 captures
+```
+
+If the two run in the same compose project and share `./captures`, give the
+directory group write and put both uids in a common group rather than
+loosening it to 0777.
+
+### 4. Bring it up
 
 ```sh
 docker compose up -d gofederation-worker
@@ -165,7 +183,7 @@ which is the right thing to run after an edit:
 docker compose run --rm gofederation-worker -check
 ```
 
-### 4. The recording proxy
+### 5. The recording proxy
 
 `fedrecorder` goes in front of the test homeserver. **Route only the send
 endpoint to it:**
@@ -188,7 +206,7 @@ request URI, so a stripped or rewritten prefix turns every transaction into a
 docker compose up -d fedrecorder
 ```
 
-### 5. Compare
+### 6. Compare
 
 Both halves land in `./captures`, side by side. `fedcompare` is a local CLI
 rather than an image — it reads two files and prints a report, so there is
