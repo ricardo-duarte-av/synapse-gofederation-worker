@@ -160,6 +160,7 @@ type worker struct {
 	queues  *queue.Manager
 	sender  *sender.Sender
 	devices *sender.Devices
+	catchup *sender.CatchUp
 	sub     *replication.Subscriber
 	metrics *http.Server
 }
@@ -370,6 +371,18 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		Queues:                w.queues,
 		ShouldHandle:          cfg.ShouldHandle,
 		AllowDeviceNameLookup: cfg.Synapse.AllowDeviceNameLookup,
+	})
+
+	w.catchup = sender.NewCatchUp(sender.CatchUpConfig{
+		Store:        w.db,
+		Queues:       w.queues,
+		Log:          log,
+		ShouldHandle: cfg.ShouldHandle,
+		Due: func(destination string) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return w.limiter.Due(ctx, destination)
+		},
 	})
 
 	w.sub = replication.New(replication.Config{

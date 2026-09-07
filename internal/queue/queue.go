@@ -88,10 +88,31 @@ type Destination struct {
 	// send would swallow exactly those (per_destination_queue.py:368).
 	newData bool
 
+	// catchingUp starts TRUE for every destination, as it does in Synapse
+	// (per_destination_queue.py:137).
+	//
+	// The reason is not obvious and it is the whole design: a sender that has
+	// been down does not know what it missed, and the live stream will only
+	// ever tell it about NEW events. What it missed is recorded in
+	// destination_rooms, and the only way to find it is to look. So every
+	// destination begins by assuming it is behind and proving otherwise.
+	catchingUp bool
+	// catchupLastSkipped is the newest stream ordering dropped while catching
+	// up. It exists to close a race: an event can arrive after catch-up has
+	// read its last page and before it decides it is finished, and without
+	// this that event would be dropped by catch-up and never seen again by the
+	// live path either.
+	catchupLastSkipped int64
+
 	// lastSuccessfulStreamOrdering is our copy of the destinations table's
-	// column. We never write that table, so this is the in-memory truth and
-	// internal/state is where it is persisted.
+	// column, and lastSuccessfulKnown says whether it has been read yet.
+	//
+	// The distinction is load-bearing. A destination with NO recorded value has
+	// never had a successful transaction, so there is no point from which to
+	// catch up and Synapse leaves catch-up immediately rather than replaying
+	// history for it (per_destination_queue.py:485).
 	lastSuccessfulStreamOrdering int64
+	lastSuccessfulKnown          bool
 
 	// onSuccess is called after a delivered transaction, with the highest
 	// stream ordering in it, so the caller can persist the cursor.
@@ -136,7 +157,11 @@ func NewDestination(cfg Config) *Destination {
 		limits.MaxEDUs = 100
 	}
 	return &Destination{
-		name:       cfg.Name,
+		name: cfg.Name,
+		// Starts TRUE, as in Synapse. A sender that has been down cannot know
+		// what it missed from the live stream alone, so every destination
+		// begins by assuming it is behind and proves otherwise.
+		catchingUp: true,
 		limits:     limits,
 		signer:     cfg.Signer,
 		ids:        cfg.IDs,
@@ -153,8 +178,22 @@ func NewDestination(cfg Config) *Destination {
 func (d *Destination) Name() string { return d.name }
 
 // EnqueuePDU adds an event to the queue.
+//
+// While catching up the event is DROPPED rather than queued, and only its
+// stream ordering is remembered. That looks like losing it and is the opposite:
+// the durable record is destination_rooms, which was written before this, and
+// catch-up will find it there in stream order. Queueing it as well would send
+// it out of order, ahead of everything the destination missed while it was
+// down (per_destination_queue.py:206).
 func (d *Destination) EnqueuePDU(p PDU) {
 	d.mu.Lock()
+	if d.catchingUp && d.lastSuccessfulKnown {
+		if p.StreamOrdering > d.catchupLastSkipped {
+			d.catchupLastSkipped = p.StreamOrdering
+		}
+		d.mu.Unlock()
+		return
+	}
 	d.pendingPDUs = append(d.pendingPDUs, p)
 	d.newData = true
 	d.mu.Unlock()
@@ -368,7 +407,75 @@ func (d *Destination) SetLastSuccessfulStreamOrdering(v int64) {
 	if v > d.lastSuccessfulStreamOrdering {
 		d.lastSuccessfulStreamOrdering = v
 	}
+	d.lastSuccessfulKnown = true
 	d.mu.Unlock()
+}
+
+// CatchingUp reports whether this destination is still replaying a backlog.
+func (d *Destination) CatchingUp() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.catchingUp
+}
+
+// FinishCatchUp marks the destination as up to date.
+func (d *Destination) FinishCatchUp() {
+	d.mu.Lock()
+	d.catchingUp = false
+	d.mu.Unlock()
+}
+
+// RestartCatchUp puts the destination back into catch-up and discards what is
+// queued.
+//
+// Synapse does this when a destination has been unreachable for longer than an
+// hour (per_destination_queue.py:420): whatever is queued is a fragment of what
+// the destination now needs, and sending it would deliver a handful of recent
+// events ahead of everything older. destination_rooms has the whole story, so
+// the queue is dropped and catch-up reads it back in order.
+func (d *Destination) RestartCatchUp() {
+	d.mu.Lock()
+	d.catchingUp = true
+	d.pendingPDUs = nil
+	d.mu.Unlock()
+}
+
+// TakeCatchUpSkipped returns and clears the newest ordering dropped while
+// catching up.
+func (d *Destination) TakeCatchUpSkipped() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v := d.catchupLastSkipped
+	d.catchupLastSkipped = 0
+	return v
+}
+
+// SendCatchUp delivers one catch-up transaction: a single room's event, no
+// EDUs, as Synapse does (per_destination_queue.py:596).
+//
+// One room per transaction rather than batching, because the destination is
+// being brought forward room by room and a failure should cost one room's
+// progress rather than fifty.
+func (d *Destination) SendCatchUp(ctx context.Context, p PDU) error {
+	if err := d.send(ctx, []PDU{p}, nil); err != nil {
+		if d.onOutcome != nil {
+			d.onOutcome(d.name, false)
+		}
+		return err
+	}
+	if d.onOutcome != nil {
+		d.onOutcome(d.name, true)
+	}
+	d.mu.Lock()
+	if p.StreamOrdering > d.lastSuccessfulStreamOrdering {
+		d.lastSuccessfulStreamOrdering = p.StreamOrdering
+		d.lastSuccessfulKnown = true
+	}
+	d.mu.Unlock()
+	if d.onSuccess != nil {
+		d.onSuccess(d.name, p.StreamOrdering)
+	}
+	return nil
 }
 
 // Release gives up a claim taken by TryStart without running the loop.

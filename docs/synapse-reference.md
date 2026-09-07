@@ -249,6 +249,14 @@ cursor into `destination_rooms`, not a delivery receipt.
 A fresh destination with no `last_successful_stream_ordering` row exits catch-up
 immediately and never replays history.
 
+One wart, shared with Synapse: `get_catch_up_room_event_ids` joins `events`, so
+a `destination_rooms` row whose event has since been purged yields nothing.
+Catch-up then finds no work, exits, and never advances the cursor -- leaving
+that destination in the outstanding list to be swept again every minute. Seen
+in practice on this deployment. It is wasted work rather than a correctness
+problem, and behaving differently from Synapse here would be worse than
+matching it.
+
 ## 10. Backoff, and why it is not optional
 
 A homeserver's destination list is mostly a graveyard. On aguiarvieira.pt,

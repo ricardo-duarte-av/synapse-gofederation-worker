@@ -75,6 +75,10 @@ func (w *worker) run(ctx context.Context) error {
 		return gctx.Err()
 	})
 	g.Go(func() error { return w.sender.Run(gctx) })
+	// Catch-up runs regardless of mode. A shadow needs it too: without it the
+	// shadow's decisions diverge from the real sender's the moment either has
+	// been down, and the comparison stops meaning anything.
+	g.Go(func() error { return w.catchup.Run(gctx) })
 	g.Go(func() error { return w.sampleGauges(gctx) })
 
 	if w.cfg.Metrics.Addr != "" {

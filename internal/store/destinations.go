@@ -136,3 +136,55 @@ func (s *Store) GetCatchUpRoomEventIDs(ctx context.Context, destination string, 
 	}
 	return out, rows.Err()
 }
+
+// GetCatchUpOutstandingDestinations is Synapse's
+// get_catch_up_outstanding_destinations (transactions.py:490): destinations
+// that are owed something and are due to be tried.
+//
+// Paginated by destination name rather than offset, because the set changes
+// while it is being walked -- a destination that catches up mid-scan would
+// shift every later page and silently skip one.
+//
+// Both halves matter. A destination can be owed PDUs (destination_rooms ahead
+// of its last success) or to-device messages (rows sitting in the outbox) or
+// both, and a sender that only looked at one would leave the other stranded
+// until unrelated traffic happened to wake it.
+func (s *Store) GetCatchUpOutstandingDestinations(ctx context.Context, after string, nowMS int64, limit int) ([]string, error) {
+	const q = `
+		WITH pdu_destinations AS (
+			SELECT DISTINCT destination FROM destination_rooms
+			LEFT JOIN destinations USING (destination)
+			WHERE destination > $1
+			  AND destination_rooms.stream_ordering >
+			      COALESCE(destinations.last_successful_stream_ordering, 0)
+			  AND (destinations.retry_last_ts IS NULL
+			       OR destinations.retry_last_ts + destinations.retry_interval < $2)
+			ORDER BY destination LIMIT $3
+		), to_device_destinations AS (
+			SELECT DISTINCT destination FROM device_federation_outbox
+			LEFT JOIN destinations USING (destination)
+			WHERE destination > $1
+			  AND (destinations.retry_last_ts IS NULL
+			       OR destinations.retry_last_ts + destinations.retry_interval < $2)
+			ORDER BY destination LIMIT $3
+		)
+		SELECT destination FROM pdu_destinations
+		UNION SELECT destination FROM to_device_destinations
+		ORDER BY destination LIMIT $3`
+
+	rows, err := s.pool.Query(ctx, q, after, nowMS, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: catch-up destinations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, fmt.Errorf("store: catch-up destinations: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
