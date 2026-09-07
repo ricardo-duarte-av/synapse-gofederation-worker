@@ -120,9 +120,17 @@ database:
 
 state:
   # Our own cursors and routing record -- the only things this worker writes
-  # anywhere. A separate role with access to one schema. See
-  # deploy/state-role.sql. Omitting it reuses the database connection above,
-  # which only works if that role can write to our schema.
+  # anywhere. The two tables below do NOT create themselves; create them once
+  # before the first start or startup fails saying they do not exist:
+  #
+  #   deploy/state-role.sql    creates them AND the gofed_state role that owns
+  #                            them -- use with the dsn below.
+  #   deploy/state-tables.sql  creates them alone, for the case where this
+  #                            worker connects as Synapse's own role because
+  #                            the connection came from homeserver.yaml.
+  #
+  # Omitting dsn reuses the database connection above, which only works if that
+  # role can write to our schema.
   dsn: "host=/var/sockets user=gofed_state dbname=synapse-db"
   table: gofederation.stream_positions
   # Our copy of Synapse's destination_rooms, which the routing comparison
