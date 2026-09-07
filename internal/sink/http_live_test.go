@@ -1,7 +1,10 @@
 package sink
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -66,6 +69,16 @@ func TestLiveSendEmptyTransaction(t *testing.T) {
 		req.Path, destination, scfg.ServerName, signer.KeyID())
 	t.Logf("body: %s", req.Body)
 
+	// FEDERATION_TEST_URL sends to a fixed URL instead of resolving the server
+	// name, so the request can be pushed through a proxy under test --
+	// cmd/fedrecorder -- rather than straight at the homeserver. The signature
+	// is unaffected: it covers the path, the origin and the destination, none
+	// of which change with the route taken.
+	if direct := os.Getenv("FEDERATION_TEST_URL"); direct != "" {
+		sendDirect(t, direct, req)
+		return
+	}
+
 	h := NewHTTP(HTTPConfig{
 		Log:      zerolog.New(zerolog.NewTestWriter(t)),
 		Timeout:  scfg.ClientTimeout,
@@ -89,4 +102,35 @@ func TestLiveSendEmptyTransaction(t *testing.T) {
 
 func encodeSeedForTest(seed []byte) string {
 	return base64RawStdForTest.EncodeToString(seed)
+}
+
+// sendDirect PUTs a signed transaction to an explicit URL, bypassing Matrix
+// server discovery.
+//
+// Test-only, and deliberately not a feature of the HTTP sink: a way to send a
+// signed transaction somewhere other than the server it is addressed to is
+// exactly the kind of thing that should not exist in production code.
+func sendDirect(t *testing.T, base string, req *txn.Request) {
+	t.Helper()
+	httpReq, err := http.NewRequest(http.MethodPut, base+req.Path, bytes.NewReader(req.Body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq.Header.Set("Authorization", req.AuthHeader)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", "synapse-gofederation-worker/test")
+	// What a reverse proxy in front of the recorder would set, and what the
+	// recorder reads to learn which name the sender addressed.
+	httpReq.Header.Set("X-Forwarded-Host", req.Destination)
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(httpReq)
+	if err != nil {
+		t.Fatalf("sending to %s: %v", base, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s returned %s: %s", base, resp.Status, body)
+	}
+	t.Logf("ACCEPTED via %s: status %d, body %s", base, resp.StatusCode, body)
 }

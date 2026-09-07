@@ -65,6 +65,38 @@ sender  ──TLS──>  nginx  ──HTTP──>  fedrecorder  ──HTTP─�
                                          └──> captures/synapse.jsonl
 ```
 
+### Which paths to route through it
+
+Either works, and both were checked against the live test server.
+
+**Only the send endpoint** — the smaller blast radius, and the recommended one:
+
+    /_matrix/federation/v1/send/   ->  fedrecorder:8449
+    everything else                ->  testing-synapse:8008
+
+The recorder is then in the path only for what it records. Client traffic,
+long-polling `/sync`, and media never touch it, so its timeouts and its
+uptime are irrelevant to everything except the comparison.
+
+**Everything** — one proxy entry instead of two:
+
+    testing.aguiarvieira.pt  ->  fedrecorder:8449  ->  testing-synapse:8008
+
+fedrecorder forwards every other path untouched and records nothing from them;
+`/_matrix/key/v2/server`, `/_matrix/client/versions` and a long-polling
+`/sync` were all confirmed to pass through cleanly. The cost is that the
+recorder becomes a single point of failure for the whole test server, and its
+two-minute write timeout would cut a `/sync` that polled for longer than that.
+
+**In either case the proxy must not rewrite the path.** The X-Matrix signature
+covers the request URI, so a proxy that strips or rewrites a prefix turns every
+transaction into a signature failure -- a 401 that looks like a signing bug and
+is not.
+
+`X-Forwarded-Host` should reach the recorder, since that is how it learns which
+name the sender addressed; nginx-proxy-manager sets it by default, and without
+it the recorder falls back to the `Host` header.
+
 `fedrecorder` is transparent: it records `PUT /_matrix/federation/v1/send/…` and
 forwards everything else untouched. It forwards the exact bytes it received —
 re-encoding would invalidate the signature computed over them and the homeserver
