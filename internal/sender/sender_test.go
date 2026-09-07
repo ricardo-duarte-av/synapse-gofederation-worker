@@ -438,3 +438,5 @@ func TestAuthEventsAreLoadedLazily(t *testing.T) {
 			"should not have been loaded", h.store.getEventsCalls)
 	}
 }
+
+func nowMS() int64 { return time.Now().UnixMilli() }

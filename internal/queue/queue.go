@@ -302,3 +302,16 @@ func (d *Destination) Release() {
 	d.running = false
 	d.mu.Unlock()
 }
+
+// PeekEDUs returns a copy of the queued EDUs.
+//
+// For metrics and tests. A copy rather than the slice itself, because the
+// transmission loop takes it without removing and a caller holding the live
+// slice could observe it being re-sliced under them.
+func (d *Destination) PeekEDUs() []txn.EDU {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]txn.EDU, len(d.pendingEDUs))
+	copy(out, d.pendingEDUs)
+	return out
+}
