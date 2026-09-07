@@ -1,6 +1,10 @@
 package replication
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tidwall/gjson"
+)
 
 // Row shapes come from replication/tcp/streams/events.py:107,122,132. The field
 // order of an "ev" row is checked here explicitly because a positional array
@@ -97,5 +101,42 @@ func TestParseDeviceListRow(t *testing.T) {
 	row, ok = ParseDeviceListRow(`["@bob:a.example"]`)
 	if !ok || row.UserID != "@bob:a.example" || row.HostsCalculated {
 		t.Errorf("got %+v, %v", row, ok)
+	}
+}
+
+// The exact bytes Synapse puts on the wire for a typing notification, from
+// KeyedEduRow.to_data() -> {"key": self.key, "edu": self.edu.get_internal_dict()}
+// (federation/send_queue.py:444) with get_internal_dict returning edu_type,
+// content, origin and destination (federation/units.py:58).
+//
+// Typing is the ONLY caller of build_and_send_edu in Synapse
+// (handlers/typing.py:188), so this row shape is the entire reason the
+// federation stream is consumed at all.
+func TestParseFederationRowTyping(t *testing.T) {
+	const row = `["k", {"key": ["!room:example.com", "@alice:example.com"], ` +
+		`"edu": {"edu_type": "m.typing", "content": {"room_id": "!room:example.com", ` +
+		`"user_id": "@alice:example.com", "typing": true}, "origin": "example.com", ` +
+		`"destination": "remote.example"}}]`
+
+	r, ok := ParseFederationRow(row)
+	if !ok {
+		t.Fatal("a real typing row did not parse")
+	}
+	if r.Kind != "k" {
+		t.Errorf("Kind = %q, want k", r.Kind)
+	}
+	if r.EDUType != "m.typing" {
+		t.Errorf("EDUType = %q", r.EDUType)
+	}
+	if r.Destination != "remote.example" {
+		t.Errorf("Destination = %q", r.Destination)
+	}
+	// The key is opaque and positional; what matters is that two different
+	// (room, user) pairs produce different keys, since the queue clobbers on it.
+	if r.Key == "" {
+		t.Error("Key is empty; every typing update would clobber every other")
+	}
+	if !gjson.GetBytes(r.Content, "typing").Bool() {
+		t.Errorf("Content did not survive: %s", r.Content)
 	}
 }
