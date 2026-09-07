@@ -289,3 +289,5 @@ room should be private.
 - [docs/test-destination.md](docs/test-destination.md) — the capture rig.
 - [docs/going-live.md](docs/going-live.md) — the send allowlist, and the order
   in which to widen it.
+- [grafana/README.md](grafana/README.md) — the dashboard, a Prometheus scrape
+  config, and what each row is for.
