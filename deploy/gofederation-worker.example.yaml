@@ -102,12 +102,20 @@ database:
   # host, port, user, password, dbname -- so there is one statement of where the
   # homeserver's data lives rather than two that can drift.
   #
-  # Set dsn to connect DIFFERENTLY from Synapse, which is what a shadow should
-  # do. libpq keyword form, not a URI. This deployment's read-only role, on the
-  # direct unix socket with peer auth as uid 991, deliberately bypassing the
+  # Set dsn to connect DIFFERENTLY from Synapse, which is what the main
+  # deployment should do. libpq keyword form, not a URI. The read-only role, on
+  # the direct unix socket with peer auth as uid 991, deliberately bypassing the
   # pgcat pooler homeserver.yaml points at:
   #
   #   dsn: "host=/var/sockets user=gofed_ro dbname=synapse-db"
+  #
+  # Bypassing the pooler is worth doing on its own account. Through pgcat in
+  # transaction mode this worker holds a pooled connection for the length of
+  # every query and competes with Synapse for backends, while the socket costs
+  # nothing and gives peer auth instead of a password. Leaving dsn unset on a
+  # deployment whose homeserver.yaml points at pgcat sends every query through
+  # it, as the SAME role Synapse uses -- which also means require_read_only
+  # cannot be set.
   #
   max_conns: 16
   connect_timeout_seconds: 10

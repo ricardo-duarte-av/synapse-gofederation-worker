@@ -33,7 +33,9 @@ func OpenWriter(ctx context.Context, cfg Config) (*Writer, error) {
 	if cfg.MaxConns > 0 {
 		pcfg.MaxConns = cfg.MaxConns
 	}
-	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	// Same transaction-pooler reasoning as internal/store.Open: one round trip,
+	// so a pooler has no seam to switch the backend connection on.
+	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 	if cfg.ConnectTimeout > 0 {
 		pcfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
 	}

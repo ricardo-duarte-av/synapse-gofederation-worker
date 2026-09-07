@@ -49,11 +49,25 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pcfg.MaxConns = cfg.MaxConns
 	}
 
-	// Synapse's database may sit behind pgcat in transaction pooling mode,
-	// where server-side prepared statements cannot be reused across
-	// transactions. Describing statements on each exec keeps us compatible with
-	// both a direct connection and a transaction-mode pooler.
-	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	// Synapse's database may sit behind pgcat or PgBouncer in TRANSACTION
+	// pooling mode, where consecutive round trips can land on different backend
+	// connections.
+	//
+	// QueryExecModeExec is the mode that survives that: it sends parse, bind
+	// and execute as one round trip, so a pooler has no seam to switch on. The
+	// obvious-looking DescribeExec does NOT -- pgx's own documentation says it
+	// "may cause problems with connection poolers that switch the underlying
+	// connection between round trips" (pgx conn.go:633), because it describes
+	// the unnamed prepared statement on one round trip and executes it on the
+	// next. Through pgcat that fails with "unnamed prepared statement does not
+	// exist" (SQLSTATE 26000), which names the symptom and not the cause.
+	//
+	// The cost is that parameters and results use the text format and parameter
+	// types are inferred from the Go values, so an argument of an ambiguous type
+	// is rejected rather than guessed. Everything here passes strings, integers
+	// and typed arrays, which are none of those. It is also one round trip
+	// rather than two, so it is faster than what it replaces.
+	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 
 	if cfg.ConnectTimeout > 0 {
 		pcfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
