@@ -1,0 +1,329 @@
+// Command gofederation-worker is a Synapse federation sender written in Go.
+//
+// It runs as a SHADOW of an existing federation sender by default: it consumes
+// the same replication stream, applies the same sharding, resolves the same
+// destinations, assembles and signs the same transactions -- and then logs them
+// instead of sending. Nothing is written to any Synapse table and nothing is
+// published to Redis. See docs/shadow-safety.md.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/destinations"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/difflog"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/queue"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/replication"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sender"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sink"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/state"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/store"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/synapsecfg"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
+)
+
+// Stamped by the build. The same three names as the sibling workers.
+var (
+	tag       = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
+func main() {
+	var (
+		configPath  = flag.String("config", "gofederation-worker.yaml", "path to the configuration file")
+		check       = flag.Bool("check", false, "validate the configuration and connections, then exit")
+		healthcheck = flag.Bool("healthcheck", false, "probe a running worker and exit")
+		showVersion = flag.Bool("version", false, "print build information and exit")
+	)
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("gofederation-worker %s (%s, built %s)\n", tag, commit, buildTime)
+		return
+	}
+
+	if err := run(*configPath, *check, *healthcheck); err != nil {
+		fmt.Fprintf(os.Stderr, "gofederation-worker: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(configPath string, check, healthcheck bool) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	if healthcheck {
+		return probe(cfg)
+	}
+
+	log := newLogger(cfg)
+
+	scfg, err := synapsecfg.LoadWithOptions(cfg.SynapseConfig,
+		synapsecfg.Options{SigningKeyPath: cfg.SigningKeyPath})
+	if err != nil {
+		return err
+	}
+	resolved, err := config.Resolve(cfg, scfg)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	w, err := newWorker(ctx, resolved, log)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	if check {
+		log.Info().Msg("configuration and connections are valid")
+		return nil
+	}
+
+	return w.run(ctx)
+}
+
+func newLogger(cfg *config.Config) zerolog.Logger {
+	level, err := zerolog.ParseLevel(cfg.Log.Level)
+	if err != nil || cfg.Log.Level == "" {
+		level = zerolog.InfoLevel
+	}
+	var l zerolog.Logger
+	if cfg.Log.Pretty {
+		l = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+	} else {
+		l = zerolog.New(os.Stderr)
+	}
+	return l.Level(level).With().Timestamp().Logger()
+}
+
+// probe is the container healthcheck. The image is distroless and has no curl,
+// so the binary probes itself.
+func probe(cfg *config.Config) error {
+	if cfg.Metrics.Addr == "" {
+		// Nothing to probe. A worker with no metrics listener is still a valid
+		// configuration, so this is success rather than failure.
+		return nil
+	}
+	addr := cfg.Metrics.Addr
+	if addr[0] == ':' {
+		addr = "127.0.0.1" + addr
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthcheck returned %s", resp.Status)
+	}
+	return nil
+}
+
+// worker owns everything with a lifetime.
+type worker struct {
+	cfg *config.Resolved
+	log zerolog.Logger
+
+	db      *store.Store
+	cursors *state.Store
+	diff    *difflog.Writer
+	queues  *queue.Manager
+	sender  *sender.Sender
+	devices *sender.Devices
+	sub     *replication.Subscriber
+	metrics *http.Server
+}
+
+func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*worker, error) {
+	w := &worker{cfg: cfg, log: log}
+
+	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var err error
+	if w.db, err = store.Open(openCtx, store.Config{
+		DSN:            cfg.Database.DSN,
+		MaxConns:       cfg.Database.MaxConns,
+		ConnectTimeout: cfg.ConnectTimeout(),
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := w.checkReadOnly(openCtx); err != nil {
+		w.close()
+		return nil, err
+	}
+
+	stateDSN := cfg.State.DSN
+	if stateDSN == "" {
+		stateDSN = cfg.Database.DSN
+	}
+	if w.cursors, err = state.Open(openCtx, state.Config{
+		DSN:            stateDSN,
+		Table:          cfg.State.Table,
+		InstanceName:   cfg.WorkerName,
+		MaxConns:       4,
+		ConnectTimeout: cfg.ConnectTimeout(),
+	}); err != nil {
+		w.close()
+		return nil, err
+	}
+
+	if cfg.ShadowEnabled() {
+		if w.diff, err = difflog.Open(difflog.Config{
+			Dir:            cfg.Shadow.DiffLogDir,
+			Instance:       cfg.WorkerName,
+			SampleEvery:    1000,
+			MaxSampleBytes: 64 << 20,
+		}); err != nil {
+			w.close()
+			return nil, err
+		}
+	}
+
+	key, err := cfg.Synapse.SigningKey()
+	if err != nil {
+		w.close()
+		return nil, err
+	}
+	signer, err := txn.NewSigner(cfg.ServerName,
+		fmt.Sprintf("%s %s %s", key.Algorithm, key.Version, encodeSeed(key.Seed)))
+	if err != nil {
+		w.close()
+		return nil, err
+	}
+
+	// The switch. In shadow mode the HTTP sink is never constructed, so there
+	// is no client in the process that a bug could reach.
+	var out sink.Sink
+	if cfg.ShadowEnabled() {
+		dry := sink.NewDryRun(log)
+		dry.SetOnSent(func(pdus, edus, bytes int) {
+			metrics.Transactions.Inc()
+			metrics.TransactionPDUs.Add(float64(pdus))
+			metrics.TransactionEDUs.Add(float64(edus))
+			metrics.TransactionBytes.Add(float64(bytes))
+			if w.diff != nil {
+				w.diff.RecordTransaction(pdus, edus)
+			}
+		})
+		out = dry
+	} else {
+		w.close()
+		return nil, errors.New(
+			"shadow.enabled is false but no real sender is implemented yet; " +
+				"this worker can only shadow (docs/shadow-safety.md)")
+	}
+
+	w.queues = queue.NewManager(queue.ManagerConfig{
+		Limits: queue.Limits{
+			MaxPDUs: cfg.Queue.MaxPDUsPerTransaction,
+			MaxEDUs: cfg.Queue.MaxEDUsPerTransaction,
+		},
+		Signer:        signer,
+		IDs:           txn.NewIDGenerator(),
+		Sink:          out,
+		Log:           log,
+		MaxConcurrent: cfg.Queue.MaxConcurrentDestinations,
+	})
+
+	w.sender = sender.New(sender.Config{
+		Store:        w.db,
+		Cursors:      w.cursors,
+		Resolver:     destinations.NewResolver(w.db, cfg.ServerName, cfg.Synapse.DomainWhitelist),
+		Queues:       w.queues,
+		Observer:     &observer{diff: w.diff},
+		Log:          log,
+		ServerName:   cfg.ServerName,
+		ShouldHandle: cfg.ShouldHandle,
+		BatchLimit:   cfg.Queue.EventBatchLimit,
+	})
+
+	w.devices = sender.NewDevices(sender.DevicesConfig{
+		Store:        w.db,
+		Cursors:      w.cursors,
+		Queues:       w.queues,
+		ShouldHandle: cfg.ShouldHandle,
+	})
+
+	w.sub = replication.New(replication.Config{
+		Enabled:      cfg.ReplicationEnabled(),
+		Address:      cfg.RedisAddress,
+		Channel:      cfg.RedisChannel,
+		Password:     cfg.Replication.Password,
+		DB:           cfg.Replication.DB,
+		InstanceName: cfg.WorkerName,
+	}, log, &handler{worker: w, log: log})
+
+	w.registerMetrics()
+	return w, nil
+}
+
+func (w *worker) checkReadOnly(ctx context.Context) error {
+	role, err := w.db.CurrentRole(ctx)
+	if err != nil {
+		return err
+	}
+	readOnly, err := w.db.IsReadOnly(ctx)
+	if err != nil {
+		return err
+	}
+	if readOnly {
+		metrics.DatabaseReadOnly.Set(1)
+	} else {
+		metrics.DatabaseReadOnly.Set(0)
+	}
+
+	if readOnly {
+		w.log.Info().Str("role", role).Msg("Synapse database connection is read-only")
+		return nil
+	}
+	if w.cfg.Database.RequireReadOnly {
+		return fmt.Errorf(
+			"database role %q can write to Synapse's tables and database.require_read_only "+
+				"is set; see deploy/readonly-role.sql", role)
+	}
+	// A warning rather than a refusal, because a scratch database is a
+	// legitimate way to develop against this. In production, set
+	// require_read_only.
+	w.log.Warn().Str("role", role).Msg(
+		"the Synapse database role can WRITE; production should use a read-only role " +
+			"(deploy/readonly-role.sql) and set database.require_read_only")
+	return nil
+}
+
+func (w *worker) close() {
+	if w.diff != nil {
+		if err := w.diff.Close(); err != nil {
+			w.log.Error().Err(err).Msg("failed to flush the shadow record")
+		}
+	}
+	if w.cursors != nil {
+		w.cursors.Close()
+	}
+	if w.db != nil {
+		w.db.Close()
+	}
+}
+
+func encodeSeed(seed []byte) string {
+	return base64RawStd.EncodeToString(seed)
+}

@@ -21,9 +21,15 @@ type Resolved struct {
 	// wrong origin produces transactions every remote server rejects.
 	ServerName string
 
-	// InstanceName is the sender we impersonate, i.e. Shadow.Instance,
-	// validated to be one of Synapse's configured senders.
-	InstanceName string
+	// WorkerName is this process's own identity: what it calls itself on the
+	// replication bus and what its cursors are keyed by. Never a real sender's
+	// name.
+	WorkerName string
+
+	// ShardInstance is the sender whose shard we take, validated to be one of
+	// Synapse's configured senders. It decides which destinations are ours and
+	// nothing else.
+	ShardInstance string
 
 	// Shard answers which destinations are ours.
 	Shard *sharding.Config
@@ -36,11 +42,12 @@ type Resolved struct {
 // Resolve merges the worker config with Synapse's and validates the pair.
 func Resolve(cfg *Config, scfg *synapsecfg.Config) (*Resolved, error) {
 	r := &Resolved{
-		Config:       cfg,
-		Synapse:      scfg,
-		ServerName:   scfg.ServerName,
-		InstanceName: cfg.Shadow.Instance,
-		Shard:        sharding.New(scfg.SenderInstances),
+		Config:        cfg,
+		Synapse:       scfg,
+		ServerName:    scfg.ServerName,
+		WorkerName:    cfg.WorkerName,
+		ShardInstance: cfg.Shadow.Instance,
+		Shard:         sharding.New(scfg.SenderInstances),
 	}
 
 	// The check this whole function exists for. An instance name that is not in
@@ -53,6 +60,16 @@ func Resolve(cfg *Config, scfg *synapsecfg.Config) (*Resolved, error) {
 			"config: shadow.instance %q is not in %s's federation_sender_instances (%s); "+
 				"it would own no destinations and the worker would silently do nothing",
 			cfg.Shadow.Instance, scfg.Path, strings.Join(quoted(scfg.SenderInstances), ", "))
+	}
+
+	// Claiming a real sender's name would make the bus suppress that sender's
+	// rows as our own echo, and would put us in a config Synapse believes
+	// describes one of its own workers.
+	if contains(scfg.SenderInstances, cfg.WorkerName) {
+		return nil, fmt.Errorf(
+			"config: worker_name %q is one of %s's federation_sender_instances; "+
+				"this worker must have an identity of its own",
+			cfg.WorkerName, scfg.Path)
 	}
 
 	// Redis: ours wins if set, otherwise Synapse's. Synapse's is the normal
@@ -89,7 +106,7 @@ func Resolve(cfg *Config, scfg *synapsecfg.Config) (*Resolved, error) {
 
 // ShouldHandle reports whether this worker owns a destination.
 func (r *Resolved) ShouldHandle(destination string) bool {
-	return r.Shard.ShouldHandle(r.InstanceName, destination)
+	return r.Shard.ShouldHandle(r.ShardInstance, destination)
 }
 
 // IsMine reports whether a user or room id belongs to this homeserver.

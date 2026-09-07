@@ -23,6 +23,17 @@ import (
 
 // Config is the whole file.
 type Config struct {
+	// WorkerName is THIS process's own identity, and must differ from every
+	// name in federation_sender_instances.
+	//
+	// It is not the same thing as shadow.instance, and conflating the two is a
+	// real bug rather than a tidiness point: the replication bus suppresses a
+	// worker's own echo by instance name, so a shadow calling itself by the
+	// name of the sender it shadows discards that sender's rows -- which are
+	// exactly the ones it needs. It also keeps our cursors from colliding if
+	// two shadows of the same sender ever run.
+	WorkerName string `yaml:"worker_name"`
+
 	// SynapseConfig points at Synapse's homeserver.yaml. Everything derivable
 	// from it -- server_name, the sender instance list, the signing key path,
 	// Redis, the retry tuning -- is read from there rather than duplicated
@@ -51,7 +62,10 @@ type ShadowConfig struct {
 	// docs/shadow-safety.md.
 	Enabled *bool `yaml:"enabled"`
 
-	// Instance is the federation sender we impersonate. It must appear in
+	// Instance is the federation sender whose SHARD we take -- which
+	// destinations are ours. It is not our identity; see WorkerName.
+	//
+	// It must appear in
 	// homeserver.yaml's federation_sender_instances, and startup fails if it
 	// does not: a name that is not in the list owns no destinations at all, so
 	// the worker would run perfectly and do nothing, which is the hardest kind
@@ -206,6 +220,10 @@ func (c *Config) ConnectTimeout() time.Duration {
 }
 
 func (c *Config) validate() error {
+	if c.WorkerName == "" {
+		return fmt.Errorf("config: worker_name is required; it is this process's own " +
+			"identity on the replication bus and must differ from every federation sender")
+	}
 	if c.SynapseConfig == "" {
 		return fmt.Errorf("config: synapse_config is required; it is where server_name, " +
 			"federation_sender_instances and the signing key come from")

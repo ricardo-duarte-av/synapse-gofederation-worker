@@ -125,3 +125,46 @@ func TestIsMine(t *testing.T) {
 		}
 	}
 }
+
+// The bug this separation exists to prevent, found by running the worker
+// against the live replication bus rather than by reading the code.
+//
+// worker_name is our own identity and shadow.instance is the shard we take.
+// Conflating them makes the subscriber suppress the shadowed sender's rows as
+// our own echo -- so the worker connects, subscribes, logs cheerfully, and
+// processes nothing at all.
+func TestWorkerNameMustNotBeARealSender(t *testing.T) {
+	cfg := worker(t, "")
+	cfg.WorkerName = "av-federation-sender-worker-1"
+	_, err := Resolve(cfg, synapse())
+	if err == nil {
+		t.Fatal("a worker_name that is one of the configured senders was accepted")
+	}
+	if !strings.Contains(err.Error(), "identity of its own") {
+		t.Errorf("unhelpful error: %v", err)
+	}
+}
+
+func TestWorkerNameAndShardInstanceAreDistinct(t *testing.T) {
+	r, err := Resolve(worker(t, ""), synapse())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.WorkerName != "av-gofederation-worker-1" {
+		t.Errorf("WorkerName = %q", r.WorkerName)
+	}
+	if r.ShardInstance != "av-federation-sender-worker-1" {
+		t.Errorf("ShardInstance = %q", r.ShardInstance)
+	}
+	// The shard must follow ShardInstance, not WorkerName: our own name is not
+	// in the instance list at all, so sharding on it would own nothing.
+	owned := 0
+	for _, d := range []string{"matrix.org", "maunium.net", "t2bot.io", "element.io", "beeper.com"} {
+		if r.ShouldHandle(d) {
+			owned++
+		}
+	}
+	if owned == 0 {
+		t.Error("ShouldHandle owns nothing; the shard is being computed from worker_name")
+	}
+}

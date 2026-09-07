@@ -3,6 +3,7 @@ package config
 import "testing"
 
 const minimal = `
+worker_name: av-gofederation-worker-1
 synapse_config: /etc/synapse/homeserver.yaml
 shadow:
   instance: av-federation-sender-worker-1
@@ -49,6 +50,7 @@ func TestExplicitFalseBeatsTheDefault(t *testing.T) {
 
 func TestShadowCanBeTurnedOff(t *testing.T) {
 	cfg, err := Parse([]byte(`
+worker_name: av-gofederation-worker-1
 synapse_config: /etc/synapse/homeserver.yaml
 shadow:
   enabled: false
@@ -80,10 +82,11 @@ func TestUnknownFieldIsAnError(t *testing.T) {
 
 func TestRequiredFields(t *testing.T) {
 	for name, body := range map[string]string{
-		"no synapse_config":  "shadow:\n  instance: w1\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
-		"no shadow.instance": "synapse_config: /h.yaml\nshadow:\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
-		"no database.dsn":    "synapse_config: /h.yaml\nshadow:\n  instance: w1\n  difflog_dir: /d\n",
-		"no difflog while shadowing": "synapse_config: /h.yaml\nshadow:\n  instance: w1\n" +
+		"no worker_name":     "synapse_config: /h.yaml\nshadow:\n  instance: w1\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
+		"no synapse_config":  "worker_name: w\nshadow:\n  instance: w1\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
+		"no shadow.instance": "worker_name: w\nsynapse_config: /h.yaml\nshadow:\n  difflog_dir: /d\ndatabase:\n  dsn: x\n",
+		"no database.dsn":    "worker_name: w\nsynapse_config: /h.yaml\nshadow:\n  instance: w1\n  difflog_dir: /d\n",
+		"no difflog while shadowing": "worker_name: w\nsynapse_config: /h.yaml\nshadow:\n  instance: w1\n" +
 			"database:\n  dsn: x\n",
 	} {
 		if _, err := Parse([]byte(body)); err == nil {

@@ -96,3 +96,33 @@ func TestDryRunCannotReachTheNetwork(t *testing.T) {
 		t.Fatal("no source files were parsed; the guard is not doing anything")
 	}
 }
+
+// The counters have to reach the metrics and the shadow record, or a run looks
+// idle while it is in fact assembling thousands of transactions -- which is
+// exactly what happened the first time this was run against production.
+func TestOnSentReportsEveryTransaction(t *testing.T) {
+	var got struct {
+		calls, pdus, edus, bytes int
+	}
+	d := NewDryRun(zerolog.New(io.Discard))
+	d.SetOnSent(func(pdus, edus, bytes int) {
+		got.calls++
+		got.pdus += pdus
+		got.edus += edus
+		got.bytes += bytes
+	})
+
+	body := []byte(`{"pdus":[{"a":1},{"b":2}],"edus":[{"edu_type":"m.receipt"}]}`)
+	for i := 0; i < 3; i++ {
+		if _, err := d.Send(context.Background(), &txn.Request{Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got.calls != 3 || got.pdus != 6 || got.edus != 3 || got.bytes != 3*len(body) {
+		t.Errorf("got %+v", got)
+	}
+	// And the sink's own totals agree with what it reported.
+	if s := d.Stats(); s.Transactions != 3 || s.PDUs != 6 || s.EDUs != 3 {
+		t.Errorf("Stats = %+v, disagrees with the callback", s)
+	}
+}

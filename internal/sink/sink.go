@@ -43,6 +43,11 @@ type Sink interface {
 // DryRun logs transactions instead of sending them.
 type DryRun struct {
 	log zerolog.Logger
+	// onSent reports each transaction to whoever is counting. A hook rather
+	// than the sink importing the metrics package, so this package stays
+	// testable without a Prometheus registry -- and so the same numbers reach
+	// both the metrics and the persisted shadow record from one place.
+	onSent func(pdus, edus, bytes int)
 
 	transactions atomic.Int64
 	pdus         atomic.Int64
@@ -54,6 +59,9 @@ type DryRun struct {
 func NewDryRun(log zerolog.Logger) *DryRun {
 	return &DryRun{log: log}
 }
+
+// SetOnSent registers a callback invoked for every transaction.
+func (d *DryRun) SetOnSent(f func(pdus, edus, bytes int)) { d.onSent = f }
 
 // Mode identifies this sink.
 func (d *DryRun) Mode() string { return "dry-run (shadow; nothing is sent)" }
@@ -71,6 +79,10 @@ func (d *DryRun) Send(_ context.Context, req *txn.Request) (Result, error) {
 	d.pdus.Add(int64(pdus))
 	d.edus.Add(int64(edus))
 	d.bytes.Add(int64(len(req.Body)))
+
+	if d.onSent != nil {
+		d.onSent(pdus, edus, len(req.Body))
+	}
 
 	d.log.Debug().
 		Str("destination", req.Destination).
