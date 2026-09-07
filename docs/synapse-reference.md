@@ -249,6 +249,23 @@ cursor into `destination_rooms`, not a delivery receipt.
 A fresh destination with no `last_successful_stream_ordering` row exits catch-up
 immediately and never replays history.
 
+Catch-up is gated on the backoff in four places, and all four are needed:
+
+1. The outstanding-destinations query excludes anything not due, in SQL.
+2. The sweep re-checks before dispatching, since the query's snapshot ages.
+3. `CatchUp.Destination` checks on entry, so it is safe called from anywhere.
+4. It re-checks between pages -- a destination can fall into backoff while its
+   own backlog is being replayed, because a failed send does exactly that, and
+   a long backlog would otherwise keep dialling it for as long as the pages
+   last.
+
+The sweep DISPATCHES rather than performs. `wake_destination` starts a
+background process and returns (`federation/sender/__init__.py:1164`), so
+Synapse's waker never waits on a destination. Doing it inline instead makes a
+sweep as slow as its slowest destination -- and on a list where half the
+entries no longer exist, with `client_timeout: 180s` and twenty retries behind
+it, that is not a tail case.
+
 One wart, shared with Synapse: `get_catch_up_room_event_ids` joins `events`, so
 a `destination_rooms` row whose event has since been purged yields nothing.
 Catch-up then finds no work, exits, and never advances the cursor -- leaving

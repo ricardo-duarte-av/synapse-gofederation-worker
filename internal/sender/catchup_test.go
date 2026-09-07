@@ -240,3 +240,163 @@ func TestSkippedEventReopensCatchUp(t *testing.T) {
 		t.Errorf("cursor = %d, want the raced event replayed", got)
 	}
 }
+
+// Catch-up must respect the backoff, and for exactly the destinations the
+// backoff protects most: the ones that owe the most, because they have been
+// unreachable the longest.
+func TestCatchUpRespectsTheBackoff(t *testing.T) {
+	st := &fakeCatchUpStore{
+		owed: map[string][]store.Event{"dead.example": {
+			owedEvent("$a", 10), owedEvent("$b", 20),
+		}},
+		lastSuccessful: map[string]int64{"dead.example": 5},
+	}
+	c, _, s := catchUpHarness(t, st)
+	c.due = func(string) bool { return false }
+
+	if err := c.Destination(context.Background(), "dead.example"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.count(); got != 0 {
+		t.Fatalf("%d catch-up transactions to a destination that is backing off", got)
+	}
+
+	// And once due, the backlog goes.
+	c.due = func(string) bool { return true }
+	if err := c.Destination(context.Background(), "dead.example"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.count(); got != 2 {
+		t.Errorf("%d transactions once due, want the 2 owed", got)
+	}
+}
+
+// A destination can fall into backoff partway through its own backlog -- a
+// failed send does exactly that -- and a long backlog would otherwise keep
+// dialling it for as long as the pages last.
+func TestCatchUpStopsWhenADestinationFallsIntoBackoffMidway(t *testing.T) {
+	// More than one page, or the per-page check never runs: catchUpPageSize is
+	// 50, so a shorter backlog is fetched and sent in a single iteration and
+	// the test would pass whether the check existed or not.
+	const owedCount = catchUpPageSize * 3
+	var owed []store.Event
+	for i := 1; i <= owedCount; i++ {
+		owed = append(owed, owedEvent(fmt.Sprintf("$e%d", i), int64(i*10)))
+	}
+	st := &fakeCatchUpStore{
+		owed:           map[string][]store.Event{"flaky.example": owed},
+		lastSuccessful: map[string]int64{"flaky.example": 0},
+	}
+	c, _, s := catchUpHarness(t, st)
+
+	// Due for the self-guard at the top and the first page's check, then not.
+	// The count is deliberate: the guard and the per-page check are separate
+	// calls, and a test that conflated them would pass whichever one was
+	// removed.
+	calls := 0
+	c.due = func(string) bool {
+		calls++
+		return calls <= 2
+	}
+
+	if err := c.Destination(context.Background(), "flaky.example"); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the first page went; the rest did not.
+	got := s.count()
+	if got == 0 {
+		t.Error("nothing was sent while the destination was still due")
+	}
+	if got == owedCount {
+		t.Error("the whole backlog was sent; the per-page backoff check did nothing")
+	}
+	if got != catchUpPageSize {
+		t.Errorf("sent %d, want exactly one page of %d", got, catchUpPageSize)
+	}
+	if calls < 3 {
+		t.Errorf("due was consulted %d times, want the guard plus at least two pages", calls)
+	}
+}
+
+// The sweep must dispatch rather than perform. One destination that hangs --
+// a dead server held open until client_timeout, 180s on this deployment with
+// twenty retries behind it -- must not stall every other destination.
+func TestSweepDoesNotBlockOnASlowDestination(t *testing.T) {
+	release := make(chan struct{})
+	st := &fakeCatchUpStore{
+		owed: map[string][]store.Event{
+			"aaa-slow.example": {owedEvent("$slow", 10)},
+			"bbb-fast.example": {owedEvent("$fast", 10)},
+		},
+		lastSuccessful: map[string]int64{"aaa-slow.example": 5, "bbb-fast.example": 5},
+		outstanding:    []string{"aaa-slow.example", "bbb-fast.example"},
+	}
+	signer, err := txn.NewSigner(serverName, testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := &blockingCatchUpSink{release: release, slow: "aaa-slow.example"}
+	m := queue.NewManager(queue.ManagerConfig{
+		Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix), Sink: blocking,
+		Log: zerolog.New(io.Discard), MaxConcurrent: 8,
+	})
+	m.Start(context.Background())
+	c := NewCatchUp(CatchUpConfig{
+		Store: st, Queues: m, Log: zerolog.New(io.Discard),
+		ShouldHandle: func(string) bool { return true },
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); c.sweep(ctx) }()
+
+	// The fast destination must get through while the slow one is still stuck.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocking.sawFast() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !blocking.sawFast() {
+		close(release)
+		cancel()
+		<-done
+		t.Fatal("the fast destination was blocked behind the slow one; " +
+			"the sweep is performing catch-up instead of dispatching it")
+	}
+	close(release)
+	cancel()
+	<-done
+}
+
+// blockingCatchUpSink holds one named destination until released.
+type blockingCatchUpSink struct {
+	release chan struct{}
+	slow    string
+	mu      sync.Mutex
+	fast    bool
+}
+
+func (b *blockingCatchUpSink) Mode() string { return "blocking" }
+
+func (b *blockingCatchUpSink) Send(ctx context.Context, req *txn.Request) (sink.Result, error) {
+	if req.Destination == b.slow {
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return sink.Result{}, ctx.Err()
+		}
+		return sink.Result{Delivered: true}, nil
+	}
+	b.mu.Lock()
+	b.fast = true
+	b.mu.Unlock()
+	return sink.Result{Delivered: true}, nil
+}
+
+func (b *blockingCatchUpSink) sawFast() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fast
+}

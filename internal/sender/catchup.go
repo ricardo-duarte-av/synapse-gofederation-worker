@@ -2,6 +2,7 @@ package sender
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -25,6 +26,17 @@ const (
 	betweenDestinations = 5 * time.Second
 	// destinationPage is how many destinations one sweep query returns.
 	destinationPage = 25
+	// catchUpConcurrency bounds how many destinations are being brought
+	// forward at once.
+	//
+	// The sweep DISPATCHES rather than performs, which is the shape Synapse
+	// has: wake_destination starts a background process and returns, so the
+	// waker never waits on a destination (federation/sender/__init__.py:1164).
+	// Running catch-up inline instead means one destination with a large
+	// backlog -- or one that hangs until client_timeout, which on this
+	// deployment is 180s with twenty retries behind it -- stalls every other
+	// destination behind it for as long as it takes.
+	catchUpConcurrency = 32
 )
 
 // CatchUpStore is the database access catch-up needs.
@@ -88,8 +100,17 @@ func (c *CatchUp) Run(ctx context.Context) error {
 	}
 }
 
-// sweep walks every destination that is owed something and brings it forward.
+// sweep walks every destination that is owed something and starts it catching
+// up.
+//
+// It dispatches and does not wait. A sweep that performed each catch-up in turn
+// would be as slow as its slowest destination, and on a list where half the
+// entries are servers that no longer exist that is not a tail case.
 func (c *CatchUp) sweep(ctx context.Context) {
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, catchUpConcurrency)
+	defer wg.Wait()
+
 	after := ""
 	swept := 0
 	for ctx.Err() == nil {
@@ -111,13 +132,27 @@ func (c *CatchUp) sweep(ctx context.Context) {
 			if c.due != nil && !c.due(d) {
 				continue
 			}
-			if err := c.Destination(ctx, d); err != nil {
-				c.log.Warn().Err(err).Str("destination", d).Msg("catch-up failed")
+			// Bounded, so a sweep of thousands cannot open thousands of
+			// connections; and acquired before the goroutine so the pacing
+			// below still applies when every slot is busy.
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return
 			}
+			wg.Add(1)
+			go func(destination string) {
+				defer wg.Done()
+				defer func() { <-slots }()
+				if err := c.Destination(ctx, destination); err != nil {
+					c.log.Warn().Err(err).Str("destination", destination).
+						Msg("catch-up failed")
+				}
+			}(d)
 			swept++
 
-			// Paced deliberately. Without it a restart puts every stale
-			// destination on the wire at once.
+			// Paced deliberately, on DISPATCH. Without it a restart puts every
+			// stale destination on the wire in the same instant.
 			select {
 			case <-ctx.Done():
 				return
@@ -135,6 +170,15 @@ func (c *CatchUp) sweep(ctx context.Context) {
 // This is Synapse's _catch_up_transmission_loop (per_destination_queue.py:473)
 // with one deliberate omission, noted below.
 func (c *CatchUp) Destination(ctx context.Context, destination string) error {
+	// Self-guarding, so the exported method is safe to call from anywhere.
+	// The sweep already filters on this, but a catch-up that dialled a
+	// destination the backoff had ruled out would defeat the backoff for
+	// exactly the destinations it exists to protect -- the ones that owe the
+	// most because they have been unreachable the longest.
+	if c.due != nil && !c.due(destination) {
+		return nil
+	}
+
 	d := c.queues.Get(destination)
 
 	// The cursor to catch up FROM. A destination with no recorded value has
@@ -151,6 +195,14 @@ func (c *CatchUp) Destination(ctx context.Context, destination string) error {
 	d.SetLastSuccessfulStreamOrdering(lastSuccessful)
 
 	for ctx.Err() == nil {
+		// Re-checked between pages. A destination can fall into backoff while
+		// its own backlog is being replayed -- a failed send does exactly that
+		// -- and a long backlog would otherwise keep dialling it for as long as
+		// the pages last.
+		if c.due != nil && !c.due(destination) {
+			return nil
+		}
+
 		eventIDs, err := c.store.GetCatchUpRoomEventIDs(ctx, destination, lastSuccessful, catchUpPageSize)
 		if err != nil {
 			return err
