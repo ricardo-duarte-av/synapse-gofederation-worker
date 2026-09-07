@@ -26,6 +26,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/queue"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/replication"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/retry"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sender"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sink"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/state"
@@ -150,7 +151,12 @@ type worker struct {
 	diff    *difflog.Writer
 	capture *capture.WorkerCapture
 	// router is set only outside shadow mode; it owns the send allowlist.
-	router  *sink.Router
+	router *sink.Router
+	// limiter is the per-destination backoff, shared by the routing filter and
+	// the gate in front of the transmission loop. One instance, because two
+	// implementations of a backoff would disagree under exactly the conditions
+	// that make a backoff matter.
+	limiter *retry.Limiter
 	queues  *queue.Manager
 	sender  *sender.Sender
 	devices *sender.Devices
@@ -294,6 +300,35 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		out = router
 	}
 
+	// The persistent backoff. Seeded from whichever table holds it -- Synapse's
+	// while shadowing, ours once primary -- so a restart does not forget that
+	// a quarter of the destination list has been dead for years.
+	w.limiter = retry.New(
+		retry.Config{
+			MinInterval: cfg.Synapse.Retry.MinInterval,
+			Multiplier:  cfg.Synapse.Retry.Multiplier,
+			MaxInterval: cfg.Synapse.Retry.MaxInterval,
+		},
+		func(ctx context.Context, dests []string) (map[string]retry.Timings, error) {
+			timings, err := w.db.GetDestinationRetryTimings(ctx, dests)
+			if err != nil {
+				return nil, err
+			}
+			out := make(map[string]retry.Timings, len(timings))
+			for d, t := range timings {
+				out[d] = retry.Timings{
+					FailureTS: t.FailureTS, RetryLastTS: t.RetryLastTS,
+					RetryInterval: t.RetryInterval,
+				}
+			}
+			return out, nil
+		},
+		w.persistTimings,
+	)
+	w.limiter.SetOnRecovered(func(destination string) {
+		log.Info().Str("destination", destination).Msg("destination recovered; backoff cleared")
+	})
+
 	w.queues = queue.NewManager(queue.ManagerConfig{
 		Limits: queue.Limits{
 			MaxPDUs: cfg.Queue.MaxPDUsPerTransaction,
@@ -307,6 +342,11 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		OnSuccess:     w.onDelivered,
 		OnEDUsSent:    w.onEDUsDelivered,
 		OnOutcome:     w.onSendOutcome,
+		Due: func(destination string) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return w.limiter.Due(ctx, destination)
+		},
 	})
 
 	w.sender = sender.New(sender.Config{

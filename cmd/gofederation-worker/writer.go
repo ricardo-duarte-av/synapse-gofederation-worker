@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"math/rand"
 	"time"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/retry"
 )
 
 // bookkeepingTimeout bounds one write. Generous, because losing a deletion is
@@ -111,60 +111,48 @@ func (w *worker) recordPosition(ctx context.Context, streamID int64) error {
 	return nil
 }
 
-// onSendOutcome records a destination's backoff state after an attempt.
+// onSendOutcome updates the destination's backoff after an attempt.
 //
-// Synapse's RetryDestinationLimiter (retryutils.py:226): a success clears the
-// backoff, a failure grows it by the configured multiplier with jitter, capped.
-// Without this a primary never backs off persistently -- it would retry a dead
-// server on every event, forever, and the destinations table would never show
-// that anything was wrong.
+// The growth and the jitter live in internal/retry rather than here, so the
+// same arithmetic governs both the gate in front of the transmission loop and
+// the state written to the database. Two implementations of a backoff is one
+// too many: they would disagree under exactly the conditions that make a
+// backoff matter.
 func (w *worker) onSendOutcome(destination string, delivered bool) {
-	if w.writer == nil {
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
 	defer cancel()
 
 	if delivered {
-		if err := w.writer.ClearDestinationRetryTimings(ctx, destination); err != nil {
-			metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
-			w.log.Error().Err(err).Str("destination", destination).
-				Msg("failed to clear the backoff for a destination that is working")
-			return
-		}
-		metrics.WriteOps.WithLabelValues("retry_timings", "ok").Inc()
+		w.limiter.Success(ctx, destination)
 		return
 	}
-
-	now := time.Now().UnixMilli()
-	next := w.nextRetryInterval(ctx, destination)
-	if err := w.writer.SetDestinationRetryTimings(ctx, destination, now, now, next); err != nil {
-		metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
-		w.log.Error().Err(err).Str("destination", destination).Msg("failed to record a backoff")
-		return
-	}
-	metrics.WriteOps.WithLabelValues("retry_timings", "ok").Inc()
+	t := w.limiter.Failure(ctx, destination)
+	w.log.Debug().
+		Str("destination", destination).
+		Dur("retry_in", time.Duration(t.RetryInterval)*time.Millisecond).
+		Msg("destination failed; backing off")
 }
 
-// nextRetryInterval grows the backoff the way Synapse does.
+// persistTimings writes a destination's backoff, in primary mode only.
 //
-// The jitter is Synapse's uniform(0.8, 1.4) and is not decoration: without it
-// every destination that failed together retries together, and a server coming
-// back up is met by the entire backlog at once.
-func (w *worker) nextRetryInterval(ctx context.Context, destination string) int64 {
-	retry := w.cfg.Synapse.Retry
-	timings, err := w.db.GetDestinationRetryTimings(ctx, []string{destination})
+// A shadow keeps the backoff in memory for its own lifetime and writes nothing:
+// destinations is the real senders' bookkeeping and a shadow that wrote it
+// would change their behaviour, which is the one thing it must never do.
+func (w *worker) persistTimings(ctx context.Context, destination string, t retry.Timings) error {
+	if w.writer == nil {
+		return nil
+	}
+	var err error
+	if t.RetryInterval == 0 && t.RetryLastTS == 0 {
+		err = w.writer.ClearDestinationRetryTimings(ctx, destination)
+	} else {
+		err = w.writer.SetDestinationRetryTimings(ctx, destination, t.FailureTS, t.RetryLastTS, t.RetryInterval)
+	}
 	if err != nil {
-		// Reading failed, so start from the minimum rather than guessing high.
-		return retry.MinInterval.Milliseconds()
+		metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
+		w.log.Error().Err(err).Str("destination", destination).Msg("failed to persist a backoff")
+		return err
 	}
-	current := timings[destination].RetryInterval
-	if current <= 0 {
-		return retry.MinInterval.Milliseconds()
-	}
-	grown := float64(current) * retry.Multiplier * (0.8 + rand.Float64()*0.6)
-	if max := float64(retry.MaxInterval.Milliseconds()); grown > max {
-		grown = max
-	}
-	return int64(grown)
+	metrics.WriteOps.WithLabelValues("retry_timings", "ok").Inc()
+	return nil
 }

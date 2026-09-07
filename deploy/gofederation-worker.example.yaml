@@ -78,6 +78,21 @@ shadow:
   # traffic by deleting a line. Cannot be combined with send_only_to.
   # send_to_all: false
 
+# Backoff, transaction timeouts and per-request retries all come from the
+# `federation:` block of the homeserver.yaml above, not from here -- both
+# senders should behave the same way towards the same destinations. For
+# reference, this deployment's testing server uses:
+#
+#   federation:
+#     client_timeout: 180s
+#     max_short_retry_delay: 7s          # unused here: only /send is called
+#     max_long_retry_delay: 100s
+#     max_short_retries: 5               # unused here
+#     max_long_retries: 20
+#     destination_min_retry_interval: 30s
+#     destination_retry_multiplier: 5
+#     destination_max_retry_interval: 12h
+
 database:
   # Synapse's database, read-only. libpq keyword form, not a URI.
   # host=/var/sockets is the direct unix socket with peer auth as uid 991; the

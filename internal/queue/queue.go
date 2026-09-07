@@ -104,6 +104,12 @@ type Destination struct {
 	// which is the half that matters: without it a dead server is retried on
 	// every event forever.
 	onOutcome func(destination string, delivered bool)
+	// due gates the loop. Synapse checks its retry limiter at the TOP of the
+	// transmission loop and abandons the run entirely when the destination is
+	// backing off (per_destination_queue.py:351). Without that gate the
+	// backoff only slows down how often a dead server is enqueued for, not how
+	// often it is actually dialled.
+	due func(destination string) bool
 }
 
 // Config builds a Destination.
@@ -117,6 +123,7 @@ type Config struct {
 	OnSuccess  func(destination string, streamOrdering int64)
 	OnEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	OnOutcome  func(destination string, delivered bool)
+	Due        func(destination string) bool
 }
 
 // NewDestination builds a queue for one remote server.
@@ -138,6 +145,7 @@ func NewDestination(cfg Config) *Destination {
 		onSuccess:  cfg.OnSuccess,
 		onEDUsSent: cfg.OnEDUsSent,
 		onOutcome:  cfg.OnOutcome,
+		due:        cfg.Due,
 	}
 }
 
@@ -213,6 +221,18 @@ func (d *Destination) Run(ctx context.Context) {
 	}()
 
 	for ctx.Err() == nil {
+		// The backoff gate, checked before every transaction rather than only
+		// when the event was routed. A destination can go into backoff while
+		// work is already queued for it, and a dead server should be dialled
+		// on the interval, not on the traffic.
+		//
+		// The queued units stay queued: they are what catch-up and the next
+		// attempt will send. Only the attempt is abandoned.
+		if d.due != nil && !d.due(d.name) {
+			d.log.Debug().Msg("destination is backing off; not attempting")
+			return
+		}
+
 		d.mu.Lock()
 		// Cleared at the TOP, so anything enqueued during the send below is
 		// seen by the next iteration rather than lost.

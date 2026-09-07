@@ -105,11 +105,13 @@ func (h *handler) OnPosition(stream, _ string, position int64) {
 }
 
 func (h *handler) OnRemoteServerUp(server string) {
-	// A destination somebody else has seen working. A real sender wakes it
-	// immediately; we do the same, which costs nothing if it has no queue.
+	// A destination somebody else has seen working. Our backoff for it is now
+	// stale: that is not proof WE can reach it, but retrying once and failing
+	// is cheap next to leaving a working server unreachable for hours.
 	if !h.worker.cfg.ShouldHandle(server) {
 		return
 	}
+	h.worker.limiter.Recovered(server)
 	q := h.worker.queues.Get(server)
 	if pdus, edus := q.Pending(); pdus == 0 && edus == 0 {
 		return

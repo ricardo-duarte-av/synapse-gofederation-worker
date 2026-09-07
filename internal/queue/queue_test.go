@@ -397,3 +397,45 @@ func TestOnlyDeliveredMarksAreCommitted(t *testing.T) {
 		t.Errorf("highest committed mark = %d, want 99 once all were delivered", got.toDevice)
 	}
 }
+
+// The gate Synapse checks at the top of its transmission loop.
+//
+// Without it the backoff only limits how often a dead server is ENQUEUED for,
+// not how often it is dialled -- so a busy room keeps a permanently gone
+// server under continuous connection attempts, which is wasted work here and
+// unsolicited traffic at the other end.
+func TestBackingOffDestinationIsNotDialled(t *testing.T) {
+	s := &recordingSink{}
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := false
+	d := NewDestination(Config{
+		Name: "dead.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		Due: func(string) bool { return allowed },
+	})
+
+	for i := 0; i < 20; i++ {
+		d.EnqueuePDU(pdu("$e", int64(i+1)))
+		d.Attempt(context.Background())
+	}
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+
+	if got := len(s.sent()); got != 0 {
+		t.Fatalf("%d transactions were sent to a destination that is backing off", got)
+	}
+	// The work is not lost -- it is what the next attempt and catch-up send.
+	if p, _ := d.Pending(); p != 20 {
+		t.Errorf("%d pdus queued, want all 20 still there", p)
+	}
+
+	// And once it is due again, the queued work goes.
+	allowed = true
+	d.Attempt(context.Background())
+	waitFor(t, "the drain once due", func() bool {
+		p, _ := d.Pending()
+		return p == 0
+	})
+}

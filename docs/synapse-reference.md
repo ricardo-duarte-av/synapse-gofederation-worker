@@ -249,12 +249,50 @@ cursor into `destination_rooms`, not a delivery receipt.
 A fresh destination with no `last_successful_stream_ordering` row exits catch-up
 immediately and never replays history.
 
-## 10. What a federation sender does NOT use
+## 10. Backoff, and why it is not optional
+
+A homeserver's destination list is mostly a graveyard. On aguiarvieira.pt,
+of 27,827 known destinations **13,416 are backing off right now** and 16,335
+carry a retry interval at or past twelve hours -- servers that were shut down,
+domains that expired, hosts that will never answer again.
+
+A sender without a growing, persistent backoff attempts roughly half its
+destination list continuously. That is wasted work locally and unsolicited
+traffic at the other end.
+
+Synapse gates this in two places and both are needed:
+
+- **In front of the transmission loop.** `get_retry_limiter` raises
+  `NotRetryingDestination` at the top of `_transaction_transmission_loop`
+  (`per_destination_queue.py:351`). Without this, the backoff limits only how
+  often a destination is *enqueued* for, not how often it is *dialled* -- a busy
+  room keeps a dead server under continuous connection attempts.
+- **When routing.** `filter_destinations_by_retry_limiter` drops destinations
+  that are not due, with an hour of slack so a recovering server is picked up
+  in the current batch rather than the next.
+
+Growth is `interval * multiplier * uniform(0.8, 1.4)`, capped
+(`retryutils.py:226`). The jitter is not decoration: without it every
+destination that failed in the same incident retries in the same instant, and a
+server coming back is met by the whole backlog at once. A success clears the
+backoff outright rather than decaying it -- one working request is enough
+evidence, and a decay would keep a recovered server throttled for as long as it
+had been broken.
+
+The per-request retry inside one attempt is separate and is Synapse's long
+algorithm for `/send`: `4^(max_long_retries + 1 - retries_left)`, capped at
+`max_long_retry_delay`, times the same jitter
+(`matrixfederationclient.py:851`). The short algorithm applies to other
+federation calls, which this worker does not make.
+
+## 11. What a federation sender does NOT use
 
 Worth stating, because it saves reading the config in alarm later.
 
-A federation sender is not a stream writer, so nothing addresses it through
-`instance_map`. The one setting that would make other workers call a sender over
+`instance_map` is how workers learn to reach each other over HTTP replication,
+and a worker needs an entry there only if it has a replication listener that
+others call. A federation sender is not a stream writer, so nothing addresses it
+that way. The one setting that would make other workers call a sender over
 HTTP replication is `outbound_federation_restricted_to`
 (`config/workers.py:483`, used at `matrixfederationclient.py:422`), which makes
 every other worker proxy its outbound federation requests through the named

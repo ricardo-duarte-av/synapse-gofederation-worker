@@ -112,6 +112,7 @@ func (w *worker) sampleGauges(ctx context.Context) error {
 			metrics.QueuedPDUs.Set(float64(pdus))
 			metrics.QueuedEDUs.Set(float64(edus))
 			metrics.KnownDestinations.Set(float64(w.queues.Count()))
+			metrics.DestinationsBackingOff.Set(float64(w.limiter.Backoff()))
 
 			if w.sub.Live() {
 				metrics.ReplicationLive.Set(1)

@@ -165,7 +165,7 @@ func All() []prometheus.Collector {
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,
 		Transactions, TransactionPDUs, TransactionEDUs, TransactionBytes,
 		EventProcessingLag, StageDuration, FanOutDuration, SendDuration,
-		InFlightSends, DestinationGoroutines, WriteOps,
+		InFlightSends, DestinationGoroutines, WriteOps, DestinationsBackingOff,
 	}
 }
 
@@ -252,6 +252,17 @@ var (
 	DestinationGoroutines = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "gofed_destination_goroutines",
 		Help: "Destination transmission loops currently running.",
+	})
+
+	// DestinationsBackingOff is how many destinations are currently refusing to
+	// be dialled.
+	//
+	// A homeserver's destination list is mostly a graveyard, so this number is
+	// large and that is normal. What matters is its SHAPE: a step change means
+	// a network problem at our end rather than at theirs.
+	DestinationsBackingOff = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gofed_destinations_backing_off",
+		Help: "Destinations currently in a retry backoff.",
 	})
 
 	// WriteOps counts the bookkeeping a primary sender performs, by operation.

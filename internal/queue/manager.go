@@ -35,6 +35,7 @@ type Manager struct {
 	onSuccess  func(destination string, streamOrdering int64)
 	onEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	onOutcome  func(destination string, delivered bool)
+	due        func(destination string) bool
 
 	mu    sync.RWMutex
 	dests map[string]*Destination
@@ -62,6 +63,7 @@ type ManagerConfig struct {
 	OnSuccess     func(destination string, streamOrdering int64)
 	OnEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	OnOutcome     func(destination string, delivered bool)
+	Due           func(destination string) bool
 }
 
 // NewManager builds a Manager.
@@ -80,6 +82,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		onSuccess:  cfg.OnSuccess,
 		onEDUsSent: cfg.OnEDUsSent,
 		onOutcome:  cfg.OnOutcome,
+		due:        cfg.Due,
 		dests:      map[string]*Destination{},
 		base:       context.Background(),
 	}
@@ -125,6 +128,7 @@ func (m *Manager) Get(name string) *Destination {
 		OnSuccess:  m.onSuccess,
 		OnEDUsSent: m.onEDUsSent,
 		OnOutcome:  m.onOutcome,
+		Due:        m.due,
 	})
 	m.dests[name] = d
 	return d
