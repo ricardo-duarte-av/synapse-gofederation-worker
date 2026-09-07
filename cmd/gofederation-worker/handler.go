@@ -4,9 +4,11 @@ import (
 	"context"
 
 	"github.com/rs/zerolog"
+	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/replication"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sender"
 )
 
 // handler turns replication rows into work.
@@ -33,6 +35,18 @@ func (h *handler) OnRows(stream string, position int64, rows []replication.Row) 
 
 	case replication.StreamDeviceLists:
 		h.handleDeviceLists(position, rows)
+
+	case replication.StreamReceipts:
+		h.handleReceipts(rows)
+
+	case replication.StreamPresenceFederation:
+		h.handlePresenceFederation(rows)
+
+	case replication.StreamFederation:
+		// Typing and arbitrary EDUs reach a sender through here rather than
+		// off their own streams: the handler that produced them runs on
+		// another worker and hands them over (handlers/typing.py:188).
+		h.handleFederation(rows)
 	}
 }
 
@@ -94,6 +108,108 @@ func (h *handler) handleDeviceLists(position int64, rows []replication.Row) {
 				Msg("failed to queue device list updates")
 		}
 	}()
+}
+
+// handleReceipts routes read receipts to the servers in each room.
+func (h *handler) handleReceipts(rows []replication.Row) {
+	var updates []sender.ReceiptUpdate
+	for _, row := range rows {
+		r, ok := replication.ParseReceiptRow(row.JSON)
+		if !ok {
+			continue
+		}
+		updates = append(updates, sender.ReceiptUpdate{
+			RoomID: r.RoomID, ReceiptType: r.ReceiptType, UserID: r.UserID,
+			EventID: r.EventID, ThreadID: r.ThreadID, Data: r.Data,
+		})
+	}
+	if len(updates) == 0 {
+		return
+	}
+	// Off the replication goroutine: routing a receipt reads the room's host
+	// list, and a database query in the subscriber's path would stall the
+	// stream for every other worker's traffic too.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), replicationWorkTimeout)
+		defer cancel()
+		for _, u := range updates {
+			if err := h.worker.ephemeral.HandleReceipt(ctx, u); err != nil {
+				h.log.Error().Err(err).Str("room", u.RoomID).Msg("failed to route a receipt")
+			}
+		}
+	}()
+}
+
+// handlePresenceFederation routes presence to the destinations named in the
+// rows.
+func (h *handler) handlePresenceFederation(rows []replication.Row) {
+	// Grouped by destination, because one transaction carries one m.presence
+	// EDU describing many users -- sending one EDU per user would spend the
+	// whole per-transaction EDU budget on presence.
+	byDestination := map[string][]string{}
+	for _, row := range rows {
+		r, ok := replication.ParsePresenceFederationRow(row.JSON)
+		if !ok {
+			continue
+		}
+		byDestination[r.Destination] = append(byDestination[r.Destination], r.UserID)
+	}
+	if len(byDestination) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), replicationWorkTimeout)
+		defer cancel()
+		for destination, users := range byDestination {
+			if err := h.worker.ephemeral.HandlePresence(ctx, destination, users); err != nil {
+				h.log.Error().Err(err).Str("destination", destination).
+					Msg("failed to route presence")
+			}
+		}
+	}()
+}
+
+// handleFederation routes EDUs another worker has handed us.
+func (h *handler) handleFederation(rows []replication.Row) {
+	for _, row := range rows {
+		r, ok := replication.ParseFederationRow(row.JSON)
+		if !ok {
+			continue
+		}
+		switch r.Kind {
+		case "k":
+			if r.Destination == "" {
+				continue
+			}
+			// Keyed by type AND key, so typing for one room does not clobber
+			// typing for another.
+			h.worker.ephemeral.HandleTyping(r.Destination, r.EDUType+"|"+r.Key, r.Content)
+		case "e":
+			if r.Destination == "" {
+				continue
+			}
+			h.worker.ephemeral.HandleEDU(r.Destination, r.EDUType, r.Content)
+		case "pd":
+			// Presence carried inline rather than by reference. Handled by
+			// re-reading the state for consistency with the
+			// presence_federation path, which is the one this deployment uses.
+			userID := gjson.GetBytes(r.PresenceState, "user_id").String()
+			if userID == "" || len(r.PresenceDestinations) == 0 {
+				continue
+			}
+			dests := r.PresenceDestinations
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), replicationWorkTimeout)
+				defer cancel()
+				for _, d := range dests {
+					if err := h.worker.ephemeral.HandlePresence(ctx, d, []string{userID}); err != nil {
+						h.log.Error().Err(err).Str("destination", d).
+							Msg("failed to route presence")
+					}
+				}
+			}()
+		}
+	}
 }
 
 func (h *handler) OnPosition(stream, _ string, position int64) {

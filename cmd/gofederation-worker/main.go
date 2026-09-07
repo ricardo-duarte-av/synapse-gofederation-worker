@@ -156,13 +156,14 @@ type worker struct {
 	// the gate in front of the transmission loop. One instance, because two
 	// implementations of a backoff would disagree under exactly the conditions
 	// that make a backoff matter.
-	limiter *retry.Limiter
-	queues  *queue.Manager
-	sender  *sender.Sender
-	devices *sender.Devices
-	catchup *sender.CatchUp
-	sub     *replication.Subscriber
-	metrics *http.Server
+	limiter   *retry.Limiter
+	queues    *queue.Manager
+	sender    *sender.Sender
+	devices   *sender.Devices
+	catchup   *sender.CatchUp
+	ephemeral *sender.Ephemeral
+	sub       *replication.Subscriber
+	metrics   *http.Server
 }
 
 func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*worker, error) {
@@ -371,6 +372,14 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		Queues:                w.queues,
 		ShouldHandle:          cfg.ShouldHandle,
 		AllowDeviceNameLookup: cfg.Synapse.AllowDeviceNameLookup,
+	})
+
+	w.ephemeral = sender.NewEphemeral(sender.EphemeralConfig{
+		Store:        w.db,
+		Queues:       w.queues,
+		Log:          log,
+		ServerName:   cfg.ServerName,
+		ShouldHandle: cfg.ShouldHandle,
 	})
 
 	w.catchup = sender.NewCatchUp(sender.CatchUpConfig{

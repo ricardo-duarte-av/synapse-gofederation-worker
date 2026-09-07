@@ -472,8 +472,6 @@ func TestAuthEventsAreLoadedLazily(t *testing.T) {
 	}
 }
 
-func nowMS() int64 { return time.Now().UnixMilli() }
-
 // waitFor polls until cond holds or the deadline passes, so a test never
 // depends on a sleep being long enough. Asserting on a value sampled straight
 // after an asynchronous handoff is a race, not a test.

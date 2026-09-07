@@ -1,6 +1,10 @@
 package replication
 
-import "github.com/tidwall/gjson"
+import (
+	"encoding/json"
+
+	"github.com/tidwall/gjson"
+)
 
 // Replication rows are positional JSON arrays, one shape per stream
 // (replication/tcp/streams/*.py). Getting a shape wrong is not a parse error --
@@ -142,4 +146,156 @@ func ParseDeviceListRow(row string) (DeviceListRow, bool) {
 		out.HostsCalculated = a[2].Bool()
 	}
 	return out, true
+}
+
+// ReceiptRow is one row of the receipts stream:
+//
+//	[room_id, receipt_type, user_id, event_id, thread_id, data]
+type ReceiptRow struct {
+	RoomID      string
+	ReceiptType string
+	UserID      string
+	EventID     string
+	// ThreadID is empty for an unthreaded receipt. It is not decoration: two
+	// receipts from one user in one room for different threads are both real,
+	// and merging them into one slot would lose the older.
+	ThreadID string
+	// Data is the receipt body, forwarded as-is.
+	Data json.RawMessage
+}
+
+// ParseReceiptRow reads one row of the receipts stream.
+func ParseReceiptRow(row string) (ReceiptRow, bool) {
+	r := gjson.Parse(row)
+	if !r.IsArray() {
+		return ReceiptRow{}, false
+	}
+	a := r.Array()
+	if len(a) < 3 {
+		return ReceiptRow{}, false
+	}
+	out := ReceiptRow{
+		RoomID:      a[0].String(),
+		ReceiptType: a[1].String(),
+		UserID:      a[2].String(),
+	}
+	if len(a) > 3 {
+		out.EventID = a[3].String()
+	}
+	if len(a) > 4 && a[4].Type != gjson.Null {
+		out.ThreadID = a[4].String()
+	}
+	if len(a) > 5 {
+		out.Data = json.RawMessage(a[5].Raw)
+	}
+	if out.RoomID == "" || out.UserID == "" {
+		return ReceiptRow{}, false
+	}
+	return out, true
+}
+
+// PresenceFederationRow is one row of the presence_federation stream:
+//
+//	[destination, user_id]
+//
+// The state itself is not in the row -- only who it is about and where it goes
+// -- so the sender reads the current presence from the database. That is
+// deliberate on Synapse's part: presence changes far faster than it can be
+// delivered, and sending the state as it was when the row was written would put
+// stale presence on the wire.
+type PresenceFederationRow struct {
+	Destination string
+	UserID      string
+}
+
+// ParsePresenceFederationRow reads one row of the presence_federation stream.
+func ParsePresenceFederationRow(row string) (PresenceFederationRow, bool) {
+	r := gjson.Parse(row)
+	if !r.IsArray() {
+		return PresenceFederationRow{}, false
+	}
+	a := r.Array()
+	if len(a) < 2 {
+		return PresenceFederationRow{}, false
+	}
+	out := PresenceFederationRow{Destination: a[0].String(), UserID: a[1].String()}
+	if out.Destination == "" || out.UserID == "" {
+		return PresenceFederationRow{}, false
+	}
+	return out, true
+}
+
+// FederationRow is one row of the federation stream, which carries EDUs the
+// main process or another worker wants sent.
+//
+//	["k", {"key": [...], "edu": {...}}]   a keyed EDU, e.g. typing
+//	["e", {...}]                          a plain EDU
+//	["pd", {"state": {...}, "dests": [...]}]  presence destinations
+//
+// Typing arrives this way rather than off the typing stream: the typing handler
+// runs on its own worker and hands the EDU to the federation sender through
+// here (handlers/typing.py:188).
+type FederationRow struct {
+	// Kind is "k", "e" or "pd".
+	Kind string
+	// Key identifies a keyed EDU, so a later update replaces an earlier one.
+	Key string
+	// EDUType and Content are set for "k" and "e".
+	EDUType string
+	Content json.RawMessage
+	// Destination is set for "k" and "e" when the EDU names one.
+	Destination string
+	// PresenceState and PresenceDestinations are set for "pd".
+	PresenceState        json.RawMessage
+	PresenceDestinations []string
+}
+
+// ParseFederationRow reads one row of the federation stream.
+func ParseFederationRow(row string) (FederationRow, bool) {
+	r := gjson.Parse(row)
+	if !r.IsArray() {
+		return FederationRow{}, false
+	}
+	a := r.Array()
+	if len(a) < 2 {
+		return FederationRow{}, false
+	}
+	kind := a[0].String()
+	body := a[1]
+
+	switch kind {
+	case "k":
+		edu := body.Get("edu")
+		if !edu.Exists() {
+			return FederationRow{}, false
+		}
+		return FederationRow{
+			Kind: kind,
+			// The key is a positional array; its exact shape is the sender's
+			// business, so it is used verbatim as an opaque identity rather
+			// than interpreted.
+			Key:         body.Get("key").Raw,
+			EDUType:     edu.Get("edu_type").String(),
+			Content:     json.RawMessage(edu.Get("content").Raw),
+			Destination: edu.Get("destination").String(),
+		}, true
+	case "e":
+		return FederationRow{
+			Kind:        kind,
+			EDUType:     body.Get("edu_type").String(),
+			Content:     json.RawMessage(body.Get("content").Raw),
+			Destination: body.Get("destination").String(),
+		}, true
+	case "pd":
+		var dests []string
+		for _, d := range body.Get("dests").Array() {
+			dests = append(dests, d.String())
+		}
+		return FederationRow{
+			Kind:                 kind,
+			PresenceState:        json.RawMessage(body.Get("state").Raw),
+			PresenceDestinations: dests,
+		}, true
+	}
+	return FederationRow{}, false
 }

@@ -50,6 +50,14 @@ type EDU struct {
 	// DeviceListUpTo is the device_lists_outbound_pokes stream id this unit
 	// consumed, or zero.
 	DeviceListUpTo int64
+	// Key, when set, makes this unit replace any pending unit of the same type
+	// with the same key. Typing uses it: two updates about one fact, of which
+	// only the latest is worth delivering.
+	Key string
+	// Receipts holds a merged m.receipt EDU, room -> type -> user. Encoded at
+	// transaction time rather than on arrival, since receipts keep merging in
+	// while the EDU waits.
+	Receipts map[string]map[string]map[string]receiptEntry
 }
 
 // PDU is an event waiting to go to a destination.
@@ -370,7 +378,11 @@ func (d *Destination) send(ctx context.Context, pdus []PDU, edus []EDU) error {
 		t.PDUs = append(t.PDUs, p.JSON)
 	}
 	for _, e := range edus {
-		t.EDUs = append(t.EDUs, e.Unit)
+		unit, err := e.materialise()
+		if err != nil {
+			return err
+		}
+		t.EDUs = append(t.EDUs, unit)
 	}
 
 	req, err := d.signer.Build(d.ids.Next(), d.name, t)
@@ -499,8 +511,10 @@ func (d *Destination) PeekEDUs() []txn.EDU {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	out := make([]txn.EDU, 0, len(d.pendingEDUs))
-	for _, e := range d.pendingEDUs {
-		out = append(out, e.Unit)
+	for i := range d.pendingEDUs {
+		if unit, err := d.pendingEDUs[i].materialise(); err == nil {
+			out = append(out, unit)
+		}
 	}
 	return out
 }

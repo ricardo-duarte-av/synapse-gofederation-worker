@@ -323,8 +323,12 @@ func TestPDUsWithoutEventIDGetAShortContentIdentity(t *testing.T) {
 // not built yet". The second is exactly the gap that goes unnoticed for weeks
 // because the report looked fine.
 func TestUnimplementedEDUTypesAreMarked(t *testing.T) {
+	// A type this worker does not send. Every EDU Synapse currently emits is
+	// now implemented, so the mechanism is exercised with a type that is not --
+	// the point of the test is that an unimplemented type is MARKED, not which
+	// type happens to be missing today.
 	syn := []Record{rec(SourceSynapse, "b.example", "1", nil,
-		EDU{Type: "m.typing", Content: json.RawMessage(`{"typing":true}`)},
+		EDU{Type: "m.not.implemented.here", Content: json.RawMessage(`{}`)},
 		EDU{Type: "m.direct_to_device", Content: json.RawMessage(`{"message_id":"m1"}`)},
 	)}
 	ours := []Record{rec(SourceWorker, "b.example", "1", nil,
@@ -340,8 +344,8 @@ func TestUnimplementedEDUTypesAreMarked(t *testing.T) {
 		byType[e.Type] = e
 	}
 
-	if byType["m.typing"].Implemented {
-		t.Error("m.typing is reported as implemented; this worker does not send typing")
+	if byType["m.not.implemented.here"].Implemented {
+		t.Error("an EDU type absent from eduImplemented was reported as implemented")
 	}
 	if !byType["m.direct_to_device"].Implemented {
 		t.Error("m.direct_to_device is reported as unimplemented; it is sent")

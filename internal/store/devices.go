@@ -303,3 +303,49 @@ func crossSigningPseudoDeviceID(keyData []byte) string {
 	})
 	return version
 }
+
+// PresenceState is a user's current presence, for an m.presence EDU.
+type PresenceState struct {
+	UserID          string
+	State           string
+	LastActiveTS    int64
+	StatusMsg       string
+	CurrentlyActive bool
+}
+
+// GetPresenceStates reads the current presence for a set of users.
+//
+// Read at send time rather than taken from the replication row, because the row
+// carries only who the update is about and where it goes. Presence changes far
+// faster than it can be delivered, so a state captured when the row was written
+// would often be stale by the time the transaction goes out -- and stale
+// presence is worse than none: it says someone is online who left.
+func (s *Store) GetPresenceStates(ctx context.Context, userIDs []string) (map[string]PresenceState, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	const q = `
+		SELECT DISTINCT ON (user_id) user_id, state,
+		       COALESCE(last_active_ts, 0), COALESCE(status_msg, ''),
+		       COALESCE(currently_active, false)
+		FROM presence_stream
+		WHERE user_id = ANY($1)
+		ORDER BY user_id, stream_id DESC`
+
+	rows, err := s.pool.Query(ctx, q, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: presence states: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]PresenceState, len(userIDs))
+	for rows.Next() {
+		var p PresenceState
+		if err := rows.Scan(&p.UserID, &p.State, &p.LastActiveTS, &p.StatusMsg,
+			&p.CurrentlyActive); err != nil {
+			return nil, fmt.Errorf("store: presence states: %w", err)
+		}
+		out[p.UserID] = p
+	}
+	return out, rows.Err()
+}

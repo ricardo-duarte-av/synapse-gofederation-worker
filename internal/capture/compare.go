@@ -117,6 +117,9 @@ var eduImplemented = map[string]bool{
 	"m.device_list_update":          true,
 	"m.signing_key_update":          true,
 	"org.matrix.signing_key_update": true,
+	"m.receipt":                     true,
+	"m.typing":                      true,
+	"m.presence":                    true,
 }
 
 // eduComparable says whether an EDU type's content can be compared at all.
