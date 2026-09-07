@@ -34,8 +34,8 @@ Implemented: PDU routing, to-device and device-list EDUs, per-destination
 queues, transaction assembly and signing, the persisted shadow record, metrics.
 
 Not yet: the real HTTP sender (server discovery, well-known, SRV, backoff),
-receipts, typing and presence EDUs, catch-up, and the full
-`m.device_list_update` body (`prev_id`, `deleted`, `keys`,
+receipts, typing and presence EDUs, catch-up, full state resolution for forked
+DAGs, and the full `m.device_list_update` body (`prev_id`, `deleted`, `keys`,
 `device_display_name`).
 
 ## The three rules
@@ -65,6 +65,9 @@ Against the live deployment, over ~9,000 real events:
   since it HTML-escapes `<`, `>` and `&` and canonical JSON does not.
 - **It is inert.** KeyDB `MONITOR` while it ran shows one `SUBSCRIBE` and not
   one publish carrying our name.
+- **Destinations are resolved exactly** for 95.6% of routing decisions, from
+  the state before the event via its prev events' state group — the same thing
+  Synapse computes, not an approximation of it.
 
 ```sh
 go test ./...                     # unit tests, no database needed
@@ -110,11 +113,17 @@ and flipping it is a decision read from the difflog rather than from the code
 looking finished. The gate is a sustained match against the sender being
 shadowed, which is why those counters are persisted across restarts.
 
-The number to watch is `gofed_approximate_routes_total`: this worker resolves
-destinations from *current* room state, where Synapse resolves the state
-*before* the event. That is the one known difference from Synapse's algorithm
-rather than a bug we hope is absent, and sizing it is the main thing the shadow
-is for.
+The number to watch is `gofed_approximate_routes_total`, which counts routing
+decisions that fell back to current room state instead of resolving the state
+before the event as Synapse does. It is labelled by cause, and the two causes
+mean different things: `forked dag` is work not done here — full state
+resolution is room-version-specific and expensive — while
+`prev event has no state group` is an outlier nobody could have resolved.
+
+Over 14,485 production events it sits at **4.4% of routing decisions** (20 of
+450), all forked DAGs. Everything else is resolved exactly, because 98% of
+local events have a single prev event and therefore a single state group with
+nothing to resolve.
 
 ## Documentation
 
