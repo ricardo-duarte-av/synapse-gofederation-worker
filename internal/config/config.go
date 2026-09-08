@@ -249,6 +249,30 @@ type QueueConfig struct {
 	// EventBatchLimit is the `limit` of the event pickup query, Synapse's 100.
 	EventBatchLimit int `yaml:"event_batch_limit"`
 
+	// PresenceBatchStates flushes a destination's held presence once this many
+	// user states are waiting. Zero disables batching entirely.
+	//
+	// Presence only. Typing and receipts are never held -- typing is a
+	// statement about this instant and a remote expires it after a minute, and
+	// a receipt arriving late defeats its purpose. Both also act as flush
+	// triggers, so held presence rides along with them for free.
+	PresenceBatchStates int `yaml:"presence_batch_states"`
+
+	// PresenceBatchMaxWaitSeconds bounds how long the OLDEST held presence
+	// state waits before it is sent regardless of how few there are.
+	//
+	// This is a deliberate divergence from Synapse, not a gap being closed.
+	// Synapse staggers wakeups by about 20ms (_DestinationWakeupQueue), for a
+	// different reason -- avoiding a stampede of TLS handshakes -- so it
+	// batches only incidentally. At this deployment's rate of roughly one
+	// presence row per destination every few seconds, 20ms accumulates nothing;
+	// seconds are needed before a second state ever arrives to merge with.
+	//
+	// The cost of holding is not ours. A transaction carrying one presence
+	// state costs the RECEIVING server a request, an encoding and a signature
+	// verification, the same as one carrying fifty.
+	PresenceBatchMaxWaitSeconds int `yaml:"presence_batch_max_wait_seconds"`
+
 	// TransactionIDPrefix namespaces our transaction ids away from Synapse's.
 	//
 	// A receiving Synapse deduplicates on (origin, transaction_id) and returns
@@ -310,6 +334,10 @@ func Parse(data []byte) (*Config, error) {
 			MaxPDUsPerTransaction:     SynapseMaxPDUsPerTransaction,
 			MaxEDUsPerTransaction:     SynapseMaxEDUsPerTransaction,
 			EventBatchLimit:           SynapseEventBatchLimit,
+			PresenceBatchStates:       SynapseMaxEDUsPerTransaction / 2,
+			// Held long enough to be worth holding. See the field comment for
+			// why this is seconds rather than Synapse's milliseconds.
+			PresenceBatchMaxWaitSeconds: 30,
 		},
 		Resolution: ResolutionConfig{HostCacheEntries: destinations.DefaultHostCacheEntries},
 		Metrics:    MetricsConfig{Addr: ":9202"},
@@ -354,6 +382,11 @@ func (c *Config) TransactionIDPrefix() string {
 		return txn.DefaultIDPrefix
 	}
 	return *c.Queue.TransactionIDPrefix
+}
+
+// PresenceBatchMaxWait is how long held presence may wait.
+func (c *Config) PresenceBatchMaxWait() time.Duration {
+	return time.Duration(c.Queue.PresenceBatchMaxWaitSeconds) * time.Second
 }
 
 // ConnectTimeout is the database connect timeout.
@@ -425,6 +458,12 @@ func (c *Config) validate() error {
 		if f.value < 1 {
 			return fmt.Errorf("config: %s must be at least 1, got %d", f.name, f.value)
 		}
+	}
+	if c.Queue.PresenceBatchStates < 0 || c.Queue.PresenceBatchMaxWaitSeconds < 0 {
+		return fmt.Errorf("config: queue.presence_batch_states and "+
+			"queue.presence_batch_max_wait_seconds cannot be negative, got %d and %d; "+
+			"set either to 0 to send presence as soon as it arrives",
+			c.Queue.PresenceBatchStates, c.Queue.PresenceBatchMaxWaitSeconds)
 	}
 	if !c.ShadowEnabled() {
 		// Leaving shadow mode is the one change here with consequences

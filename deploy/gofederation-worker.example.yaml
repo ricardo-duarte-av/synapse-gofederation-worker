@@ -194,6 +194,28 @@ queue:
   max_edus_per_transaction: 100
   event_batch_limit: 100
 
+  # Hold presence back so it can accumulate into one EDU and one transaction.
+  #
+  # PRESENCE ONLY. Typing and receipts are never held: typing is a statement
+  # about this instant and a remote expires it after a minute, and a read
+  # receipt arriving late is the thing a read receipt is for. Both also act as
+  # flush triggers, so held presence rides along with them for free, as it does
+  # with any PDU.
+  #
+  # The cost this avoids is not ours. A transaction carrying one presence state
+  # costs the RECEIVING server a request, a canonical JSON encoding and an
+  # ed25519 verification -- the same as one carrying fifty. Before this, 96% of
+  # this worker's transactions carried a single EDU.
+  #
+  # A deliberate divergence from Synapse, which staggers wakeups by about 20ms
+  # to avoid a stampede of TLS handshakes and so batches only incidentally. At
+  # roughly one presence row per destination every few seconds, 20ms
+  # accumulates nothing.
+  #
+  # Set either to 0 to send presence as soon as it arrives.
+  presence_batch_states: 50
+  presence_batch_max_wait_seconds: 30
+
   # Namespaces our transaction ids away from Synapse's own senders'.
   #
   # A receiving Synapse deduplicates on (origin, transaction_id) and returns

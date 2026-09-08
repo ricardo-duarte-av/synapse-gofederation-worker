@@ -36,6 +36,7 @@ type Manager struct {
 	onEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	onOutcome     func(destination string, delivered bool)
 	due           func(destination string) bool
+	batch         BatchConfig
 	longBackoff   func(destination string) bool
 	onEDUsDropped func(destination string, n int)
 
@@ -66,6 +67,8 @@ type ManagerConfig struct {
 	OnEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
 	OnOutcome     func(destination string, delivered bool)
 	Due           func(destination string) bool
+	// Batch holds presence back so it can accumulate; see queue.BatchConfig.
+	Batch BatchConfig
 	// LongBackoff reports whether a destination will not be retried for at
 	// least CatchUpRetryInterval, which is when its ephemeral EDUs are dropped
 	// rather than held forever. See Destination.Run.
@@ -91,6 +94,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		onEDUsSent:    cfg.OnEDUsSent,
 		onOutcome:     cfg.OnOutcome,
 		due:           cfg.Due,
+		batch:         cfg.Batch,
 		longBackoff:   cfg.LongBackoff,
 		onEDUsDropped: cfg.OnEDUsDropped,
 		dests:         map[string]*Destination{},
@@ -129,6 +133,7 @@ func (m *Manager) Get(name string) *Destination {
 		return d
 	}
 	d = NewDestination(Config{
+		Batch:         m.batch,
 		Name:          name,
 		Limits:        m.limits,
 		Signer:        m.signer,
@@ -142,6 +147,10 @@ func (m *Manager) Get(name string) *Destination {
 		LongBackoff:   m.longBackoff,
 		OnEDUsDropped: m.onEDUsDropped,
 	})
+	// The destination needs to be able to re-run its own loop when a batching
+	// hold expires, and the Manager owns the concurrency bound, so the hook is
+	// wired after construction rather than passed in.
+	d.wake = func() { m.Wake(d) }
 	m.dests[name] = d
 	return d
 }

@@ -1,7 +1,13 @@
 # Batching EDUs per destination
 
-Not implemented. This is the design and the evidence for it, written down during
-the soak so the numbers that motivated it do not have to be rediscovered.
+Implemented for presence, in two parts: `EnqueuePresence` merges states into one
+EDU, and `queue.BatchConfig` holds that EDU back so states have time to arrive.
+
+The second part is what makes the first work, which was not obvious and cost a
+deploy to learn. Merging alone shipped first and did nothing at all: 516 states
+in 516 EDUs, a ratio of exactly 1.000. Every enqueue woke the destination and
+drained the queue before a second state could arrive, so there was never
+anything to merge with. The two halves are one change.
 
 ## The observation
 
@@ -62,15 +68,17 @@ What is proposed here is more aggressive by three orders of magnitude, and is
 therefore a deliberate divergence rather than closing a gap. It should be
 configurable, and its default should be defensible on its own terms.
 
-## The proposal
+## What was built
 
-Hold EDU-only transactions per destination until either:
+`queue.presence_batch_states` (50) and `queue.presence_batch_max_wait_seconds`
+(30), either at 0 to disable. Presence is held until enough states have gathered
+or the OLDEST held state has waited long enough -- not "time since the last
+transmission", which sounds equivalent but makes the delay depend on when the
+previous send happened rather than bounding the staleness of what is held.
 
-- pending EDUs reach a threshold (default around 50), or
-- time since that destination's last transmission exceeds a deadline
-  (default around 30s).
-
-Both configurable, because the right trade differs by deployment.
+Typing and receipts are excluded, and need no code path of their own: anything
+in the queue that is not presence makes the hold return zero, so the whole
+transaction goes at once and any held presence rides along. A PDU does the same.
 
 ## What the design has to get right
 

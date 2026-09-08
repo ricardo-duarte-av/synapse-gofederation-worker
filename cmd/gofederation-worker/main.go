@@ -325,6 +325,11 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	})
 
 	w.queues = queue.NewManager(queue.ManagerConfig{
+		// Presence only, and never typing or receipts; see queue.BatchConfig.
+		Batch: queue.BatchConfig{
+			MaxStates: cfg.Queue.PresenceBatchStates,
+			MaxWait:   cfg.PresenceBatchMaxWait(),
+		},
 		Limits: queue.Limits{
 			MaxPDUs: cfg.Queue.MaxPDUsPerTransaction,
 			MaxEDUs: cfg.Queue.MaxEDUsPerTransaction,

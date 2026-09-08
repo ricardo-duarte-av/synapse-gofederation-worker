@@ -151,6 +151,17 @@ type Destination struct {
 	// outageLogged keeps one outage to one log line. Guarded by the loop, which
 	// is single-threaded per destination.
 	outageLogged bool
+
+	batch BatchConfig
+	wake  func()
+	// heldSince is when the presence currently waiting was first held back.
+	// Zero when nothing is being held.
+	heldSince time.Time
+	// holdTimer wakes the loop when a hold expires, so a destination with
+	// nothing but held presence still sends. Without it the loop only ever runs
+	// when something new arrives, and the last few states before a quiet period
+	// would wait for the next one indefinitely.
+	holdTimer *time.Timer
 }
 
 // Config builds a Destination.
@@ -173,6 +184,36 @@ type Config struct {
 	// is in a long outage, so the count is visible rather than inferred from a
 	// queue that stopped growing.
 	OnEDUsDropped func(destination string, n int)
+	// Batch holds presence back so it can accumulate. Zero disables it.
+	Batch BatchConfig
+	// Wake re-runs this destination's loop, used when a hold expires. Set by
+	// the Manager, which owns the concurrency bound.
+	Wake func()
+}
+
+// BatchConfig is how long presence may be held to accumulate.
+//
+// PRESENCE ONLY. Typing and receipts are never held: typing is a statement
+// about this instant and a remote expires it after a minute, and a read receipt
+// arriving late is the thing a read receipt is for. Both are also natural flush
+// triggers -- when one is queued the whole transaction goes at once, and any
+// presence waiting rides along for free.
+//
+// The point is not our own throughput. A transaction carrying one presence
+// state costs the RECEIVING server an HTTP request, a canonical JSON encoding
+// and an ed25519 verification, all of it the same cost as carrying fifty. At
+// 96% of this worker's transactions being a single EDU, that is load we are
+// putting on everyone else's servers for no reason.
+type BatchConfig struct {
+	// MaxStates flushes once this many presence states are waiting. Synapse's
+	// per-EDU bound is 50 (per_destination_queue.py:79), so more than that in
+	// one transaction means more than one EDU.
+	MaxStates int
+	// MaxWait bounds how long the OLDEST held state waits. Chosen over "time
+	// since the last transmission", which sounds equivalent and is not: it
+	// makes the delay depend on when the previous send happened rather than
+	// bounding the staleness of the data being held.
+	MaxWait time.Duration
 }
 
 // NewDestination builds a queue for one remote server.
@@ -201,6 +242,8 @@ func NewDestination(cfg Config) *Destination {
 		onEDUsSent:    cfg.OnEDUsSent,
 		onOutcome:     cfg.OnOutcome,
 		due:           cfg.Due,
+		batch:         cfg.Batch,
+		wake:          cfg.Wake,
 	}
 }
 
@@ -347,6 +390,18 @@ func (d *Destination) Run(ctx context.Context) {
 		// Cleared at the TOP, so anything enqueued during the send below is
 		// seen by the next iteration rather than lost.
 		d.newData = false
+
+		// Hold presence back, if there is nothing else to send and it has not
+		// waited long enough. Everything else -- a PDU, typing, a receipt, a
+		// device EDU -- flushes the whole queue immediately and takes any held
+		// presence with it.
+		if wait := d.holdForLocked(time.Now()); wait > 0 {
+			d.scheduleFlushLocked(wait)
+			d.mu.Unlock()
+			return
+		}
+		d.heldSince = time.Time{}
+
 		batch, err := d.takeLocked()
 		d.mu.Unlock()
 		if err != nil {
@@ -496,6 +551,58 @@ func (d *Destination) dropEphemeralEDUs() int {
 	// backing array; a fresh slice lets them be collected, which is the point.
 	d.pendingEDUs = append([]EDU(nil), kept...)
 	return dropped
+}
+
+// holdForLocked reports how much longer presence should be held, or zero to
+// send now.
+//
+// Anything that is not presence sends immediately, which is what keeps typing
+// and receipts out of the batching without a second code path for them: they
+// are in the same queue, so their presence returns zero and the whole
+// transaction goes.
+func (d *Destination) holdForLocked(now time.Time) time.Duration {
+	if d.batch.MaxWait <= 0 || d.batch.MaxStates <= 0 {
+		return 0
+	}
+	if len(d.pendingPDUs) > 0 || len(d.pendingEDUs) == 0 {
+		return 0
+	}
+
+	states := 0
+	for i := range d.pendingEDUs {
+		if d.pendingEDUs[i].Presence == nil {
+			// Typing, a receipt, a device EDU: not ours to delay.
+			return 0
+		}
+		states += len(d.pendingEDUs[i].Presence)
+	}
+	if states >= d.batch.MaxStates {
+		return 0
+	}
+
+	if d.heldSince.IsZero() {
+		d.heldSince = now
+	}
+	if remaining := d.batch.MaxWait - now.Sub(d.heldSince); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+// scheduleFlushLocked arranges for the loop to run again when the hold expires.
+//
+// One timer at a time: a destination receiving a state every second would
+// otherwise stack a timer per arrival, all firing on the same queue.
+func (d *Destination) scheduleFlushLocked(wait time.Duration) {
+	if d.holdTimer != nil || d.wake == nil {
+		return
+	}
+	d.holdTimer = time.AfterFunc(wait, func() {
+		d.mu.Lock()
+		d.holdTimer = nil
+		d.mu.Unlock()
+		d.wake()
+	})
 }
 
 func (d *Destination) dequeue(pdus, edus int) {

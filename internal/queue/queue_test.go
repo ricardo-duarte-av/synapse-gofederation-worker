@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sink"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
@@ -640,3 +641,161 @@ func TestLongOutageLogsOncePerOutage(t *testing.T) {
 type funcWriter func(p []byte) (int, error)
 
 func (f funcWriter) Write(p []byte) (int, error) { return f(p) }
+
+// batchDestination builds a destination that holds presence.
+func batchDestination(t *testing.T, s sink.Sink, b BatchConfig) *Destination {
+	t.Helper()
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard), Batch: b,
+	})
+	d.wake = func() { d.Attempt(context.Background()) }
+	return d
+}
+
+func presenceOf(userID string) EDU {
+	return EDU{
+		Unit: txn.EDU{Type: txn.EDUTypePresence},
+		Presence: map[string]PresenceEntry{userID: {
+			UserID: userID,
+			Encode: func(int64) json.RawMessage {
+				return json.RawMessage(`{"user_id":"` + userID + `"}`)
+			},
+		}},
+	}
+}
+
+// Presence alone waits, so that a second state has a chance to arrive and merge
+// into the same EDU. Without the hold the queue drains on every enqueue and
+// nothing ever accumulates -- which is exactly what happened in production:
+// 516 states in 516 EDUs, a ratio of 1.000.
+func TestPresenceIsHeldToAccumulate(t *testing.T) {
+	s := &recordingSink{}
+	d := batchDestination(t, s, BatchConfig{MaxStates: 50, MaxWait: time.Minute})
+
+	d.EnqueuePresence(presenceOf("@a:x").Presence["@a:x"])
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to settle", func() bool { return !d.isRunning() })
+
+	if n := len(s.sent()); n != 0 {
+		t.Errorf("sent %d transactions, want presence held back", n)
+	}
+	if _, edus := d.Pending(); edus != 1 {
+		t.Errorf("%d EDUs pending, want the held one", edus)
+	}
+}
+
+// A PDU is what a user is waiting for. It flushes immediately and takes any
+// held presence with it, which is where a good part of the batching comes from
+// at no latency cost.
+func TestPDUFlushesHeldPresence(t *testing.T) {
+	s := &recordingSink{}
+	d := batchDestination(t, s, BatchConfig{MaxStates: 50, MaxWait: time.Minute})
+
+	d.EnqueuePresence(presenceOf("@a:x").Presence["@a:x"])
+	d.Attempt(context.Background())
+	waitFor(t, "the hold", func() bool { return !d.isRunning() })
+
+	d.EnqueuePDU(pdu("$e", 1))
+	d.Attempt(context.Background())
+	waitFor(t, "the flush", func() bool {
+		p, e := d.Pending()
+		return p == 0 && e == 0
+	})
+	if n := len(s.sent()); n != 1 {
+		t.Fatalf("sent %d transactions, want one carrying both", n)
+	}
+}
+
+// Typing and receipts are excluded from batching by design: typing is about
+// this instant and a remote expires it after a minute, and a late read receipt
+// defeats its purpose. Neither needs its own code path -- being in the queue is
+// enough, because anything that is not presence flushes the whole transaction.
+func TestTypingAndReceiptsAreNotHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enqueue func(*Destination)
+	}{
+		{"typing", func(d *Destination) {
+			d.EnqueueKeyedEDU("!r|@a:x", txn.EDU{
+				Type: txn.EDUTypeTyping, Content: json.RawMessage(`{}`)})
+		}},
+		{"receipt", func(d *Destination) {
+			d.EnqueueReceipt("!r:x", "m.read", "@a:x", "", json.RawMessage(`{"ts":1}`))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &recordingSink{}
+			d := batchDestination(t, s, BatchConfig{MaxStates: 50, MaxWait: time.Minute})
+
+			d.EnqueuePresence(presenceOf("@held:x").Presence["@held:x"])
+			d.Attempt(context.Background())
+			waitFor(t, "the hold", func() bool { return !d.isRunning() })
+
+			tc.enqueue(d)
+			d.Attempt(context.Background())
+			waitFor(t, "the flush", func() bool {
+				_, e := d.Pending()
+				return e == 0
+			})
+			if n := len(s.sent()); n != 1 {
+				t.Errorf("sent %d transactions, want %s to have flushed at once", n, tc.name)
+			}
+		})
+	}
+}
+
+// Enough states flush without waiting for the deadline.
+func TestPresenceFlushesAtTheStateLimit(t *testing.T) {
+	s := &recordingSink{}
+	d := batchDestination(t, s, BatchConfig{MaxStates: 3, MaxWait: time.Hour})
+
+	for _, u := range []string{"@a:x", "@b:x", "@c:x"} {
+		d.EnqueuePresence(presenceOf(u).Presence[u])
+		d.Attempt(context.Background())
+	}
+	waitFor(t, "the flush at the limit", func() bool {
+		_, e := d.Pending()
+		return e == 0
+	})
+	if n := len(s.sent()); n != 1 {
+		t.Fatalf("sent %d transactions, want one holding all three", n)
+	}
+	body := s.sent()[0].Body
+	if n := len(gjson.GetBytes(body, "edus").Array()); n != 1 {
+		t.Errorf("%d EDUs in the transaction, want the three states merged into one", n)
+	}
+	if n := len(gjson.GetBytes(body, "edus.0.content.push").Array()); n != 3 {
+		t.Errorf("%d states in the EDU, want 3", n)
+	}
+}
+
+// The deadline must fire on its own. A destination holding presence with
+// nothing further arriving would otherwise wait forever: the loop only runs
+// when something wakes it.
+func TestHeldPresenceIsSentWhenTheDeadlinePasses(t *testing.T) {
+	s := &recordingSink{}
+	d := batchDestination(t, s, BatchConfig{MaxStates: 50, MaxWait: 40 * time.Millisecond})
+
+	d.EnqueuePresence(presenceOf("@a:x").Presence["@a:x"])
+	d.Attempt(context.Background())
+
+	waitFor(t, "the deadline to flush it", func() bool { return len(s.sent()) == 1 })
+	if _, e := d.Pending(); e != 0 {
+		t.Errorf("%d EDUs still pending after the deadline", e)
+	}
+}
+
+// Zero disables it, which must mean "send immediately" and not "hold forever".
+func TestBatchingDisabledSendsImmediately(t *testing.T) {
+	s := &recordingSink{}
+	d := batchDestination(t, s, BatchConfig{})
+
+	d.EnqueuePresence(presenceOf("@a:x").Presence["@a:x"])
+	d.Attempt(context.Background())
+	waitFor(t, "the send", func() bool { return len(s.sent()) == 1 })
+}
