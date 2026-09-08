@@ -430,3 +430,36 @@ func TestAMissingOverrideNamesItself(t *testing.T) {
 		t.Errorf("error does not name the path that failed: %v", err)
 	}
 }
+
+// presence.enabled is a bool OR the string "untracked" (config/server.py:507),
+// and "untracked" is the case a plain bool field gets exactly backwards:
+// Python's bool("untracked") is TRUE, so presence stays on for clients while
+// federating it is off.
+func TestTrackPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"absent defaults to on", "", true},
+		{"presence.enabled true", "presence:\n  enabled: true\n", true},
+		{"presence.enabled false", "presence:\n  enabled: false\n", false},
+		{"untracked is NOT tracked", "presence:\n  enabled: \"untracked\"\n", false},
+		{"legacy use_presence false", "use_presence: false\n", false},
+		{"legacy use_presence true", "use_presence: true\n", true},
+		// presence.enabled wins over the legacy key when both are present.
+		{"presence.enabled overrides use_presence",
+			"use_presence: true\npresence:\n  enabled: false\n", false},
+		{"empty presence block falls back", "presence:\n  include_offline_users_on_sync: true\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, minimal+tc.yaml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.TrackPresence != tc.want {
+				t.Errorf("TrackPresence = %t, want %t", cfg.TrackPresence, tc.want)
+			}
+		})
+	}
+}

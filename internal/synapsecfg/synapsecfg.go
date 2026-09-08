@@ -126,6 +126,17 @@ type Config struct {
 	MaxLongRetries    int
 	MaxLongRetryDelay time.Duration
 
+	// TrackPresence is Synapse's config.server.track_presence.
+	//
+	// Read because Synapse's sender refuses to send presence when it is off,
+	// regardless of what reaches it (federation/sender/__init__.py:978). In
+	// normal operation no presence rows are produced either, so this is a
+	// second line rather than the only one -- but the case it covers is real:
+	// presence_enabled "untracked" leaves presence working for CLIENTS while
+	// forbidding it over federation, and a config change does not empty a queue
+	// that already has presence in it.
+	TrackPresence bool
+
 	// AllowDeviceNameLookup is allow_device_name_lookup_over_federation. It
 	// decides whether a device list update may carry device_display_name, so
 	// reading it rather than assuming is the difference between matching
@@ -198,6 +209,13 @@ type raw struct {
 		MaxShortRetries             *int    `yaml:"max_short_retries"`
 		MaxShortRetryDelay          any     `yaml:"max_short_retry_delay"`
 	} `yaml:"federation"`
+
+	// Presence.Enabled is a bool OR the string "untracked", and falls back to
+	// the legacy use_presence key (config/server.py:507).
+	Presence struct {
+		Enabled any `yaml:"enabled"`
+	} `yaml:"presence"`
+	UsePresence any `yaml:"use_presence"`
 
 	FederationDomainWhitelist []string `yaml:"federation_domain_whitelist"`
 	AllowDeviceNameLookup     *bool    `yaml:"allow_device_name_lookup_over_federation"`
@@ -305,6 +323,8 @@ func LoadWithOptions(path string, opts Options) (*Config, error) {
 	if r.Federation.MaxLongRetries != nil {
 		cfg.MaxLongRetries = *r.Federation.MaxLongRetries
 	}
+
+	cfg.TrackPresence = trackPresence(r)
 
 	// Defaults to false in Synapse (config/federation.py), so an absent key
 	// means device names are NOT sent.
@@ -684,4 +704,41 @@ func database(r raw) (Database, error) {
 			"synapsecfg: database.args names no database (neither `database` nor `dbname`)")
 	}
 	return db, nil
+}
+
+// trackPresence reproduces config/server.py:507.
+//
+//	presence_enabled = presence.enabled, else use_presence, else true
+//	presence_enabled_at_all = bool(presence_enabled)
+//	track_presence = presence_enabled_at_all and presence_enabled != "untracked"
+//
+// The string "untracked" is the reason this is not a bool in the yaml: Python's
+// bool("untracked") is TRUE, so presence stays on for clients while federation
+// of it is off. Reading the key as a plain bool would get that case exactly
+// backwards.
+func trackPresence(r raw) bool {
+	v := r.Presence.Enabled
+	if v == nil {
+		v = r.UsePresence
+	}
+	if v == nil {
+		// Synapse's default for the legacy key.
+		return true
+	}
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		if t == "untracked" {
+			return false
+		}
+		// Python truthiness: any non-empty string is true.
+		return t != ""
+	case int:
+		return t != 0
+	case float64:
+		return t != 0
+	default:
+		return true
+	}
 }

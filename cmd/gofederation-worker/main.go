@@ -406,11 +406,12 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	})
 
 	w.ephemeral = sender.NewEphemeral(sender.EphemeralConfig{
-		Store:        w.db,
-		Queues:       w.queues,
-		Log:          log,
-		ServerName:   cfg.ServerName,
-		ShouldHandle: cfg.ShouldHandle,
+		Store:         w.db,
+		Queues:        w.queues,
+		Log:           log,
+		ServerName:    cfg.ServerName,
+		ShouldHandle:  cfg.ShouldHandle,
+		TrackPresence: cfg.Synapse.TrackPresence,
 		// The hour of slack is Synapse's retry_due_within_ms, passed as
 		// CATCHUP_RETRY_INTERVAL wherever it decides whether an ephemeral EDU
 		// is worth building at all.

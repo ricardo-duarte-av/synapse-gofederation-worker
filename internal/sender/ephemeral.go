@@ -48,6 +48,9 @@ type Ephemeral struct {
 
 	serverName   string
 	shouldHandle func(destination string) bool
+	// trackPresence mirrors Synapse's config.server.track_presence. When it is
+	// off, presence is not federated at all, whatever reaches this worker.
+	trackPresence bool
 	// dueWithin reports whether a destination is worth building an EDU for:
 	// due now, or due within the hour. Synapse asks the same question before
 	// every ephemeral send (federation/sender/__init__.py:915,994) and the
@@ -62,6 +65,18 @@ type EphemeralConfig struct {
 	Log          zerolog.Logger
 	ServerName   string
 	ShouldHandle func(destination string) bool
+	// TrackPresence comes from homeserver.yaml's presence.enabled. False means
+	// presence is not federated, matching Synapse's own guard.
+	//
+	// The zero value is FALSE, so a caller that forgets this field silently
+	// sends no presence at all. That is the safe direction -- never sending
+	// something the homeserver disabled beats sending it -- but it is the same
+	// shape of trap as ProactivelySend in internal/destinations, where the
+	// default runs the other way and a wrong guess would drop all federation.
+	// There is one production construction site and it reads
+	// synapsecfg.Config.TrackPresence, which defaults to true when the key is
+	// absent, as Synapse does.
+	TrackPresence bool
 	// DueWithin reports whether a destination is due now or within the hour.
 	// Nil means every destination is treated as due, which is what a test or a
 	// worker with no backoff wants.
@@ -73,7 +88,7 @@ func NewEphemeral(cfg EphemeralConfig) *Ephemeral {
 	return &Ephemeral{
 		store: cfg.Store, queues: cfg.Queues, log: cfg.Log,
 		serverName: cfg.ServerName, shouldHandle: cfg.ShouldHandle,
-		dueWithin: cfg.DueWithin,
+		dueWithin: cfg.DueWithin, trackPresence: cfg.TrackPresence,
 	}
 }
 
@@ -172,6 +187,15 @@ func (e *Ephemeral) HandleEDU(destination, eduType string, content json.RawMessa
 // was written is often already wrong. Stale presence is worse than none -- it
 // says somebody is online who has left.
 func (e *Ephemeral) HandlePresence(ctx context.Context, destination string, userIDs []string) error {
+	// The homeserver's own switch, checked before anything else. Synapse's
+	// sender refuses here too, whatever reaches it
+	// (federation/sender/__init__.py:978). With presence disabled no rows are
+	// produced either, so this is a second line -- but "untracked" leaves
+	// presence working for CLIENTS while forbidding it over federation, and a
+	// config change does not empty a queue that already holds some.
+	if !e.trackPresence {
+		return nil
+	}
 	if !e.shouldHandle(destination) || destination == e.serverName || len(userIDs) == 0 {
 		return nil
 	}

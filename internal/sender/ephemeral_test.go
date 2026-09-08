@@ -73,8 +73,9 @@ func TestPresenceSkipsBackingOffDestinationsBeforeAnyWork(t *testing.T) {
 	m := ephemeralQueues(t)
 	e := NewEphemeral(EphemeralConfig{
 		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
-		ShouldHandle: func(string) bool { return true },
-		DueWithin:    func(d string) bool { return d == "up.example" },
+		ShouldHandle:  func(string) bool { return true },
+		TrackPresence: true,
+		DueWithin:     func(d string) bool { return d == "up.example" },
 	})
 
 	ctx := context.Background()
@@ -105,8 +106,9 @@ func TestReceiptSkipsBackingOffDestinations(t *testing.T) {
 	m := ephemeralQueues(t)
 	e := NewEphemeral(EphemeralConfig{
 		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
-		ShouldHandle: func(string) bool { return true },
-		DueWithin:    func(d string) bool { return d == "up.example" },
+		ShouldHandle:  func(string) bool { return true },
+		TrackPresence: true,
+		DueWithin:     func(d string) bool { return d == "up.example" },
 	})
 
 	err := e.HandleReceipt(context.Background(), ReceiptUpdate{
@@ -136,7 +138,8 @@ func TestEphemeralWithNoBackoffSendsToEveryone(t *testing.T) {
 	m := ephemeralQueues(t)
 	e := NewEphemeral(EphemeralConfig{
 		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
-		ShouldHandle: func(string) bool { return true },
+		ShouldHandle:  func(string) bool { return true },
+		TrackPresence: true,
 	})
 	if err := e.HandlePresence(context.Background(), "a.example",
 		[]string{"@alice:example.com"}); err != nil {
@@ -160,7 +163,8 @@ func TestPresenceForOneDestinationMergesAcrossCalls(t *testing.T) {
 	m := ephemeralQueues(t)
 	e := NewEphemeral(EphemeralConfig{
 		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
-		ShouldHandle: func(string) bool { return true },
+		ShouldHandle:  func(string) bool { return true },
+		TrackPresence: true,
 	})
 
 	ctx := context.Background()
@@ -194,5 +198,39 @@ func TestPresenceLastActiveAgoUsesSendTime(t *testing.T) {
 	if atSend["last_active_ago"].(int64) != 90_000 {
 		t.Errorf("last_active_ago 30s later = %v, want 90000 -- it must grow with the wait",
 			atSend["last_active_ago"])
+	}
+}
+
+// The homeserver's own switch. Synapse's sender refuses to send presence when
+// track_presence is off whatever reaches it
+// (federation/sender/__init__.py:978), and this is the second line of that:
+// with presence disabled no rows are produced either.
+//
+// The case it actually covers is presence_enabled "untracked", which leaves
+// presence working for CLIENTS while forbidding it over federation -- so rows
+// can still exist while sending them is wrong.
+func TestPresenceNotSentWhenTheHomeserverDisablesIt(t *testing.T) {
+	st := &fakeEphemeralStore{
+		hosts: []string{"remote.example"},
+		presence: map[string]store.PresenceState{
+			"@alice:example.com": {UserID: "@alice:example.com", State: "online"},
+		},
+	}
+	m := ephemeralQueues(t)
+	e := NewEphemeral(EphemeralConfig{
+		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
+		ShouldHandle:  func(string) bool { return true },
+		TrackPresence: false,
+	})
+
+	if err := e.HandlePresence(context.Background(), "remote.example",
+		[]string{"@alice:example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if st.presenceReads != 0 {
+		t.Error("read presence from the database although the homeserver has it disabled")
+	}
+	if _, edus := m.Get("remote.example").Pending(); edus != 0 {
+		t.Errorf("queued %d presence EDUs although the homeserver has it disabled", edus)
 	}
 }

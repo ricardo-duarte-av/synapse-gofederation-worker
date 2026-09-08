@@ -48,6 +48,7 @@ func (w *worker) run(ctx context.Context) error {
 		Str("worker_name", w.cfg.WorkerName).
 		Str("mode", string(w.cfg.Mode)).
 		Str(shard, w.cfg.ShardInstance).
+		Bool("presence", w.cfg.Synapse.TrackPresence).
 		Strs("senders", w.cfg.Synapse.SenderInstances).
 		Str("signing_key", key.ID()).
 		Str("redis", w.cfg.RedisAddress).
