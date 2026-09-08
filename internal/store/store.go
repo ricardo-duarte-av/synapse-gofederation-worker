@@ -20,6 +20,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
 )
 
 // Store holds a pool of read-only connections to Synapse's database.
@@ -37,6 +39,9 @@ type Config struct {
 	MaxConns int32
 	// ConnectTimeout bounds the initial connection.
 	ConnectTimeout time.Duration
+	// OnQuery is told about every query this pool runs, labelled by
+	// dbtrace.WithQueryName. Optional; nil disables tracing.
+	OnQuery dbtrace.Observer
 }
 
 // Open connects and verifies the database is reachable.
@@ -68,6 +73,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	// and typed arrays, which are none of those. It is also one round trip
 	// rather than two, so it is faster than what it replaces.
 	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+
+	// Every query on this pool is measured, including ones added later by
+	// somebody who never reads this file. See internal/dbtrace.
+	if t := dbtrace.New(cfg.OnQuery); t != nil {
+		pcfg.ConnConfig.Tracer = t
+	}
 
 	if cfg.ConnectTimeout > 0 {
 		pcfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
@@ -116,4 +127,17 @@ func (s *Store) CurrentRole(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("store: current_user: %w", err)
 	}
 	return role, nil
+}
+
+// Stat reports the connection pool's saturation.
+//
+// The pool is the shared resource this worker contends on with itself: a
+// thousand destination goroutines resolving rooms all queue for the same
+// max_conns connections, so "slow query" and "waited for a connection" look
+// identical from a duration alone and are fixed differently.
+func (s *Store) Stat() *pgxpool.Stat {
+	if s == nil || s.pool == nil {
+		return nil
+	}
+	return s.pool.Stat()
 }

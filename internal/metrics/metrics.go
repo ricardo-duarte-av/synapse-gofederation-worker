@@ -129,6 +129,55 @@ var (
 		Help: "Events routed from current state rather than state before the event, by cause.",
 	}, []string{"cause"})
 
+	// Database metrics, recorded for EVERY query by internal/dbtrace rather
+	// than at chosen call sites, because the query nobody thought to time is
+	// the one that turns out to be slow. Queries with no name are counted as
+	// "other", so an uninstrumented one shows as a rising line rather than as
+	// nothing.
+	DBQueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "gofed_db_query_duration_seconds",
+		Help: "Database query duration, by pool and query name.",
+		// The tail matters more than the middle here. This worker's slowest
+		// query is a recursive walk of the state group edges, measured against
+		// this deployment at 10.8ms, 108ms, 375ms and 6.3 SECONDS.
+		Buckets: []float64{
+			.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30,
+		},
+	}, []string{"pool", "query"})
+
+	// DBQueries counts queries by outcome, so a failing query is visible even
+	// when its duration looks healthy -- a fast error is the fastest query
+	// there is.
+	DBQueries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gofed_db_queries_total",
+		Help: "Database queries, by pool, query name and outcome.",
+	}, []string{"pool", "query", "outcome"})
+
+	// DBPoolConns is the pool's saturation, by state.
+	//
+	// The pool is what this worker contends on with itself: a thousand
+	// destination goroutines resolving rooms queue for the same max_conns
+	// connections, so "the query is slow" and "we waited for a connection" look
+	// identical in a duration and are fixed differently. Acquired at the limit
+	// with a rising wait time is the second one.
+	DBPoolConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gofed_db_pool_conns",
+		Help: "Connections in the pool, by pool and state.",
+	}, []string{"pool", "state"})
+
+	// DBPoolAcquireWaitSeconds is cumulative time spent waiting for a
+	// connection because the pool was empty. Flat means the pool is big enough.
+	DBPoolAcquireWaitSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gofed_db_pool_acquire_wait_seconds",
+		Help: "Cumulative time spent waiting for a free connection, by pool.",
+	}, []string{"pool"})
+
+	// DBPoolEmptyAcquires counts acquisitions that had to wait at all.
+	DBPoolEmptyAcquires = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gofed_db_pool_empty_acquires_total",
+		Help: "Acquisitions that found the pool empty, by pool.",
+	}, []string{"pool"})
+
 	// BatchDuration is how long one pickup pass took.
 	BatchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "gofed_batch_duration_seconds",
@@ -231,6 +280,8 @@ func All() []prometheus.Collector {
 		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped, StateGroupCache, StateGroupCacheEntries,
 		EventsProcessed, EventsSkipped, EventsRouted, DestinationsPerEvent,
 		ApproximateRoutes, BatchDuration,
+		DBQueryDuration, DBQueries, DBPoolConns,
+		DBPoolAcquireWaitSeconds, DBPoolEmptyAcquires,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,
 		Transactions, TransactionPDUs, TransactionEDUs, TransactionEDUsByType,
 		PresenceStatesSent, TransactionBytes,

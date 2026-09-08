@@ -176,6 +176,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 
 	var err error
 	if w.db, err = store.Open(openCtx, store.Config{
+		OnQuery:        dbObserver("synapse"),
 		DSN:            cfg.DatabaseDSN,
 		MaxConns:       cfg.Database.MaxConns,
 		ConnectTimeout: cfg.ConnectTimeout(),
@@ -198,6 +199,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	// rather than a stream of silent errors hours later.
 	if cfg.Mode == config.ModePrimary {
 		if w.writer, err = store.OpenWriter(openCtx, store.Config{
+			OnQuery:        dbObserver("synapse_write"),
 			DSN:            cfg.WriteDSN,
 			MaxConns:       cfg.Database.MaxConns,
 			ConnectTimeout: cfg.ConnectTimeout(),
@@ -214,6 +216,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	}
 
 	if w.cursors, err = state.Open(openCtx, state.Config{
+		OnQuery:        dbObserver("state"),
 		DSN:            cfg.StateDSN,
 		Table:          cfg.State.Table,
 		RoutesTable:    cfg.State.RoutesTable,

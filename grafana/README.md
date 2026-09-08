@@ -124,6 +124,22 @@ Two readings that look like problems and are not:
   from the outside — it looks like every destination failing at once, which
   reads as a network outage.
 
+**Database** — every query this worker makes, measured at the connection POOL
+rather than at chosen call sites. That distinction is the point: the query
+nobody thought to instrument is the one that turns out to be slow, so pgx's
+QueryTracer hooks the pool and a query with no name is counted as `other`
+rather than dropped. An uninstrumented query appears as a rising `other` line.
+
+`joined_hosts_at_state_group` is the one to watch. It walks the state group
+edges and was measured directly against this database at 10.8ms, 108ms, 375ms
+and **6.3 seconds** for the deepest chain, which is why it has a cache in front
+of it.
+
+The pool panels answer a question a duration cannot: "slow query" and "waited
+for a free connection" look identical end to end and are fixed differently.
+Acquired connections pinned at `max` with a rising wait time is the second one,
+and means raising `database.max_conns` will do more than optimising any query.
+
 **Bookkeeping** — the writes to Synapse's tables that a primary sender's
 position IS. A non-zero failure rate means delivery is working while the bookkeeping is not —
 rows re-read forever, the outbox growing without bound, `prev_id` chaining

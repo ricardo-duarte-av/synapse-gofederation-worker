@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
 )
 
 // RetryTimings is a destination's backoff state.
@@ -35,6 +37,7 @@ func (r RetryTimings) DueAt(nowMS int64) bool {
 // event is the cost this worker exists to avoid. Destinations with no row are
 // simply absent from the result and are due immediately.
 func (s *Store) GetDestinationRetryTimings(ctx context.Context, destinations []string) (map[string]RetryTimings, error) {
+	ctx = dbtrace.WithQueryName(ctx, "destination_retry_timings")
 	if len(destinations) == 0 {
 		return nil, nil
 	}
@@ -113,6 +116,7 @@ func (s *Store) GetDestinationLastSuccessfulStreamOrdering(ctx context.Context, 
 // (storage/databases/main/transactions.py:408): up to `limit` event ids owed to
 // a destination, one per room, oldest first.
 func (s *Store) GetCatchUpRoomEventIDs(ctx context.Context, destination string, lastSuccessful int64, limit int) ([]string, error) {
+	ctx = dbtrace.WithQueryName(ctx, "catchup_room_event_ids")
 	const q = `
 		SELECT event_id FROM destination_rooms
 		JOIN events USING (stream_ordering)
@@ -150,6 +154,7 @@ func (s *Store) GetCatchUpRoomEventIDs(ctx context.Context, destination string, 
 // both, and a sender that only looked at one would leave the other stranded
 // until unrelated traffic happened to wake it.
 func (s *Store) GetCatchUpOutstandingDestinations(ctx context.Context, after string, nowMS int64, limit int) ([]string, error) {
+	ctx = dbtrace.WithQueryName(ctx, "catchup_outstanding_destinations")
 	const q = `
 		WITH pdu_destinations AS (
 			SELECT DISTINCT destination FROM destination_rooms

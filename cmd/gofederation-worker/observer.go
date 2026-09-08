@@ -3,6 +3,7 @@ package main
 import (
 	"time"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/destinations"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/difflog"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
@@ -109,5 +110,23 @@ func countEDUTypes(byType map[string]int, presenceStates int) {
 	}
 	if presenceStates > 0 {
 		metrics.PresenceStatesSent.Add(float64(presenceStates))
+	}
+}
+
+// dbObserver counts one pool's queries.
+//
+// The pool name is bound here rather than carried through the store packages,
+// which keeps them free of the metrics package the way internal/queue and
+// internal/sink already are.
+func dbObserver(pool string) dbtrace.Observer {
+	return func(query string, took time.Duration, err error) {
+		metrics.DBQueryDuration.WithLabelValues(pool, query).Observe(took.Seconds())
+		outcome := "ok"
+		if err != nil {
+			// A fast error is the fastest query there is, so the duration alone
+			// would read as excellent performance.
+			outcome = "error"
+		}
+		metrics.DBQueries.WithLabelValues(pool, query, outcome).Inc()
 	}
 }

@@ -25,6 +25,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
 )
 
 // Cursor names. The per-destination forms are built by the To* helpers below.
@@ -63,6 +65,9 @@ type Config struct {
 	InstanceName   string
 	MaxConns       int32
 	ConnectTimeout time.Duration
+	// OnQuery is told about every query this pool runs, labelled by
+	// dbtrace.WithQueryName. Optional; nil disables tracing.
+	OnQuery dbtrace.Observer
 }
 
 // Open connects and verifies the table is reachable and writable.
@@ -84,6 +89,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	// Same transaction-pooler reasoning as internal/store.Open: one round trip,
 	// so a pooler has no seam to switch the backend connection on.
 	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+
+	// Every query on this pool is measured, including ones added later by
+	// somebody who never reads this file. See internal/dbtrace.
+	if t := dbtrace.New(cfg.OnQuery); t != nil {
+		pcfg.ConnConfig.Tracer = t
+	}
 	if cfg.ConnectTimeout > 0 {
 		pcfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
 	}
@@ -159,6 +170,7 @@ func (s *Store) GetAll(ctx context.Context) (map[string]int64, error) {
 // one -- are all cases where the older value is simply wrong. Refusing the
 // regression in SQL means it cannot happen even under a race.
 func (s *Store) Set(ctx context.Context, name string, pos int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "set_stream_position")
 	// Aliased as sp so the ON CONFLICT clause can refer to the target row.
 	// A schema-qualified name is not usable there, and the alias is the
 	// portable way to say it.
@@ -203,6 +215,7 @@ type RoutedRoom struct {
 // Like Synapse's, this is a high-water mark rather than a log: one row per
 // (destination, room), holding the newest stream ordering routed there.
 func (s *Store) RecordRoutes(ctx context.Context, routes []RoutedRoom) error {
+	ctx = dbtrace.WithQueryName(ctx, "record_routes")
 	if len(routes) == 0 {
 		return nil
 	}
@@ -318,4 +331,17 @@ func (s *Store) SetRetryTimings(ctx context.Context, destination string, t Retry
 		return fmt.Errorf("state: set retry timings for %s: %w", destination, err)
 	}
 	return nil
+}
+
+// Stat reports the connection pool's saturation.
+//
+// The pool is the shared resource this worker contends on with itself: a
+// thousand destination goroutines resolving rooms all queue for the same
+// max_conns connections, so "slow query" and "waited for a connection" look
+// identical from a duration alone and are fixed differently.
+func (s *Store) Stat() *pgxpool.Stat {
+	if s == nil || s.pool == nil {
+		return nil
+	}
+	return s.pool.Stat()
 }

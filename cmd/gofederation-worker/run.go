@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
@@ -133,6 +134,23 @@ func (w *worker) typingKeepAlive(ctx context.Context) error {
 	}
 }
 
+// samplePool records one connection pool's saturation.
+//
+// Sampled rather than tracked, like the queue depths and for the same reason:
+// the pool keeps these counters itself, so reading them is both cheaper and
+// harder to get wrong than maintaining a parallel set.
+func (w *worker) samplePool(name string, st *pgxpool.Stat) {
+	if st == nil {
+		return
+	}
+	metrics.DBPoolConns.WithLabelValues(name, "acquired").Set(float64(st.AcquiredConns()))
+	metrics.DBPoolConns.WithLabelValues(name, "idle").Set(float64(st.IdleConns()))
+	metrics.DBPoolConns.WithLabelValues(name, "total").Set(float64(st.TotalConns()))
+	metrics.DBPoolConns.WithLabelValues(name, "max").Set(float64(st.MaxConns()))
+	metrics.DBPoolAcquireWaitSeconds.WithLabelValues(name).Set(st.EmptyAcquireWaitTime().Seconds())
+	metrics.DBPoolEmptyAcquires.WithLabelValues(name).Set(float64(st.EmptyAcquireCount()))
+}
+
 // sampleGauges refreshes the values that are cheaper to sample than to track,
 // and flushes the shadow record.
 //
@@ -158,6 +176,13 @@ func (w *worker) sampleGauges(ctx context.Context) error {
 			metrics.KnownDestinations.Set(float64(w.queues.Count()))
 			if w.hosts != nil {
 				metrics.StateGroupCacheEntries.Set(float64(w.hosts.Len()))
+			}
+			w.samplePool("synapse", w.db.Stat())
+			if w.writer != nil {
+				w.samplePool("synapse_write", w.writer.Stat())
+			}
+			if w.cursors != nil {
+				w.samplePool("state", w.cursors.Stat())
 			}
 			metrics.DestinationsBackingOff.Set(float64(w.limiter.Backoff()))
 

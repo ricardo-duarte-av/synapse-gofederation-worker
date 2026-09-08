@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
+
 	"github.com/jackc/pgx/v5"
 )
 
@@ -25,6 +27,7 @@ type NewEvent struct {
 // advancing to uptoTS after a truncated batch would skip every event the limit
 // cut off, silently and permanently.
 func (s *Store) GetAllNewEventIDsStream(ctx context.Context, from, upto int64, limit int) ([]NewEvent, int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "new_event_ids")
 	const q = `
 		SELECT e.stream_ordering, e.event_id, COALESCE(e.received_ts, 0)
 		FROM events AS e
@@ -63,6 +66,7 @@ func (s *Store) GetAllNewEventIDsStream(ctx context.Context, from, upto int64, l
 // this from the replication stream's POSITION, which we never ask for
 // (docs/shadow-safety.md), so we read it instead.
 func (s *Store) MaxStreamOrdering(ctx context.Context) (int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "max_stream_ordering")
 	var max int64
 	err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering), 0) FROM events`).Scan(&max)
 	if err != nil {
@@ -106,6 +110,7 @@ type Event struct {
 // did not return, so an event purged between the pickup query and this one is
 // not an error.
 func (s *Store) GetEvents(ctx context.Context, ids []string) ([]Event, error) {
+	ctx = dbtrace.WithQueryName(ctx, "events_by_id")
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -159,6 +164,7 @@ func (s *Store) GetEvents(ctx context.Context, ids []string) ([]Event, error) {
 // shows up for events that change room membership, which is a small fraction of
 // traffic and exactly the fraction the divergence counter exists to size.
 func (s *Store) CurrentJoinedHosts(ctx context.Context, roomID string) ([]string, error) {
+	ctx = dbtrace.WithQueryName(ctx, "current_joined_hosts")
 	const q = `
 		SELECT DISTINCT substring(state_key FROM '@[^:]*:(.*)$')
 		FROM current_state_events

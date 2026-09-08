@@ -17,6 +17,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
 )
 
 // Writer performs a federation sender's writes against Synapse's database.
@@ -36,6 +38,12 @@ func OpenWriter(ctx context.Context, cfg Config) (*Writer, error) {
 	// Same transaction-pooler reasoning as internal/store.Open: one round trip,
 	// so a pooler has no seam to switch the backend connection on.
 	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+
+	// Every query on this pool is measured, including ones added later by
+	// somebody who never reads this file. See internal/dbtrace.
+	if t := dbtrace.New(cfg.OnQuery); t != nil {
+		pcfg.ConnConfig.Tracer = t
+	}
 	if cfg.ConnectTimeout > 0 {
 		pcfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
 	}
@@ -159,6 +167,7 @@ func (w *Writer) MarkAsSentDevicesByRemote(ctx context.Context, destination stri
 // The destinations rows are inserted first only to satisfy the foreign key;
 // their retry columns are left alone.
 func (w *Writer) StoreDestinationRoomsEntries(ctx context.Context, destinations []string, roomID string, streamOrdering int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "store_destination_rooms")
 	if len(destinations) == 0 {
 		return nil
 	}
@@ -190,6 +199,7 @@ func (w *Writer) StoreDestinationRoomsEntries(ctx context.Context, destinations 
 // SetDestinationLastSuccessfulStreamOrdering advances a destination's catch-up
 // cursor (transactions.py:359).
 func (w *Writer) SetDestinationLastSuccessfulStreamOrdering(ctx context.Context, destination string, streamOrdering int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "set_last_successful")
 	const q = `
 		INSERT INTO destinations (destination, last_successful_stream_ordering)
 		VALUES ($1, $2)
@@ -206,6 +216,7 @@ func (w *Writer) SetDestinationLastSuccessfulStreamOrdering(ctx context.Context,
 // UpdateFederationOutPos writes our position in a stream
 // (stream.py:2148), keyed by instance name as Synapse does.
 func (w *Writer) UpdateFederationOutPos(ctx context.Context, typ, instanceName string, streamID int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "update_federation_out_pos")
 	const q = `
 		INSERT INTO federation_stream_position (type, instance_name, stream_id)
 		VALUES ($1, $2, $3)
@@ -233,3 +244,16 @@ func (w *Writer) UpdateFederationOutPos(ctx context.Context, typ, instanceName s
 // invalidation on the caches stream would be a worse trade than a stale read.
 // The writer keeps last_successful_stream_ordering and destination_rooms below,
 // which are read straight from the database and cached nowhere.
+
+// Stat reports the connection pool's saturation.
+//
+// The pool is the shared resource this worker contends on with itself: a
+// thousand destination goroutines resolving rooms all queue for the same
+// max_conns connections, so "slow query" and "waited for a connection" look
+// identical from a duration alone and are fixed differently.
+func (w *Writer) Stat() *pgxpool.Stat {
+	if w == nil || w.pool == nil {
+		return nil
+	}
+	return w.pool.Stat()
+}

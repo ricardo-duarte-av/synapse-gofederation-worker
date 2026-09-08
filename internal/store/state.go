@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
 )
 
 // GetStateGroupsForEvents maps event ids to their state groups.
@@ -96,6 +98,7 @@ const joinedHostsAtGroupQuery = `
 // answer, on the per-event path, and through a transaction pooler they are four
 // network hops rather than four socket writes.
 func (s *Store) JoinedHostsAtStateGroup(ctx context.Context, group int64) ([]string, error) {
+	ctx = dbtrace.WithQueryName(ctx, "joined_hosts_at_state_group")
 	b := &pgx.Batch{}
 	b.Queue(`SET LOCAL enable_seqscan = off`)
 	b.Queue(joinedHostsAtGroupQuery, group)

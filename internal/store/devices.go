@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/dbtrace"
+
 	"github.com/tidwall/gjson"
 )
 
@@ -30,6 +32,7 @@ type ToDeviceMessage struct {
 func (s *Store) GetNewDeviceMsgsForRemote(
 	ctx context.Context, destination string, lastStreamID, currentStreamID int64, limit int,
 ) ([]ToDeviceMessage, int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "device_msgs_for_remote")
 	if lastStreamID >= currentStreamID {
 		return nil, currentStreamID, nil
 	}
@@ -80,6 +83,7 @@ type DevicePoke struct {
 func (s *Store) GetDeviceUpdatesByRemote(
 	ctx context.Context, destination string, fromStreamID, nowStreamID int64, limit int,
 ) ([]DevicePoke, error) {
+	ctx = dbtrace.WithQueryName(ctx, "device_updates_by_remote")
 	const q = `
 		SELECT user_id, device_id, stream_id, COALESCE(opentracing_context, '')
 		FROM device_lists_outbound_pokes
@@ -173,6 +177,7 @@ type DeviceDetail struct {
 // JOIN from the requested pairs rather than a lookup in devices: the whole
 // point of a device list update is often that the device is gone.
 func (s *Store) GetDeviceDetails(ctx context.Context, userIDs, deviceIDs []string) (map[string]DeviceDetail, error) {
+	ctx = dbtrace.WithQueryName(ctx, "device_details")
 	if len(userIDs) == 0 {
 		return nil, nil
 	}
@@ -321,6 +326,7 @@ type PresenceState struct {
 // would often be stale by the time the transaction goes out -- and stale
 // presence is worse than none: it says someone is online who left.
 func (s *Store) GetPresenceStates(ctx context.Context, userIDs []string) (map[string]PresenceState, error) {
+	ctx = dbtrace.WithQueryName(ctx, "presence_states")
 	if len(userIDs) == 0 {
 		return nil, nil
 	}
