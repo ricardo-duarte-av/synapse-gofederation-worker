@@ -48,6 +48,11 @@ type Ephemeral struct {
 
 	serverName   string
 	shouldHandle func(destination string) bool
+	// dueWithin reports whether a destination is worth building an EDU for:
+	// due now, or due within the hour. Synapse asks the same question before
+	// every ephemeral send (federation/sender/__init__.py:915,994) and the
+	// point is to not do the work at all for a server that is down.
+	dueWithin func(destination string) bool
 }
 
 // EphemeralConfig builds an Ephemeral.
@@ -57,6 +62,10 @@ type EphemeralConfig struct {
 	Log          zerolog.Logger
 	ServerName   string
 	ShouldHandle func(destination string) bool
+	// DueWithin reports whether a destination is due now or within the hour.
+	// Nil means every destination is treated as due, which is what a test or a
+	// worker with no backoff wants.
+	DueWithin func(destination string) bool
 }
 
 // NewEphemeral builds the ephemeral EDU router.
@@ -64,6 +73,7 @@ func NewEphemeral(cfg EphemeralConfig) *Ephemeral {
 	return &Ephemeral{
 		store: cfg.Store, queues: cfg.Queues, log: cfg.Log,
 		serverName: cfg.ServerName, shouldHandle: cfg.ShouldHandle,
+		dueWithin: cfg.DueWithin,
 	}
 }
 
@@ -98,6 +108,12 @@ func (e *Ephemeral) HandleReceipt(ctx context.Context, r ReceiptUpdate) error {
 
 	sent := 0
 	for _, host := range e.ourDestinations(hosts) {
+		// Synapse asks the same before queueing a receipt
+		// (federation/sender/__init__.py:915). A read receipt for a server that
+		// has been down for a week is worth nothing by the time it returns.
+		if !e.due(host) {
+			continue
+		}
 		q := e.queues.Get(host)
 		q.EnqueueReceipt(r.RoomID, r.ReceiptType, r.UserID, r.ThreadID, content)
 		e.queues.Wake(q)
@@ -106,6 +122,12 @@ func (e *Ephemeral) HandleReceipt(ctx context.Context, r ReceiptUpdate) error {
 	e.log.Debug().Str("room", r.RoomID).Str("user", r.UserID).
 		Int("destinations", sent).Msg("receipt routed")
 	return nil
+}
+
+// due reports whether a destination is worth building an EDU for. A nil hook
+// means yes, which is what a worker with no backoff and every test wants.
+func (e *Ephemeral) due(destination string) bool {
+	return e.dueWithin == nil || e.dueWithin(destination)
 }
 
 // ReceiptUpdate is one read receipt from the receipts stream.
@@ -151,6 +173,15 @@ func (e *Ephemeral) HandleEDU(destination, eduType string, content json.RawMessa
 // says somebody is online who has left.
 func (e *Ephemeral) HandlePresence(ctx context.Context, destination string, userIDs []string) error {
 	if !e.shouldHandle(destination) || destination == e.serverName || len(userIDs) == 0 {
+		return nil
+	}
+	// Before the database read, not after the EDU is built. Synapse filters
+	// here too (federation/sender/__init__.py:986), and the cost of not doing
+	// so is not theoretical: about half this homeserver's ten thousand
+	// destinations are backing off, so half of all presence was being read from
+	// the database, encoded, queued, and then thrown away by the long-outage
+	// rule -- measured at 8.98 dropped EDUs per second against 8.67 sent.
+	if !e.due(destination) {
 		return nil
 	}
 	states, err := e.store.GetPresenceStates(ctx, userIDs)

@@ -399,6 +399,14 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		Log:          log,
 		ServerName:   cfg.ServerName,
 		ShouldHandle: cfg.ShouldHandle,
+		// The hour of slack is Synapse's retry_due_within_ms, passed as
+		// CATCHUP_RETRY_INTERVAL wherever it decides whether an ephemeral EDU
+		// is worth building at all.
+		DueWithin: func(destination string) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return w.limiter.DueWithin(ctx, destination, queue.CatchUpRetryInterval)
+		},
 	})
 
 	w.typing = sender.NewTyping(sender.TypingConfig{

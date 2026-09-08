@@ -109,6 +109,20 @@ func (l *Limiter) SetOnRecovered(f func(destination string)) { l.onUp = f }
 // Due reports whether a destination may be attempted now, reading persisted
 // state the first time it is asked about one.
 func (l *Limiter) Due(ctx context.Context, destination string) bool {
+	return l.DueWithin(ctx, destination, 0)
+}
+
+// DueWithin reports whether a destination is due now or becomes due within the
+// given slack.
+//
+// The slack is Synapse's retry_due_within_ms, which every one of its senders
+// passes as CATCHUP_RETRY_INTERVAL -- one hour -- when deciding whether to
+// bother building an EDU at all (federation/sender/__init__.py:838,915,994,1075).
+// It is not a rounding convenience: without it a destination that comes back in
+// two minutes is skipped now and not reconsidered until the next thing happens
+// to be routed to it, so a recovering server waits far longer than its own
+// backoff asked for.
+func (l *Limiter) DueWithin(ctx context.Context, destination string, within time.Duration) bool {
 	l.mu.RLock()
 	t, known := l.state[destination]
 	seeded := l.loaded[destination]
@@ -119,7 +133,7 @@ func (l *Limiter) Due(ctx context.Context, destination string) bool {
 	} else if !known {
 		return true
 	}
-	return t.Due(time.Now().UnixMilli())
+	return t.Due(time.Now().UnixMilli() + within.Milliseconds())
 }
 
 // seed reads a destination's persisted timings once.

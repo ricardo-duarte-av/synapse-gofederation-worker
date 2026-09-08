@@ -200,3 +200,29 @@ func TestBackoffCount(t *testing.T) {
 		t.Errorf("Backoff = %d, want 1", got)
 	}
 }
+
+// The hour of slack is Synapse's retry_due_within_ms, passed as
+// CATCHUP_RETRY_INTERVAL by every sender before it decides whether to build an
+// EDU at all. Without it a destination coming back in two minutes is skipped
+// now and not reconsidered until something else happens to be routed to it.
+func TestDueWithinLookahead(t *testing.T) {
+	ctx := context.Background()
+	l := New(Config{MinInterval: 10 * time.Minute, Multiplier: 2, MaxInterval: time.Hour}, nil, nil)
+
+	l.Failure(ctx, "soon.example") // 10 minutes out
+	if l.Due(ctx, "soon.example") {
+		t.Fatal("precondition: should not be due now")
+	}
+	if !l.DueWithin(ctx, "soon.example", time.Hour) {
+		t.Error("a destination due in 10 minutes was excluded by an hour of slack")
+	}
+	if l.DueWithin(ctx, "soon.example", time.Minute) {
+		t.Error("a destination due in 10 minutes was included by a minute of slack")
+	}
+
+	// A destination that has never failed is due under any slack, including
+	// none: zero timings must not be read as "backing off since the epoch".
+	if !l.DueWithin(ctx, "fresh.example", 0) {
+		t.Error("an unknown destination was treated as backing off")
+	}
+}
