@@ -101,6 +101,29 @@ that fell back to current room state rather than resolving the state before the
 event. That is the one known difference from Synapse's algorithm rather than a
 bug we hope is absent, so it is worth a panel of its own.
 
+**Go runtime** — what the concurrency model costs. These come from the standard
+Go and process collectors, which `promhttp.Handler()` registers by default, so
+there is nothing to enable.
+
+The goroutine panel is the design bet in numbers. One goroutine per destination
+with work is the whole premise, so goroutines should track "destinations with
+queued work" plus a small constant, and a count that climbs while queued work
+does not is a leak. It can legitimately sit ABOVE
+`queue.max_concurrent_destinations`: `Wake` spawns before taking a concurrency
+slot, so the excess is goroutines parked waiting for a slot rather than sends in
+flight, which is why all three lines share the panel.
+
+Two readings that look like problems and are not:
+
+- **Resident memory lagging a drop in real usage.** The gap between heap in-use
+  and heap allocated is memory Go has freed but not yet returned to the OS.
+  After a large queue is dropped, resident stays high for minutes.
+- **File descriptors in the thousands.** One per open connection, so a sender
+  talking to thousands of servers is expected to hold thousands. The limit is
+  plotted beside it because exhausting it does not look like a resource problem
+  from the outside — it looks like every destination failing at once, which
+  reads as a network outage.
+
 **Bookkeeping** — the writes to Synapse's tables that a primary sender's
 position IS. A non-zero failure rate means delivery is working while the bookkeeping is not —
 rows re-read forever, the outbox growing without bound, `prev_id` chaining
