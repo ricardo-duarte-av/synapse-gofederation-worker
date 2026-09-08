@@ -351,10 +351,24 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		},
 	})
 
+	// The joined-host lookup is the most expensive thing in the per-event path
+	// and its answer cannot change: a state group is immutable, so a new state
+	// creates a new group rather than editing one. Caching it needs no
+	// invalidation and turns the query into once per state change rather than
+	// once per event.
+	hosts := destinations.NewCachedRoomHosts(w.db, destinations.DefaultHostCacheEntries)
+	hosts.SetOnLookup(func(hit bool) {
+		result := "miss"
+		if hit {
+			result = "hit"
+		}
+		metrics.StateGroupCache.WithLabelValues(result).Inc()
+	})
+
 	w.sender = sender.New(sender.Config{
 		Store:          w.db,
 		Cursors:        w.cursors,
-		Resolver:       destinations.NewResolver(w.db, cfg.ServerName, cfg.Synapse.DomainWhitelist),
+		Resolver:       destinations.NewResolver(hosts, cfg.ServerName, cfg.Synapse.DomainWhitelist),
 		Queues:         w.queues,
 		Observer:       &observer{diff: w.diff},
 		Log:            log,

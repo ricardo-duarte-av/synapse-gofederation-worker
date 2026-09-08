@@ -38,6 +38,18 @@ var (
 		Help: "1 while the replication subscription is connected.",
 	})
 
+	// StateGroupCache counts joined-host lookups by result.
+	//
+	// The hit rate is the whole value of the cache: state groups are immutable,
+	// so a miss is a recursive walk of the state group edges -- measured in the
+	// hundreds of milliseconds on this deployment, and seconds at worst -- while
+	// a hit is a map read. A falling hit rate means rooms are changing
+	// membership faster than the cache holds them, or that it is too small.
+	StateGroupCache = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gofed_state_group_cache_total",
+		Help: "Joined-host lookups by state group, by cache result.",
+	}, []string{"result"})
+
 	// EDUsDropped counts ephemeral EDUs abandoned because their destination is
 	// in a long outage.
 	//
@@ -170,7 +182,7 @@ var (
 func All() []prometheus.Collector {
 	return []prometheus.Collector{
 		BuildInfo, ShadowMode, DatabaseReadOnly,
-		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped,
+		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped, StateGroupCache,
 		EventsProcessed, EventsSkipped, EventsRouted, DestinationsPerEvent,
 		ApproximateRoutes, BatchDuration,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,

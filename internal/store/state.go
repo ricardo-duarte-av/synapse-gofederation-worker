@@ -82,37 +82,52 @@ const joinedHostsAtGroupQuery = `
 // state_groups_state is the largest table in a Synapse database by a wide
 // margin, and the planner will choose a sequential scan over it without help.
 // Synapse disables seqscan for this transaction and so must we: the query is
-// otherwise pathological on a large room. SET LOCAL scopes the change to the
-// transaction, which also keeps it safe behind a transaction-mode pooler.
+// otherwise pathological on a large room.
+//
+// Sent as ONE batch rather than as an explicit transaction. pgx ends a batch
+// with a single Sync, so the statements run in one implicit transaction --
+// which is what SET LOCAL needs to be scoped, and what keeps it from leaking
+// onto a pooled connection where it would silently change the plan of every
+// other query. Verified against a real PostgreSQL rather than assumed: inside
+// the batch enable_seqscan reads "off", and on the same connection immediately
+// afterwards it reads "on".
+//
+// The point is round trips. BEGIN, SET, query, ROLLBACK is four of them for one
+// answer, on the per-event path, and through a transaction pooler they are four
+// network hops rather than four socket writes.
 func (s *Store) JoinedHostsAtStateGroup(ctx context.Context, group int64) ([]string, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, fmt.Errorf("store: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	b := &pgx.Batch{}
+	b.Queue(`SET LOCAL enable_seqscan = off`)
+	b.Queue(joinedHostsAtGroupQuery, group)
 
-	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+	br := s.pool.SendBatch(ctx, b)
+	defer func() { _ = br.Close() }()
+
+	if _, err := br.Exec(); err != nil {
 		return nil, fmt.Errorf("store: disable seqscan: %w", err)
 	}
-
-	rows, err := tx.Query(ctx, joinedHostsAtGroupQuery, group)
+	rows, err := br.Query()
 	if err != nil {
 		return nil, fmt.Errorf("store: joined hosts at state group %d: %w", group, err)
 	}
-	defer rows.Close()
 
 	var out []string
 	for rows.Next() {
 		var host *string
 		if err := rows.Scan(&host); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("store: joined hosts at state group %d: %w", group, err)
 		}
 		// NULL for a malformed state key. Synapse's set comprehension would
 		// keep it as None; dropping it is the only sensible reading, since
-		// None is not a server we can send to.
+		// there is no server to send to.
 		if host != nil && *host != "" {
 			out = append(out, *host)
 		}
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: joined hosts at state group %d: %w", group, err)
+	}
+	return out, nil
 }

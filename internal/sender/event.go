@@ -94,7 +94,9 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 	// never queued anywhere. The depth filter removes the event entirely
 	// rather than trimming it: one unencodable PDU makes the whole transaction
 	// unparseable, taking every other PDU in it down too.
+	serialiseStart := time.Now()
 	body, ok := txn.SerialisePDU(e.JSON)
+	s.stage("serialise", serialiseStart)
 	if !ok {
 		if s.cfg.Observer != nil {
 			s.cfg.Observer.OnEventSkipped(e.EventID, destinations.SkipUnserialisable)
@@ -113,15 +115,24 @@ func (s *Sender) handleEvent(ctx context.Context, e store.Event) (bool, error) {
 			Destination: d, RoomID: e.RoomID, StreamOrdering: e.StreamOrdering,
 		})
 	}
+	// Timed, because these are database WRITES in the per-event path and were
+	// the largest untimed thing in it: event_total ran ~11ms above the sum of
+	// the stages, and "where the time goes" cannot answer that question while
+	// the two biggest writes are invisible.
+	recordStart := time.Now()
 	if err := s.cfg.Cursors.RecordRoutes(ctx, routes); err != nil {
 		return false, err
 	}
+	s.stage("record_routes", recordStart)
+
 	// In primary mode the same decision goes where Synapse keeps it, because
 	// catch-up reads that table and nothing else is writing it.
 	if s.cfg.RecordRoutes != nil {
+		synapseStart := time.Now()
 		if err := s.cfg.RecordRoutes(ctx, ours, e.RoomID, e.StreamOrdering); err != nil {
 			return false, err
 		}
+		s.stage("record_routes_synapse", synapseStart)
 	}
 
 	// The fan-out itself, timed separately: it is the thing this worker's

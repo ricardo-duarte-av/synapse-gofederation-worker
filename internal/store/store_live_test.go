@@ -476,3 +476,37 @@ func TestLiveCrossSigningKeys(t *testing.T) {
 	t.Logf("%d cross-signing keys across %d users, all with a usable version",
 		len(keys), len(users))
 }
+
+// The batch must keep SET LOCAL scoped: applied for the query, and gone from
+// the connection afterwards. If it leaked, every other query on that pooled
+// connection would silently get a different plan -- and through a transaction
+// pooler, on somebody else's connection.
+func TestLiveJoinedHostsDoesNotLeakSeqscan(t *testing.T) {
+	s := liveStore(t)
+	ctx := context.Background()
+
+	group, err := anyStateGroup(ctx, s)
+	if err != nil || group == 0 {
+		t.Skip("no state group available")
+	}
+	if _, err := s.JoinedHostsAtStateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same pool, and with MaxConns of 1 in the live harness the same
+	// connection, so a leak would be visible here.
+	var setting string
+	if err := s.pool.QueryRow(ctx, `SHOW enable_seqscan`).Scan(&setting); err != nil {
+		t.Fatal(err)
+	}
+	if setting != "on" {
+		t.Errorf("enable_seqscan = %q after the query; SET LOCAL leaked onto the connection", setting)
+	}
+}
+
+func anyStateGroup(ctx context.Context, s *Store) (int64, error) {
+	var g int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT state_group FROM state_group_edges LIMIT 1`).Scan(&g)
+	return g, err
+}
