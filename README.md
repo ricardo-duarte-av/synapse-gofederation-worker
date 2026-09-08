@@ -317,5 +317,8 @@ room should be private.
 - [docs/test-destination.md](docs/test-destination.md) — the capture rig.
 - [docs/going-live.md](docs/going-live.md) — the send allowlist, and the order
   in which to widen it.
+- [docs/edu-batching.md](docs/edu-batching.md) — a change NOT made yet: 96% of
+  the transactions this worker sends carry a single EDU, and the cost of that
+  falls on everyone else's servers.
 - [grafana/README.md](grafana/README.md) — the dashboard, a Prometheus scrape
   config, and what each row is for.
