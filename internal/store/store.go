@@ -112,6 +112,7 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // on, and the guarantee is worth confirming out loud at every start rather than
 // inferring from the deployment being correct.
 func (s *Store) IsReadOnly(ctx context.Context) (bool, error) {
+	ctx = dbtrace.WithQueryName(ctx, "check_read_only")
 	var setting string
 	err := s.pool.QueryRow(ctx, `SHOW default_transaction_read_only`).Scan(&setting)
 	if err != nil {
@@ -122,6 +123,7 @@ func (s *Store) IsReadOnly(ctx context.Context) (bool, error) {
 
 // CurrentRole returns the role the pool is connected as, for startup logging.
 func (s *Store) CurrentRole(ctx context.Context) (string, error) {
+	ctx = dbtrace.WithQueryName(ctx, "current_role")
 	var role string
 	if err := s.pool.QueryRow(ctx, `SELECT current_user`).Scan(&role); err != nil {
 		return "", fmt.Errorf("store: current_user: %w", err)

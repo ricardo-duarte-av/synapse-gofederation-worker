@@ -204,6 +204,7 @@ func (s *Store) CurrentJoinedHosts(ctx context.Context, roomID string) ([]string
 // deletes rows for unknown ones, so our row would either vanish or drag both
 // real senders backwards (docs/shadow-safety.md).
 func (s *Store) GetFederationOutPos(ctx context.Context, typ, instanceName string) (int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "federation_out_pos")
 	const q = `SELECT stream_id FROM federation_stream_position WHERE type = $1 AND instance_name = $2`
 	var pos int64
 	err := s.pool.QueryRow(ctx, q, typ, instanceName).Scan(&pos)

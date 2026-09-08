@@ -128,6 +128,7 @@ func (s *Store) Close() {
 // different from zero: a cursor at zero has been written and means "start from
 // the beginning", while an unset one means "we have never run".
 func (s *Store) Get(ctx context.Context, name string) (pos int64, ok bool, err error) {
+	ctx = dbtrace.WithQueryName(ctx, "state_position_get")
 	q := fmt.Sprintf(
 		`SELECT position FROM %s WHERE instance_name = $1 AND name = $2`, s.table)
 	err = s.pool.QueryRow(ctx, q, s.instance, name).Scan(&pos)
@@ -143,6 +144,7 @@ func (s *Store) Get(ctx context.Context, name string) (pos int64, ok bool, err e
 // GetAll reads every cursor for this instance, for startup logging and for
 // seeding several streams in one round trip.
 func (s *Store) GetAll(ctx context.Context) (map[string]int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "state_positions_all")
 	q := fmt.Sprintf(`SELECT name, position FROM %s WHERE instance_name = $1`, s.table)
 	rows, err := s.pool.Query(ctx, q, s.instance)
 	if err != nil {
@@ -256,6 +258,7 @@ type RetryTimings struct {
 // Ours rather than Synapse's `destinations` table, and the reason is not
 // tidiness -- see SetRetryTimings.
 func (s *Store) GetRetryTimings(ctx context.Context, destinations []string) (map[string]RetryTimings, error) {
+	ctx = dbtrace.WithQueryName(ctx, "state_retry_timings_get")
 	if s.retryTable == "" || len(destinations) == 0 {
 		return nil, nil
 	}
@@ -312,6 +315,7 @@ func (s *Store) GetRetryTimings(ctx context.Context, destinations []string) (map
 // cached it. Synapse still keeps its own for its own outbound requests, written
 // and invalidated by Synapse, exactly as it does when no sender is running.
 func (s *Store) SetRetryTimings(ctx context.Context, destination string, t RetryTimings) error {
+	ctx = dbtrace.WithQueryName(ctx, "state_retry_timings_set")
 	if s.retryTable == "" {
 		return nil
 	}

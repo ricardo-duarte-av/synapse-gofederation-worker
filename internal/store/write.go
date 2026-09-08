@@ -73,6 +73,7 @@ func (w *Writer) Close() {
 // transactions, and then fail every deletion -- delivering correctly while its
 // bookkeeping silently went nowhere and the outbox grew without bound.
 func (w *Writer) CanWrite(ctx context.Context) error {
+	ctx = dbtrace.WithQueryName(ctx, "check_can_write")
 	var readOnly string
 	if err := w.pool.QueryRow(ctx, `SHOW default_transaction_read_only`).Scan(&readOnly); err != nil {
 		return fmt.Errorf("store: checking write access: %w", err)
@@ -92,6 +93,7 @@ func (w *Writer) CanWrite(ctx context.Context) error {
 // and never deletes will re-read the same rows forever, and the outbox grows
 // without bound.
 func (w *Writer) DeleteDeviceMsgsForRemote(ctx context.Context, destination string, upToStreamID int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "delete_device_msgs")
 	const q = `DELETE FROM device_federation_outbox WHERE destination = $1 AND stream_id <= $2`
 	if _, err := w.pool.Exec(ctx, q, destination, upToStreamID); err != nil {
 		return fmt.Errorf("store: delete to-device messages for %s: %w", destination, err)
@@ -109,6 +111,7 @@ func (w *Writer) DeleteDeviceMsgsForRemote(ctx context.Context, destination stri
 // chain a receiver uses to notice a gap -- and a broken chain is not detectable
 // from either end.
 func (w *Writer) MarkAsSentDevicesByRemote(ctx context.Context, destination string, upToStreamID int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "mark_devices_sent")
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("store: begin: %w", err)

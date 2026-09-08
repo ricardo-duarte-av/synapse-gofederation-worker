@@ -21,6 +21,7 @@ import (
 // Events with no row are simply absent: an outlier has no state group, and
 // there is nothing wrong with that.
 func (s *Store) GetStateGroupsForEvents(ctx context.Context, eventIDs []string) (map[string]int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "state_groups_for_events")
 	if len(eventIDs) == 0 {
 		return nil, nil
 	}

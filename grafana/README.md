@@ -128,7 +128,14 @@ Two readings that look like problems and are not:
 rather than at chosen call sites. That distinction is the point: the query
 nobody thought to instrument is the one that turns out to be slow, so pgx's
 QueryTracer hooks the pool and a query with no name is counted as `other`
-rather than dropped. An uninstrumented query appears as a rising `other` line.
+rather than dropped.
+
+`other` should stay at or near zero. Every query site in `internal/store` and
+`internal/state` names itself, and `TestEveryQuerySiteIsNamed` reads the AST and
+fails if one stops — added after `other` turned out to be the busiest line on
+this panel at 1.026 queries a second, because fourteen sites had been missed by
+hand. A rising `other` now means a new query somewhere else, which is exactly
+what it should mean.
 
 `joined_hosts_at_state_group` is the one to watch. It walks the state group
 edges and was measured directly against this database at 10.8ms, 108ms, 375ms

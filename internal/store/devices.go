@@ -114,6 +114,7 @@ func (s *Store) GetDeviceUpdatesByRemote(
 // The row itself carries only the user id and a "hosts were calculated" flag,
 // so this is the only way to learn who the poke is actually for.
 func (s *Store) GetDestinationsForDevice(ctx context.Context, streamID int64) ([]string, error) {
+	ctx = dbtrace.WithQueryName(ctx, "destinations_for_device")
 	const q = `SELECT destination FROM device_lists_outbound_pokes WHERE stream_id = $1`
 	rows, err := s.pool.Query(ctx, q, streamID)
 	if err != nil {
@@ -147,6 +148,7 @@ func (s *Store) MaxDeviceListOutboundStreamID(ctx context.Context) (int64, error
 }
 
 func (s *Store) maxStreamID(ctx context.Context, q string) (int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "max_device_stream_id")
 	var v int64
 	if err := s.pool.QueryRow(ctx, q).Scan(&v); err != nil {
 		return 0, fmt.Errorf("store: max stream id: %w", err)
@@ -220,6 +222,7 @@ func DeviceDetailKey(userID, deviceID string) string { return userID + "\x00" + 
 // device. Zero means there is no predecessor, which Synapse sends as an empty
 // prev_id list.
 func (s *Store) GetLastDeviceUpdateForRemoteUser(ctx context.Context, destination, userID string, fromStreamID int64) (int64, error) {
+	ctx = dbtrace.WithQueryName(ctx, "last_device_update")
 	const q = `
 		SELECT COALESCE(MAX(stream_id), 0) FROM device_lists_outbound_last_success
 		WHERE destination = $1 AND user_id = $2 AND stream_id <= $3`
@@ -253,6 +256,7 @@ type CrossSigningKey struct {
 
 // GetCrossSigningKeys loads the master and self-signing keys for a set of users.
 func (s *Store) GetCrossSigningKeys(ctx context.Context, userIDs []string) ([]CrossSigningKey, error) {
+	ctx = dbtrace.WithQueryName(ctx, "cross_signing_keys")
 	if len(userIDs) == 0 {
 		return nil, nil
 	}

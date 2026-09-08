@@ -97,6 +97,7 @@ func FilterDestinationsByRetryLimiter(
 // successful transaction recorded, and Synapse leaves catch-up immediately
 // rather than replaying history for it (per_destination_queue.py:485).
 func (s *Store) GetDestinationLastSuccessfulStreamOrdering(ctx context.Context, destination string) (int64, bool, error) {
+	ctx = dbtrace.WithQueryName(ctx, "destination_last_successful")
 	const q = `SELECT last_successful_stream_ordering FROM destinations WHERE destination = $1`
 	var v *int64
 	err := s.pool.QueryRow(ctx, q, destination).Scan(&v)
