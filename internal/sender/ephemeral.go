@@ -192,24 +192,40 @@ func (e *Ephemeral) HandlePresence(ctx context.Context, destination string, user
 		return nil
 	}
 
-	push := make([]map[string]any, 0, len(states))
+	// Merged into the destination's pending m.presence EDU rather than sent as
+	// an EDU of its own. One EDU carries fifty users
+	// (per_destination_queue.py:79), and this worker was emitting exactly 1.00
+	// states per EDU -- a transaction, an HTTP request and a signature
+	// verification on somebody else's server, for each single user.
+	//
+	// The encoding is deferred to transaction time. last_active_ago is a
+	// duration from NOW, so rendering it here and sending later would
+	// understate how long ago the user was actually active.
+	q := e.queues.Get(destination)
+	queued := 0
 	for _, userID := range userIDs {
-		s, ok := states[userID]
+		st, ok := states[userID]
 		if !ok {
 			continue
 		}
-		push = append(push, formatPresence(s))
+		q.EnqueuePresence(queue.PresenceEntry{
+			UserID: userID,
+			Encode: func(nowMS int64) json.RawMessage {
+				body, err := json.Marshal(formatPresenceAt(st, nowMS))
+				if err != nil {
+					// Cannot happen for this shape, and an EDU is not worth
+					// failing a transaction over. An empty object is dropped by
+					// the receiver rather than corrupting the rest.
+					return json.RawMessage(`{}`)
+				}
+				return body
+			},
+		})
+		queued++
 	}
-	if len(push) == 0 {
+	if queued == 0 {
 		return nil
 	}
-
-	content, err := json.Marshal(map[string]any{"push": push})
-	if err != nil {
-		return fmt.Errorf("sender: encoding presence: %w", err)
-	}
-	q := e.queues.Get(destination)
-	q.EnqueueEDU(txn.EDU{Type: txn.EDUTypePresence, Content: content})
 	e.queues.Wake(q)
 	return nil
 }
@@ -221,12 +237,18 @@ func (e *Ephemeral) HandlePresence(ctx context.Context, destination string, user
 // zero, which would claim the user was active at the epoch, and
 // currently_active is meaningless unless the user is online.
 func formatPresence(s store.PresenceState) map[string]any {
+	return formatPresenceAt(s, nowMS())
+}
+
+// formatPresenceAt is formatPresence with the clock passed in, so the EDU can be
+// rendered when the transaction is built rather than when the state was read.
+func formatPresenceAt(s store.PresenceState, nowMS int64) map[string]any {
 	out := map[string]any{
 		"presence": s.State,
 		"user_id":  s.UserID,
 	}
 	if s.LastActiveTS > 0 {
-		out["last_active_ago"] = nowMS() - s.LastActiveTS
+		out["last_active_ago"] = nowMS - s.LastActiveTS
 	}
 	if s.StatusMsg != "" {
 		out["status_msg"] = s.StatusMsg

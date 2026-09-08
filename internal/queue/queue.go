@@ -58,6 +58,11 @@ type EDU struct {
 	// transaction time rather than on arrival, since receipts keep merging in
 	// while the EDU waits.
 	Receipts map[string]map[string]map[string]receiptEntry
+	// Presence holds a merged m.presence EDU, user -> that user's state. Like
+	// Receipts, and for the same reason: one EDU carries up to fifty users
+	// (per_destination_queue.py:79) and sending one EDU per user spends a
+	// transaction on each.
+	Presence map[string]PresenceEntry
 }
 
 // PDU is an event waiting to go to a destination.

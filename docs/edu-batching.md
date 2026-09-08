@@ -86,11 +86,15 @@ indicator can appear after the user has stopped typing, or lag by up to 70s.
 Either typing keeps a much shorter deadline than receipts and presence, or it is
 excluded from batching. Read receipts and presence tolerate 30s comfortably.
 
-**Presence should also merge, not just batch.** A separate win, and larger: this
-worker currently emits 1.00 presence states per `m.presence` EDU, though one EDU
-carries up to 50. Batching puts N presence EDUs in one transaction; merging puts
-N states in one EDU. Receipts already merge (`EnqueueReceipt`); presence does
-not. Doing both compounds.
+**Presence merging is DONE** (`EnqueuePresence`), and was the larger half. This
+worker was emitting 1.00 presence states per `m.presence` EDU though one EDU
+carries 50, so each user cost a transaction. Merging puts N states in one EDU;
+batching, still to do, would put N EDUs in one transaction. The two compound.
+
+The encoding is deferred to transaction-build time, which matters more once
+transactions are also held: `last_active_ago` is a duration from now, so a state
+rendered on arrival and sent 30 seconds later would claim the user was active 30
+seconds more recently than they were.
 
 **The deadline needs a timer, not a poll.** Holding EDUs means a destination with
 queued work and no new arrivals must still wake when the deadline passes.

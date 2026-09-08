@@ -146,3 +146,53 @@ func TestEphemeralWithNoBackoffSendsToEveryone(t *testing.T) {
 		t.Errorf("queued %d EDUs with no backoff hook, want 1", edus)
 	}
 }
+
+// End to end: several presence rows for one destination must become ONE EDU
+// carrying every user, not one EDU each.
+func TestPresenceForOneDestinationMergesAcrossCalls(t *testing.T) {
+	st := &fakeEphemeralStore{
+		presence: map[string]store.PresenceState{
+			"@alice:example.com": {UserID: "@alice:example.com", State: "online"},
+			"@bob:example.com":   {UserID: "@bob:example.com", State: "unavailable"},
+			"@carol:example.com": {UserID: "@carol:example.com", State: "offline"},
+		},
+	}
+	m := ephemeralQueues(t)
+	e := NewEphemeral(EphemeralConfig{
+		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
+		ShouldHandle: func(string) bool { return true },
+	})
+
+	ctx := context.Background()
+	// Arriving as three separate replication batches, which is the normal case:
+	// rows for one destination rarely land in the same batch.
+	for _, u := range []string{"@alice:example.com", "@bob:example.com", "@carol:example.com"} {
+		if err := e.HandlePresence(ctx, "remote.example", []string{u}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, edus := m.Get("remote.example").Pending(); edus != 1 {
+		t.Fatalf("%d EDUs queued for three users, want them merged into one", edus)
+	}
+}
+
+// last_active_ago must be measured from when the transaction is built. A state
+// read a minute ago and sent now should say a minute, not zero.
+func TestPresenceLastActiveAgoUsesSendTime(t *testing.T) {
+	now := nowMS()
+	s := store.PresenceState{
+		UserID: "@alice:example.com", State: "online", LastActiveTS: now - 60_000,
+	}
+
+	atRead := formatPresenceAt(s, now)
+	atSend := formatPresenceAt(s, now+30_000)
+
+	if atRead["last_active_ago"].(int64) != 60_000 {
+		t.Errorf("last_active_ago at read = %v, want 60000", atRead["last_active_ago"])
+	}
+	if atSend["last_active_ago"].(int64) != 90_000 {
+		t.Errorf("last_active_ago 30s later = %v, want 90000 -- it must grow with the wait",
+			atSend["last_active_ago"])
+	}
+}

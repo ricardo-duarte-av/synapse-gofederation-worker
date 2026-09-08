@@ -2,7 +2,11 @@ package queue
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
 )
@@ -143,5 +147,118 @@ func TestReceiptContentIsEncodedAtSendTime(t *testing.T) {
 	}
 	if got := len(sentBody.EDUs[0].Content["!room"]["m.read"]); got != 2 {
 		t.Errorf("%d users in the sent EDU, want both", got)
+	}
+}
+
+// One m.presence EDU carries up to fifty users, and this worker was emitting
+// exactly 1.00 states per EDU -- a transaction, an HTTP request and a signature
+// verification on somebody else's server for each single user.
+func TestPresenceMergesIntoOneEDU(t *testing.T) {
+	d := testDestination(t, &recordingSink{}, Limits{})
+
+	for _, u := range []string{"@a:x", "@b:x", "@c:x"} {
+		d.EnqueuePresence(presenceEntry(u, 0))
+	}
+	if _, edus := d.Pending(); edus != 1 {
+		t.Fatalf("%d EDUs queued, want one carrying all three users", edus)
+	}
+
+	unit, err := d.pendingEDUs[0].materialise()
+	if err != nil {
+		t.Fatal(err)
+	}
+	push := gjson.GetBytes(unit.Content, "push").Array()
+	if len(push) != 3 {
+		t.Fatalf("push has %d entries, want 3: %s", len(push), unit.Content)
+	}
+	// Sorted, because presence goes on the wire as an ARRAY: map order would
+	// make two runs over the same state produce different bytes, and comparing
+	// against Synapse byte for byte is the point of the capture rig.
+	got := []string{push[0].Get("user_id").String(), push[1].Get("user_id").String(),
+		push[2].Get("user_id").String()}
+	if got[0] != "@a:x" || got[1] != "@b:x" || got[2] != "@c:x" {
+		t.Errorf("push order = %v, want sorted by user", got)
+	}
+}
+
+// Presence is a user's CURRENT state, so two updates about one person are one
+// fact and only the latest is worth sending. Synapse keeps _pending_presence as
+// a dict keyed by user for the same reason.
+func TestPresenceReplacesPerUser(t *testing.T) {
+	d := testDestination(t, &recordingSink{}, Limits{})
+
+	d.EnqueuePresence(presenceEntry("@a:x", 1))
+	d.EnqueuePresence(presenceEntry("@a:x", 2))
+
+	if _, edus := d.Pending(); edus != 1 {
+		t.Fatalf("%d EDUs queued, want one", edus)
+	}
+	unit, err := d.pendingEDUs[0].materialise()
+	if err != nil {
+		t.Fatal(err)
+	}
+	push := gjson.GetBytes(unit.Content, "push").Array()
+	if len(push) != 1 {
+		t.Fatalf("push has %d entries, want the newer state to have replaced the older", len(push))
+	}
+	if v := push[0].Get("v").Int(); v != 2 {
+		t.Errorf("kept version %d, want the newer 2", v)
+	}
+}
+
+// Fifty per EDU is Synapse's bound (per_destination_queue.py:79). Without it a
+// transaction to a busy server could carry thousands of states.
+func TestPresenceStartsANewEDUWhenFull(t *testing.T) {
+	d := testDestination(t, &recordingSink{}, Limits{})
+
+	for i := 0; i < maxPresenceStates+5; i++ {
+		d.EnqueuePresence(presenceEntry(fmt.Sprintf("@u%03d:x", i), 0))
+	}
+	_, edus := d.Pending()
+	if edus != 2 {
+		t.Fatalf("%d EDUs queued, want 2 once the first held %d", edus, maxPresenceStates)
+	}
+	first, err := d.pendingEDUs[0].materialise()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(gjson.GetBytes(first.Content, "push").Array()); n != maxPresenceStates {
+		t.Errorf("first EDU carries %d states, want %d", n, maxPresenceStates)
+	}
+}
+
+// last_active_ago is a duration from NOW, so it must be rendered when the
+// transaction is built. Encoding on arrival and sending later would understate
+// how long ago the user was actually active by however long the EDU waited.
+func TestPresenceEncodesAtTransactionTime(t *testing.T) {
+	d := testDestination(t, &recordingSink{}, Limits{})
+
+	var encodedAt int64
+	d.EnqueuePresence(PresenceEntry{
+		UserID: "@a:x",
+		Encode: func(nowMS int64) json.RawMessage {
+			encodedAt = nowMS
+			return json.RawMessage(`{"user_id":"@a:x"}`)
+		},
+	})
+	if encodedAt != 0 {
+		t.Fatal("presence was encoded on arrival, not at transaction time")
+	}
+
+	before := time.Now().UnixMilli()
+	if _, err := d.pendingEDUs[0].materialise(); err != nil {
+		t.Fatal(err)
+	}
+	if encodedAt < before {
+		t.Errorf("encoded at %d, before materialise was called at %d", encodedAt, before)
+	}
+}
+
+func presenceEntry(userID string, version int) PresenceEntry {
+	return PresenceEntry{
+		UserID: userID,
+		Encode: func(int64) json.RawMessage {
+			return json.RawMessage(fmt.Sprintf(`{"user_id":%q,"v":%d}`, userID, version))
+		},
 	}
 }
