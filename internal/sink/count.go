@@ -33,3 +33,20 @@ func countEDUTypes(body []byte) map[string]int {
 	}
 	return out
 }
+
+// countPresenceStates counts the individual user states across a transaction's
+// m.presence EDUs.
+//
+// One EDU carries up to 50 of them, so this is what separates "we coalesce" --
+// the same presence delivered in fewer, fuller EDUs -- from "we drop", which
+// the EDU count alone cannot distinguish.
+func countPresenceStates(body []byte) int {
+	n := 0
+	for _, e := range gjson.GetBytes(body, "edus").Array() {
+		if e.Get("edu_type").String() != "m.presence" {
+			continue
+		}
+		n += len(e.Get("content.push").Array())
+	}
+	return n
+}

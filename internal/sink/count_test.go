@@ -32,3 +32,26 @@ func TestCountEDUTypes(t *testing.T) {
 		t.Errorf("an EDU-less transaction produced %d entries", n)
 	}
 }
+
+// One m.presence EDU carries up to 50 states, so the EDU count alone cannot
+// tell coalescing from loss. This is the number that can.
+func TestCountPresenceStates(t *testing.T) {
+	body := []byte(`{"edus":[
+		{"edu_type":"m.presence","content":{"push":[{"user_id":"@a:x"},{"user_id":"@b:x"},{"user_id":"@c:x"}]}},
+		{"edu_type":"m.presence","content":{"push":[{"user_id":"@d:x"}]}},
+		{"edu_type":"m.receipt","content":{"!r:x":{}}},
+		{"edu_type":"m.typing","content":{"typing":true}}
+	]}`)
+
+	if got := countPresenceStates(body); got != 4 {
+		t.Errorf("countPresenceStates = %d, want 4 across two EDUs", got)
+	}
+	// A transaction of four EDUs carrying four presence states is exactly the
+	// case the EDU counter reads wrong.
+	if got := countEDUTypes(body)["m.presence"]; got != 2 {
+		t.Errorf("presence EDUs = %d, want 2", got)
+	}
+	if got := countPresenceStates([]byte(`{"edus":[{"edu_type":"m.typing"}]}`)); got != 0 {
+		t.Errorf("non-presence transaction counted %d states", got)
+	}
+}

@@ -175,6 +175,25 @@ var (
 		Help: "PDUs placed in transactions.",
 	})
 
+	// PresenceStatesSent counts individual user presence states put on the wire.
+	//
+	// Distinct from the EDU count, and the distinction is the only way to tell
+	// two very different things apart. One m.presence EDU carries up to 50
+	// states, so a sender that coalesces aggressively delivers the same
+	// information in far fewer EDUs than one that does not -- which looks
+	// identical, from the EDU counter alone, to a sender that is silently
+	// dropping presence.
+	//
+	// The Python senders this worker replaced sent 15.257 presence EDUs per
+	// second against 15.35 transactions per second: one destination, one
+	// transaction, one EDU, essentially never batched. This worker sends 3.5
+	// EDUs per second from a HIGHER input rate, and whether that is coalescing
+	// or loss cannot be read from either counter alone.
+	PresenceStatesSent = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gofed_presence_states_sent_total",
+		Help: "User presence states placed in transactions, across all m.presence EDUs.",
+	})
+
 	// TransactionEDUsByType counts EDUs placed in transactions, by edu_type.
 	//
 	// The counterpart to Synapse's
@@ -214,7 +233,7 @@ func All() []prometheus.Collector {
 		ApproximateRoutes, BatchDuration,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,
 		Transactions, TransactionPDUs, TransactionEDUs, TransactionEDUsByType,
-		TransactionBytes,
+		PresenceStatesSent, TransactionBytes,
 		EventProcessingLag, StageDuration, FanOutDuration, SendDuration,
 		InFlightSends, DestinationGoroutines, WriteOps, DestinationsBackingOff,
 	}

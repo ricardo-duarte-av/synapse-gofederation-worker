@@ -41,7 +41,7 @@ type HTTP struct {
 	onSent   func(pdus, edus, bytes int)
 	// onEDUTypes reports the EDU type breakdown of each transaction, which the
 	// unlabelled counts cannot answer questions about. See countEDUTypes.
-	onEDUTypes func(byType map[string]int)
+	onEDUTypes func(byType map[string]int, presenceStates int)
 	capture    Capturer
 
 	// observe reports one attempt's duration and outcome, and inFlight tracks
@@ -143,7 +143,9 @@ func (h *HTTP) SetOnSent(f func(pdus, edus, bytes int)) { h.onSent = f }
 
 // SetOnEDUTypes registers a callback for the EDU type breakdown of each
 // transaction.
-func (h *HTTP) SetOnEDUTypes(f func(byType map[string]int)) { h.onEDUTypes = f }
+func (h *HTTP) SetOnEDUTypes(f func(byType map[string]int, presenceStates int)) {
+	h.onEDUTypes = f
+}
 
 // SetCapture registers a full-request recorder.
 func (h *HTTP) SetCapture(c Capturer) { h.capture = c }
@@ -266,7 +268,7 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 	h.observed("ok", started)
 	pdus, edus := countUnits(req.Body)
 	if h.onEDUTypes != nil {
-		h.onEDUTypes(countEDUTypes(req.Body))
+		h.onEDUTypes(countEDUTypes(req.Body), countPresenceStates(req.Body))
 	}
 	if h.onSent != nil {
 		h.onSent(pdus, edus, len(req.Body))

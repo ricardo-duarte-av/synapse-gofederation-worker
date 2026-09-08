@@ -60,7 +60,7 @@ type DryRun struct {
 	onSent func(pdus, edus, bytes int)
 	// onEDUTypes reports the EDU type breakdown of each transaction, which the
 	// unlabelled counts cannot answer questions about. See countEDUTypes.
-	onEDUTypes func(byType map[string]int)
+	onEDUTypes func(byType map[string]int, presenceStates int)
 	// capture records the full request for named destinations. Separate from
 	// onSent because it is about bytes rather than counts, and because it is
 	// off for every destination but the handful being compared.
@@ -82,7 +82,9 @@ func (d *DryRun) SetOnSent(f func(pdus, edus, bytes int)) { d.onSent = f }
 
 // SetOnEDUTypes registers a callback for the EDU type breakdown of each
 // transaction.
-func (d *DryRun) SetOnEDUTypes(f func(byType map[string]int)) { d.onEDUTypes = f }
+func (d *DryRun) SetOnEDUTypes(f func(byType map[string]int, presenceStates int)) {
+	d.onEDUTypes = f
+}
 
 // SetCapture registers a full-request recorder.
 func (d *DryRun) SetCapture(c Capturer) { d.capture = c }
@@ -100,7 +102,7 @@ func (d *DryRun) Mode() string { return "dry-run (shadow; nothing is sent)" }
 func (d *DryRun) Send(_ context.Context, req *txn.Request) (Result, error) {
 	pdus, edus := countUnits(req.Body)
 	if d.onEDUTypes != nil {
-		d.onEDUTypes(countEDUTypes(req.Body))
+		d.onEDUTypes(countEDUTypes(req.Body), countPresenceStates(req.Body))
 	}
 	d.transactions.Add(1)
 	d.pdus.Add(int64(pdus))
