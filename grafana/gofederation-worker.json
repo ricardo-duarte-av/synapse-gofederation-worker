@@ -1145,7 +1145,7 @@
       "id": 40,
       "type": "timeseries",
       "title": "State group cache hit rate",
-      "description": "The joined-host lookup is the most expensive thing in the per-event path -- a recursive walk of the state group edges, hundreds of milliseconds on a deep chain and seconds at worst. A state group is immutable, so the answer is cached with no invalidation and the query runs once per state CHANGE rather than once per event. Events between two state changes share a group (14.5 of them here, measured), so expect a high rate; a falling one means rooms are changing membership faster than the cache holds them, or that it is too small.",
+      "description": "The joined-host lookup is the most expensive thing in the per-event path -- a recursive walk of the state group edges, hundreds of milliseconds on a deep chain and seconds at worst. A state group is immutable, so the answer is cached with no invalidation and the query runs once per state CHANGE rather than once per event. Events between two state changes share a group (14.5 of them here, measured), so expect a high rate; a falling one means rooms are changing membership faster than the cache holds them, or that it is too small. 'entries held' against resolution.host_cache_entries answers whether a bigger cache would help: while it sits below the limit nothing has been evicted, so every miss is a first sight of a state group and raising the limit changes nothing.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1175,6 +1175,16 @@
           "expr": "sum by (result) (rate(gofed_state_group_cache_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{result}}/s",
           "refId": "B",
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "gofed_state_group_cache_entries{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "entries held",
+          "refId": "C",
           "instant": false
         }
       ],
@@ -1230,6 +1240,26 @@
               {
                 "id": "custom.axisLabel",
                 "value": "lookups/s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "entries held"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "lookups/s \u00b7 entries"
               }
             ]
           }

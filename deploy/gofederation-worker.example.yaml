@@ -97,6 +97,27 @@ shadow:
 #     destination_retry_multiplier: 5
 #     destination_max_retry_interval: 12h
 
+resolution:
+  # How many state groups' joined-host sets to remember.
+  #
+  # This is a MEMORY setting, not a hit-rate one, and the difference is the
+  # whole reason it is configurable. The lookup it caches is keyed by a state
+  # group, and a state group is immutable, so the cache never evicts for
+  # correctness and a bigger one cannot lift the hit rate past its ceiling:
+  # events between two state changes share a group, so the best achievable rate
+  # is 1 - 1/(events per group) -- about 93% on this deployment -- and the
+  # remaining misses are first sights that no size prevents.
+  #
+  # What varies between homeservers is what an ENTRY costs: one hostname per
+  # server in the room, and rooms differ by three orders of magnitude. Here the
+  # median room has 2 servers and the largest 1,308, so 4096 entries is a few
+  # megabytes; on a homeserver that lives in large rooms the same number is
+  # hundreds.
+  #
+  # Watch gofed_state_group_cache_entries. While it sits below this limit
+  # nothing has ever been evicted, and raising it changes nothing.
+  host_cache_entries: 4096
+
 database:
   # Omitted: the connection is built from homeserver.yaml's `database:` block --
   # host, port, user, password, dbname -- so there is one statement of where the

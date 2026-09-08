@@ -296,3 +296,26 @@ func TestTheExampleConfigParses(t *testing.T) {
 		t.Errorf("database.dsn = %q, want it left to homeserver.yaml", cfg.Database.DSN)
 	}
 }
+
+// A cache size of zero would be a cache that misses every time while looking
+// configured, so it is refused rather than silently defaulted.
+func TestHostCacheEntriesMustBePositive(t *testing.T) {
+	if _, err := Parse([]byte(minimal + "\nresolution:\n  host_cache_entries: 0\n")); err == nil {
+		t.Error("a zero host cache size was accepted")
+	}
+	cfg, err := Parse([]byte(minimal + "\nresolution:\n  host_cache_entries: 128\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Resolution.HostCacheEntries != 128 {
+		t.Errorf("HostCacheEntries = %d", cfg.Resolution.HostCacheEntries)
+	}
+	// Absent takes the default rather than zero.
+	cfg, err = Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Resolution.HostCacheEntries < 1 {
+		t.Errorf("absent host_cache_entries gave %d", cfg.Resolution.HostCacheEntries)
+	}
+}

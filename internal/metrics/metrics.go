@@ -38,6 +38,17 @@ var (
 		Help: "1 while the replication subscription is connected.",
 	})
 
+	// StateGroupCacheEntries is how full the joined-host cache is.
+	//
+	// The question "should the cache be bigger?" is only answerable with this:
+	// while it sits below resolution.host_cache_entries the cache has never
+	// evicted anything, every miss is a first sight of a state group, and
+	// raising the limit cannot change the hit rate by a single lookup.
+	StateGroupCacheEntries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "gofed_state_group_cache_entries",
+		Help: "State groups currently held in the joined-host cache.",
+	})
+
 	// StateGroupCache counts joined-host lookups by result.
 	//
 	// The hit rate is the whole value of the cache: state groups are immutable,
@@ -182,7 +193,7 @@ var (
 func All() []prometheus.Collector {
 	return []prometheus.Collector{
 		BuildInfo, ShadowMode, DatabaseReadOnly,
-		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped, StateGroupCache,
+		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped, StateGroupCache, StateGroupCacheEntries,
 		EventsProcessed, EventsSkipped, EventsRouted, DestinationsPerEvent,
 		ApproximateRoutes, BatchDuration,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,

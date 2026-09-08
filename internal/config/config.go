@@ -20,6 +20,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/destinations"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
 )
 
@@ -71,6 +72,7 @@ type Config struct {
 	SigningKeyPath string `yaml:"signing_key_path"`
 
 	Shadow      ShadowConfig      `yaml:"shadow"`
+	Resolution  ResolutionConfig  `yaml:"resolution"`
 	Database    DatabaseConfig    `yaml:"database"`
 	State       StateConfig       `yaml:"state"`
 	Replication ReplicationConfig `yaml:"replication"`
@@ -129,6 +131,28 @@ type ShadowConfig struct {
 	// separate option rather than a property of leaving send_only_to empty.
 	// Nobody should reach production federation traffic by deleting a line.
 	SendToAll bool `yaml:"send_to_all"`
+}
+
+// ResolutionConfig tunes working out where an event goes.
+type ResolutionConfig struct {
+	// HostCacheEntries is how many state groups' joined-host sets to remember.
+	//
+	// Sized by MEMORY rather than by hit rate, which is the part that surprises.
+	// The lookup it caches is keyed by state group, and a state group is
+	// immutable, so the cache never evicts for correctness and a bigger one
+	// cannot raise the hit rate above its ceiling: events between two state
+	// changes share a group, so the best possible rate is 1 - 1/(events per
+	// group), and misses beyond that are first sights of a group that no size
+	// prevents.
+	//
+	// What DOES vary between homeservers is what an entry costs. One entry is
+	// one hostname per server in the room, and rooms differ by three orders of
+	// magnitude -- on this deployment the median room has 2 servers and the
+	// largest has 1,308. So the same 4,096 entries is a few megabytes on one
+	// homeserver and hundreds on another, which is why this is a setting and
+	// not a constant. Watch gofed_state_group_cache_entries: while it sits
+	// below the limit, raising it changes nothing at all.
+	HostCacheEntries int `yaml:"host_cache_entries"`
 }
 
 // DatabaseConfig is the read-only connection to Synapse's database.
@@ -287,8 +311,9 @@ func Parse(data []byte) (*Config, error) {
 			MaxEDUsPerTransaction:     SynapseMaxEDUsPerTransaction,
 			EventBatchLimit:           SynapseEventBatchLimit,
 		},
-		Metrics: MetricsConfig{Addr: ":9202"},
-		Log:     LogConfig{Level: "info"},
+		Resolution: ResolutionConfig{HostCacheEntries: destinations.DefaultHostCacheEntries},
+		Metrics:    MetricsConfig{Addr: ":9202"},
+		Log:        LogConfig{Level: "info"},
 	}
 
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
@@ -379,6 +404,11 @@ func (c *Config) validate() error {
 	}
 	if c.State.Table == "" {
 		return fmt.Errorf("config: state.table cannot be empty")
+	}
+	if c.Resolution.HostCacheEntries < 1 {
+		return fmt.Errorf("config: resolution.host_cache_entries must be at least 1, got %d; "+
+			"omit it for the default of %d", c.Resolution.HostCacheEntries,
+			destinations.DefaultHostCacheEntries)
 	}
 	if c.Queue.MaxConcurrentDestinations < 1 {
 		return fmt.Errorf("config: queue.max_concurrent_destinations must be at least 1, got %d",

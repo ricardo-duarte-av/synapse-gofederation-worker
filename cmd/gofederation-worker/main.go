@@ -161,6 +161,7 @@ type worker struct {
 	sender    *sender.Sender
 	devices   *sender.Devices
 	catchup   *sender.CatchUp
+	hosts     *destinations.CachedRoomHosts
 	ephemeral *sender.Ephemeral
 	typing    *sender.Typing
 	sub       *replication.Subscriber
@@ -356,7 +357,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	// creates a new group rather than editing one. Caching it needs no
 	// invalidation and turns the query into once per state change rather than
 	// once per event.
-	hosts := destinations.NewCachedRoomHosts(w.db, destinations.DefaultHostCacheEntries)
+	hosts := destinations.NewCachedRoomHosts(w.db, cfg.Resolution.HostCacheEntries)
 	hosts.SetOnLookup(func(hit bool) {
 		result := "miss"
 		if hit {
@@ -364,6 +365,8 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		}
 		metrics.StateGroupCache.WithLabelValues(result).Inc()
 	})
+
+	w.hosts = hosts
 
 	w.sender = sender.New(sender.Config{
 		Store:          w.db,
