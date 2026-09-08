@@ -143,6 +143,9 @@ type Destination struct {
 	longBackoff func(destination string) bool
 	// onEDUsDropped reports what a long outage cost.
 	onEDUsDropped func(destination string, n int)
+	// outageLogged keeps one outage to one log line. Guarded by the loop, which
+	// is single-threaded per destination.
+	outageLogged bool
 }
 
 // Config builds a Destination.
@@ -309,8 +312,19 @@ func (d *Destination) Run(ctx context.Context) {
 			// so holding them in memory buys nothing.
 			if d.longBackoff != nil && d.longBackoff(d.name) {
 				if n := d.dropEphemeralEDUs(); n > 0 {
-					d.log.Info().Int("edus", n).
-						Msg("destination is in a long outage; dropping its ephemeral EDUs and catching up later")
+					// Once per outage, not once per EDU. Every enqueue wakes
+					// this loop, so a busy room drops one EDU at a time and an
+					// unconditional log prints a line per receipt per dead
+					// server, forever -- thousands of lines saying the same
+					// thing about the same outage. The count that matters is
+					// gofed_edus_dropped_total, which loses nothing by the log
+					// being quiet.
+					if !d.outageLogged {
+						d.outageLogged = true
+						d.log.Info().Int("edus", n).
+							Msg("destination is in a long outage; dropping its ephemeral EDUs " +
+								"and catching up later (further drops for it are not logged)")
+					}
 					if d.onEDUsDropped != nil {
 						d.onEDUsDropped(d.name, n)
 					}
@@ -322,6 +336,9 @@ func (d *Destination) Run(ctx context.Context) {
 		}
 
 		d.mu.Lock()
+		// Past the gate, so the outage is over as far as this loop knows; the
+		// next one gets its own line.
+		d.outageLogged = false
 		// Cleared at the TOP, so anything enqueued during the send below is
 		// seen by the next iteration rather than lost.
 		d.newData = false

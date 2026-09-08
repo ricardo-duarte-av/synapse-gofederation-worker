@@ -588,3 +588,55 @@ func TestShortBackoffKeepsEphemeralEDUs(t *testing.T) {
 		t.Errorf("pending = %d pdus %d edus, want everything kept on a short backoff", pdus, edus)
 	}
 }
+
+// One outage, one log line. Every enqueue wakes the loop, so a busy room drops
+// one EDU at a time; logging each would print thousands of identical lines
+// about one dead server. Observed in production doing exactly that.
+func TestLongOutageLogsOncePerOutage(t *testing.T) {
+	var lines int
+	// Info level, as the worker runs: the debug "not attempting" line is
+	// per-attempt by design and is not what this is about.
+	w := zerolog.New(funcWriter(func(p []byte) (int, error) {
+		lines++
+		return len(p), nil
+	})).Level(zerolog.InfoLevel)
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	due := false
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: &recordingSink{}, Log: w,
+		Due:         func(string) bool { return due },
+		LongBackoff: func(string) bool { return true },
+	})
+
+	for i := 0; i < 5; i++ {
+		d.EnqueueEDU(txn.EDU{Type: txn.EDUTypeReceipt, Content: []byte(`{}`)})
+		d.Attempt(context.Background())
+		waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+	}
+	if lines != 1 {
+		t.Errorf("%d log lines for one outage, want 1", lines)
+	}
+
+	// A new outage after the destination has been reachable again gets its own
+	// line, or a server that flaps for a week goes unreported.
+	due = true
+	d.Attempt(context.Background())
+	waitFor(t, "the successful pass", func() bool { return !d.isRunning() })
+	before := lines
+
+	due = false
+	d.EnqueueEDU(txn.EDU{Type: txn.EDUTypeReceipt, Content: []byte(`{}`)})
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+	if lines != before+1 {
+		t.Errorf("a second outage produced %d new lines, want 1", lines-before)
+	}
+}
+
+type funcWriter func(p []byte) (int, error)
+
+func (f funcWriter) Write(p []byte) (int, error) { return f(p) }

@@ -218,7 +218,7 @@ func (l *Limiter) Failure(ctx context.Context, destination string) Timings {
 // Synapse's REMOTE_SERVER_UP: another worker got a response, so our backoff is
 // stale. It is not evidence WE can reach it, but retrying once and failing is
 // cheap next to leaving a working server unreachable for hours.
-func (l *Limiter) Recovered(destination string) {
+func (l *Limiter) Recovered(ctx context.Context, destination string) {
 	l.mu.Lock()
 	t := l.state[destination]
 	if t.RetryInterval == 0 && t.RetryLastTS == 0 {
@@ -226,7 +226,20 @@ func (l *Limiter) Recovered(destination string) {
 		return
 	}
 	l.state[destination] = Timings{}
+	l.loaded[destination] = true
 	l.mu.Unlock()
+
+	// Persisted, exactly as Success does. Clearing only in memory would mean a
+	// server somebody else has seen working goes back into a long backoff on
+	// our next restart, re-read from a row that recorded an outage which is
+	// over -- and with this deployment's destination_max_retry_interval of
+	// 365d, "next restart" can be a year of not trying.
+	if l.persist != nil {
+		_ = l.persist(ctx, destination, Timings{})
+	}
+	if l.onUp != nil {
+		l.onUp(destination)
+	}
 }
 
 // Backoff reports how many destinations are currently in a backoff, for

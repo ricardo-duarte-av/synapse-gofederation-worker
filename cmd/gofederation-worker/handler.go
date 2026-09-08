@@ -259,7 +259,9 @@ func (h *handler) OnRemoteServerUp(server string) {
 	if !h.worker.cfg.ShouldHandle(server) {
 		return
 	}
-	h.worker.limiter.Recovered(server)
+	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
+	defer cancel()
+	h.worker.limiter.Recovered(ctx, server)
 	q := h.worker.queues.Get(server)
 	if pdus, edus := q.Pending(); pdus == 0 && edus == 0 {
 		return

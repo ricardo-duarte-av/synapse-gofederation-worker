@@ -152,9 +152,41 @@ func TestRecoveredClearsTheBackoff(t *testing.T) {
 	if l.Due(ctx, "back.example") {
 		t.Fatal("precondition: should be backing off")
 	}
-	l.Recovered("back.example")
+	l.Recovered(ctx, "back.example")
 	if !l.Due(ctx, "back.example") {
 		t.Error("REMOTE_SERVER_UP did not clear the backoff")
+	}
+}
+
+// The clear must be PERSISTED, not only held in memory. Otherwise a server
+// somebody else has seen working goes straight back into its old backoff on the
+// next restart, read from a row recording an outage that is over -- and with a
+// destination_max_retry_interval of 365d, as this deployment uses, "the next
+// restart" can mean a year of never trying.
+func TestRecoveredPersistsTheClear(t *testing.T) {
+	ctx := context.Background()
+	written := map[string]Timings{}
+	l := New(Config{MinInterval: time.Minute, Multiplier: 2, MaxInterval: time.Hour},
+		nil,
+		func(_ context.Context, d string, timings Timings) error {
+			written[d] = timings
+			return nil
+		})
+
+	l.Failure(ctx, "back.example")
+	if written["back.example"].RetryInterval == 0 {
+		t.Fatal("precondition: the failure was not persisted")
+	}
+
+	var woken string
+	l.SetOnRecovered(func(d string) { woken = d })
+	l.Recovered(ctx, "back.example")
+
+	if got := written["back.example"]; got != (Timings{}) {
+		t.Errorf("persisted %+v, want the backoff cleared on disk too", got)
+	}
+	if woken != "back.example" {
+		t.Error("the recovery callback did not fire, so the queue is never woken")
 	}
 }
 
