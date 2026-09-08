@@ -101,13 +101,32 @@ func newTypingWith(t *testing.T, hosts *fixedHosts, block chan struct{}) (*Typin
 		Log:           zerolog.Nop(),
 		MaxConcurrent: 10,
 	})
-	return NewTyping(TypingConfig{
+	ty := NewTyping(TypingConfig{
 		Hosts:        hosts,
 		Queues:       m,
 		Log:          zerolog.Nop(),
 		ServerName:   "example.com",
 		ShouldHandle: func(string) bool { return true },
-	}), s, m
+	})
+	// The pushes are done by a single consumer now, so tests need it running.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = ty.Run(ctx) }()
+	return ty, s, m
+}
+
+// waitPending polls until a destination holds the expected number of EDUs, so
+// tests do not race the consumer goroutine.
+func waitPending(t *testing.T, m *queue.Manager, destination string, want int) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, edus := m.Get(destination).Pending()
+		if edus == want || time.Now().After(deadline) {
+			return edus
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func newTyping(t *testing.T, hosts *fixedHosts) (*Typing, *typingSink) {
@@ -132,9 +151,8 @@ func pendingEDUs(m *queue.Manager, destination string) int {
 func TestTypingDiffProducesStartsAndStops(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"example.com", "remote.example"}}
 	ty, s := newTyping(t, hosts)
-	ctx := context.Background()
 
-	ty.HandleRows(ctx, 1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 	edus := s.take(t, "remote.example", 1)
 	if len(edus) != 1 {
 		t.Fatalf("got %d EDUs, want one start", len(edus))
@@ -144,7 +162,7 @@ func TestTypingDiffProducesStartsAndStops(t *testing.T) {
 	}
 
 	// Alice absent from the new set means she stopped.
-	ty.HandleRows(ctx, 2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
+	ty.HandleRows(2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
 	edus = s.take(t, "remote.example", 1)
 	if len(edus) != 1 {
 		t.Fatalf("got %d EDUs, want one stop", len(edus))
@@ -161,7 +179,7 @@ func TestTypingIgnoresRemoteUsers(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, s := newTyping(t, hosts)
 
-	ty.HandleRows(context.Background(), 1,
+	ty.HandleRows(1,
 		[]TypingRow{{RoomID: "!r", UserIDs: []string{"@bob:remote.example"}}})
 	if edus := s.take(t, "remote.example", 0); len(edus) != 0 {
 		t.Errorf("announced a remote user's typing: %v", edus)
@@ -176,7 +194,7 @@ func TestTypingNeverSendsToOurselves(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"example.com"}}
 	ty, s := newTyping(t, hosts)
 
-	ty.HandleRows(context.Background(), 1,
+	ty.HandleRows(1,
 		[]TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 	if edus := s.take(t, "example.com", 0); len(edus) != 0 {
 		t.Errorf("queued typing for our own server: %v", edus)
@@ -189,16 +207,15 @@ func TestTypingNeverSendsToOurselves(t *testing.T) {
 func TestTypingClobbersPerRoomAndUser(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, m := newQueuedTyping(t, hosts)
-	ctx := context.Background()
 
-	ty.HandleRows(ctx, 1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
-	ty.HandleRows(ctx, 2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
+	ty.HandleRows(1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
 
 	// One pending EDU, not two: the stop replaced the start rather than
 	// queueing behind it. WHICH one survives is the queue's business and is
 	// covered by TestKeyedEDUReplacesRatherThanAccumulates; what is being
 	// tested here is the key this package chooses.
-	if n := pendingEDUs(m, "remote.example"); n != 1 {
+	if n := waitPending(t, m, "remote.example", 1); n != 1 {
 		t.Errorf("%d EDUs queued, want the stop to have replaced the start", n)
 	}
 }
@@ -209,10 +226,10 @@ func TestTypingDoesNotClobberAcrossUsers(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, m := newQueuedTyping(t, hosts)
 
-	ty.HandleRows(context.Background(), 1, []TypingRow{{RoomID: "!r",
+	ty.HandleRows(1, []TypingRow{{RoomID: "!r",
 		UserIDs: []string{"@alice:example.com", "@bob:example.com"}}})
 
-	if n := pendingEDUs(m, "remote.example"); n != 2 {
+	if n := waitPending(t, m, "remote.example", 2); n != 2 {
 		t.Errorf("%d EDUs queued, want one per user", n)
 	}
 }
@@ -223,14 +240,13 @@ func TestTypingDoesNotClobberAcrossUsers(t *testing.T) {
 func TestTypingResetsWhenTheStreamGoesBackwards(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, s := newTyping(t, hosts)
-	ctx := context.Background()
 
-	ty.HandleRows(ctx, 10, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(10, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 	s.take(t, "remote.example", 1)
 
 	// The same set again after a rewind is a START, not a no-op: the previous
 	// state was discarded, so nothing says the far side still knows.
-	ty.HandleRows(ctx, 3, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(3, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 	if edus := s.take(t, "remote.example", 1); len(edus) != 1 {
 		t.Errorf("got %d EDUs after a rewind, want the typing re-announced", len(edus))
 	}
@@ -241,14 +257,13 @@ func TestTypingResetsWhenTheStreamGoesBackwards(t *testing.T) {
 func TestTypingKeepAliveReannounces(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, s := newTyping(t, hosts)
-	ctx := context.Background()
 
-	ty.HandleRows(ctx, 1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 	s.take(t, "remote.example", 1)
 
 	// Not yet due: a keep-alive on every tick would be a transaction per tick
 	// per typing user.
-	ty.KeepAlive(ctx)
+	ty.KeepAlive()
 	if edus := s.take(t, "remote.example", 0); len(edus) != 0 {
 		t.Errorf("re-announced before the ping interval: %v", edus)
 	}
@@ -257,7 +272,7 @@ func TestTypingKeepAliveReannounces(t *testing.T) {
 	ty.lastPoke[member{"!r", "@alice:example.com"}] = time.Now().Add(-FederationPingInterval - time.Second)
 	ty.mu.Unlock()
 
-	ty.KeepAlive(ctx)
+	ty.KeepAlive()
 	edus := s.take(t, "remote.example", 1)
 	if len(edus) != 1 {
 		t.Fatalf("got %d EDUs, want the typing re-announced", len(edus))
@@ -272,13 +287,12 @@ func TestTypingKeepAliveReannounces(t *testing.T) {
 func TestTypingKeepAliveForgetsStoppedUsers(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, s := newTyping(t, hosts)
-	ctx := context.Background()
 
-	ty.HandleRows(ctx, 1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
-	ty.HandleRows(ctx, 2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
+	ty.HandleRows(1, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(2, []TypingRow{{RoomID: "!r", UserIDs: []string{}}})
 	s.take(t, "remote.example", 1)
 
-	ty.KeepAlive(ctx)
+	ty.KeepAlive()
 	if edus := s.take(t, "remote.example", 0); len(edus) != 0 {
 		t.Errorf("kept a stopped user alive: %v", edus)
 	}
@@ -290,7 +304,7 @@ func TestTypingEDUContent(t *testing.T) {
 	hosts := &fixedHosts{hosts: []string{"remote.example"}}
 	ty, s := newTyping(t, hosts)
 
-	ty.HandleRows(context.Background(), 1,
+	ty.HandleRows(1,
 		[]TypingRow{{RoomID: "!room:example.com", UserIDs: []string{"@alice:example.com"}}})
 
 	edus := s.take(t, "remote.example", 1)
@@ -316,7 +330,7 @@ func TestTypingSkipsBackingOffDestinations(t *testing.T) {
 	ty, s := newTyping(t, hosts)
 	ty.due = func(destination string) bool { return destination == "up.example" }
 
-	ty.HandleRows(context.Background(), 1,
+	ty.HandleRows(1,
 		[]TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
 
 	if edus := s.take(t, "up.example", 1); len(edus) != 1 {
@@ -324,5 +338,55 @@ func TestTypingSkipsBackingOffDestinations(t *testing.T) {
 	}
 	if edus := s.take(t, "remote.example", 0); len(edus) != 0 {
 		t.Errorf("queued typing for a backing-off destination: %v", edus)
+	}
+}
+
+// The diff is only meaningful in token order, and it used to be run from a
+// goroutine per batch -- so the batch for token 19259 could run after 19255,
+// which reads as the writer having restarted and throws away every room's
+// state. Seen in production several times a minute:
+//
+//	typing stream went backwards; forgetting who was typing from=19259 to=19255
+//
+// HandleRows is synchronous now, so ascending tokens processed in the order
+// they arrive must never trip the reset.
+func TestTypingInOrderTokensDoNotReset(t *testing.T) {
+	hosts := &fixedHosts{hosts: []string{"remote.example"}}
+	ty, _, _ := newTypingWith(t, hosts, make(chan struct{}))
+
+	for token := int64(1); token <= 50; token++ {
+		ty.HandleRows(token, []TypingRow{{
+			RoomID: "!r", UserIDs: []string{"@alice:example.com"},
+		}})
+	}
+
+	ty.mu.Lock()
+	serial := ty.serial
+	typing := len(ty.rooms["!r"])
+	ty.mu.Unlock()
+
+	if serial != 50 {
+		t.Errorf("serial = %d, want 50", serial)
+	}
+	// A reset would have emptied this, and the state must survive 50 batches.
+	if typing != 1 {
+		t.Errorf("%d users remembered as typing, want alice still there", typing)
+	}
+}
+
+// A genuine rewind still resets: the guard is against losing ORDER, not against
+// noticing that the writer really did restart.
+func TestTypingGenuineRewindStillResets(t *testing.T) {
+	hosts := &fixedHosts{hosts: []string{"remote.example"}}
+	ty, _, _ := newTypingWith(t, hosts, make(chan struct{}))
+
+	ty.HandleRows(100, []TypingRow{{RoomID: "!r", UserIDs: []string{"@alice:example.com"}}})
+	ty.HandleRows(5, []TypingRow{{RoomID: "!other", UserIDs: []string{}}})
+
+	ty.mu.Lock()
+	_, stillThere := ty.rooms["!r"]
+	ty.mu.Unlock()
+	if stillThere {
+		t.Error("a real rewind did not clear the remembered state")
 	}
 }

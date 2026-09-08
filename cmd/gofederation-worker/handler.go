@@ -192,13 +192,17 @@ func (h *handler) handleTyping(position int64, rows []replication.Row) {
 	if len(parsed) == 0 {
 		return
 	}
-	// Off the replication goroutine: this resolves room membership from the
-	// database, and blocking the subscriber would stall every other stream.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), replicationWorkTimeout)
-		defer cancel()
-		h.worker.typing.HandleRows(ctx, position, parsed)
-	}()
+	// SYNCHRONOUS, unlike the other streams, and deliberately so. A typing row
+	// is the room's whole typing set, so start and stop exist only in the diff
+	// against the previous token -- which makes the ORDER the meaning. Handing
+	// each batch to its own goroutine lost it: the batch for token 19259 could
+	// run after 19255, which reads as the writer having restarted and throws
+	// away every room's state.
+	//
+	// The diff itself is a few map operations and no I/O; the database work it
+	// produces is queued for Typing.Run, so the subscriber is still not the
+	// thing waiting on a query.
+	h.worker.typing.HandleRows(position, parsed)
 }
 
 // handleFederation routes EDUs another worker has handed us.

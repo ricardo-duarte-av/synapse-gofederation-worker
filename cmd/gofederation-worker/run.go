@@ -92,6 +92,9 @@ func (w *worker) run(ctx context.Context) error {
 	g.Go(func() error { return w.catchup.Run(gctx) })
 	g.Go(func() error { return w.sampleGauges(gctx) })
 	g.Go(func() error { return w.typingKeepAlive(gctx) })
+	// The typing pushes, one at a time and in the order the diffs produced
+	// them. See internal/sender.Typing.
+	g.Go(func() error { return w.typing.Run(gctx) })
 
 	if w.cfg.Metrics.Addr != "" {
 		g.Go(func() error { return w.serveMetrics(gctx) })
@@ -124,7 +127,7 @@ func (w *worker) typingKeepAlive(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			w.typing.KeepAlive(ctx)
+			w.typing.KeepAlive()
 		}
 	}
 }

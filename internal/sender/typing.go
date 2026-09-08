@@ -56,6 +56,22 @@ type Typing struct {
 	// nothing by the time it comes back.
 	due func(destination string) bool
 
+	// work carries pushes to the single consumer in Run.
+	//
+	// Typing arrives as a stream of tokens whose ORDER is the whole meaning: a
+	// row is the room's complete typing set, so the diff against the previous
+	// one is where start and stop come from. Handing each batch to its own
+	// goroutine loses that order -- the batch for token 19259 can run after the
+	// one for 19255, which reads as the writer having gone backwards and
+	// throws away every room's state. Observed doing exactly that, several
+	// times a minute.
+	//
+	// So the diff runs inline on the replication goroutine, where it is a few
+	// map operations and cannot stall anything, and only the pushes -- which
+	// read room membership from the database -- are handed off. One consumer,
+	// so they stay in the order the diff produced them.
+	work chan typingWork
+
 	mu sync.Mutex
 	// serial is the last typing stream token seen, for the backwards check.
 	serial int64
@@ -96,7 +112,22 @@ func NewTyping(cfg TypingConfig) *Typing {
 		hosts: cfg.Hosts, queues: cfg.Queues, log: cfg.Log,
 		serverName: cfg.ServerName, shouldHandle: cfg.ShouldHandle, due: cfg.Due,
 		rooms: map[string]map[string]bool{}, lastPoke: map[member]time.Time{},
+		work: make(chan typingWork, typingWorkBuffer),
 	}
+}
+
+// typingWorkBuffer is how many pushes may be waiting on the consumer.
+//
+// Typing is low volume -- 0.37 rows per second on this deployment -- so this is
+// generous. It is bounded rather than unbounded because the consumer talks to
+// the database: if that stalls, an unbounded queue turns one slow query into
+// unbounded memory.
+const typingWorkBuffer = 1024
+
+// typingWork is one member's typing state, waiting to be sent.
+type typingWork struct {
+	m      member
+	typing bool
 }
 
 // TypingRow is one row of the typing stream: the complete set of users typing
@@ -107,13 +138,48 @@ type TypingRow struct {
 }
 
 // HandleRows processes a batch of typing rows.
-func (t *Typing) HandleRows(ctx context.Context, token int64, rows []TypingRow) {
+//
+// Called SYNCHRONOUSLY from the replication goroutine, and that is required
+// rather than incidental: the diff is only meaningful in token order. It does
+// no I/O -- the database work is queued for Run.
+func (t *Typing) HandleRows(token int64, rows []TypingRow) {
 	starts, stops := t.diff(token, rows)
 	for _, m := range starts {
-		t.push(ctx, m, true)
+		t.submit(typingWork{m: m, typing: true})
 	}
 	for _, m := range stops {
-		t.push(ctx, m, false)
+		t.submit(typingWork{m: m, typing: false})
+	}
+}
+
+// Run sends the queued typing updates, one at a time and in order.
+func (t *Typing) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case w := <-t.work:
+			pushCtx, cancel := context.WithTimeout(ctx, typingPushTimeout)
+			t.push(pushCtx, w.m, w.typing)
+			cancel()
+		}
+	}
+}
+
+// typingPushTimeout bounds one push's database work.
+const typingPushTimeout = 30 * time.Second
+
+// submit queues a push, dropping it if the consumer has fallen far behind.
+//
+// Dropped rather than blocked: blocking here would stall the replication
+// subscriber, which would hold up every other stream to preserve a typing
+// notification -- the least important thing this worker sends.
+func (t *Typing) submit(w typingWork) {
+	select {
+	case t.work <- w:
+	default:
+		t.log.Warn().Str("room", w.m.roomID).Str("user", w.m.userID).
+			Msg("typing queue is full; dropping an update")
 	}
 }
 
@@ -177,7 +243,7 @@ func (t *Typing) diff(token int64, rows []TypingRow) (starts, stops []member) {
 // Without it a remote server expires the indicator after FederationTimeout and
 // a user who is still typing appears to have stopped -- Synapse re-pokes on a
 // wheel timer for exactly this reason (typing.py:143).
-func (t *Typing) KeepAlive(ctx context.Context) {
+func (t *Typing) KeepAlive() {
 	now := time.Now()
 
 	t.mu.Lock()
@@ -196,8 +262,10 @@ func (t *Typing) KeepAlive(ctx context.Context) {
 	sortMembers(due)
 	t.mu.Unlock()
 
+	// Through the same consumer as the diffs, so a keep-alive cannot overtake a
+	// stop and leave an indicator switched on.
 	for _, m := range due {
-		t.push(ctx, m, true)
+		t.submit(typingWork{m: m, typing: true})
 	}
 }
 
