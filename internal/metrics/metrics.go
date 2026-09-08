@@ -285,9 +285,20 @@ var (
 	// moves the bottleneck. Labelled by stage: pickup, resolve, shard, queue,
 	// build, send.
 	StageDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "gofed_stage_duration_seconds",
-		Help:    "Time spent in each stage of the pipeline.",
-		Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 5},
+		Name: "gofed_stage_duration_seconds",
+		Help: "Time spent in each stage of the pipeline.",
+		// The top of this range is not padding. The stage that dominates is
+		// destination resolution, a recursive walk of the state group edges,
+		// and it was measured directly against this deployment's database at
+		// 10.8ms, 108ms, 375ms and 6.3 SECONDS for the deepest chain. A set
+		// ending at 5s put the worst case in +Inf, where it has no value at
+		// all, and jumped .5 -> 1 -> 5, so a quantile landing up there was
+		// interpolated across a 4-second-wide bucket and reported with a
+		// precision it did not have.
+		Buckets: []float64{
+			.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5,
+			1, 2.5, 5, 10, 30,
+		},
 	}, []string{"stage"})
 
 	// FanOutDuration is how long one event takes to reach every one of its

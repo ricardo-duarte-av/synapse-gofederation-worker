@@ -869,7 +869,7 @@
       "id": 15,
       "type": "timeseries",
       "title": "Where the time goes, per stage (p95)",
-      "description": "The panel that says WHERE to optimise, and it has already answered once: the goroutine fan-out this design bets on costs microseconds, while destination resolution costs milliseconds. The bottleneck is the database, not the concurrency model.\n\nUnaffected by replay, unlike the lag panel.",
+      "description": "p95 per stage, over a ONE HOUR window rather than the dashboard's rate interval. That is deliberate. This worker routes on the order of one event a minute, so a short window leaves histogram_quantile interpolating inside a bucket from two or three samples -- which produced a confident '4.20 s' for a stage whose p95 across its whole history was 24 ms. The sample rate is plotted alongside for the same reason: a quantile computed from almost nothing should be visibly computed from almost nothing.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -886,9 +886,19 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(gofed_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(gofed_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[1h])))",
           "legendFormat": "{{stage}}",
           "refId": "A",
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(gofed_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",stage=\"event_total\"}[1h]))",
+          "legendFormat": "events/s (sample rate)",
+          "refId": "B",
           "instant": false
         }
       ],
@@ -926,7 +936,28 @@
             "mode": "palette-classic"
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "events/s (sample rate)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "events/s"
+              }
+            ]
+          }
+        ]
       }
     },
     {
