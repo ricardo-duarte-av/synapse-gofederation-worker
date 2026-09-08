@@ -58,6 +58,9 @@ type DryRun struct {
 	// testable without a Prometheus registry -- and so the same numbers reach
 	// both the metrics and the persisted shadow record from one place.
 	onSent func(pdus, edus, bytes int)
+	// onEDUTypes reports the EDU type breakdown of each transaction, which the
+	// unlabelled counts cannot answer questions about. See countEDUTypes.
+	onEDUTypes func(byType map[string]int)
 	// capture records the full request for named destinations. Separate from
 	// onSent because it is about bytes rather than counts, and because it is
 	// off for every destination but the handful being compared.
@@ -77,6 +80,10 @@ func NewDryRun(log zerolog.Logger) *DryRun {
 // SetOnSent registers a callback invoked for every transaction.
 func (d *DryRun) SetOnSent(f func(pdus, edus, bytes int)) { d.onSent = f }
 
+// SetOnEDUTypes registers a callback for the EDU type breakdown of each
+// transaction.
+func (d *DryRun) SetOnEDUTypes(f func(byType map[string]int)) { d.onEDUTypes = f }
+
 // SetCapture registers a full-request recorder.
 func (d *DryRun) SetCapture(c Capturer) { d.capture = c }
 
@@ -92,6 +99,9 @@ func (d *DryRun) Mode() string { return "dry-run (shadow; nothing is sent)" }
 // the comparison is supposed to isolate.
 func (d *DryRun) Send(_ context.Context, req *txn.Request) (Result, error) {
 	pdus, edus := countUnits(req.Body)
+	if d.onEDUTypes != nil {
+		d.onEDUTypes(countEDUTypes(req.Body))
+	}
 	d.transactions.Add(1)
 	d.pdus.Add(int64(pdus))
 	d.edus.Add(int64(edus))

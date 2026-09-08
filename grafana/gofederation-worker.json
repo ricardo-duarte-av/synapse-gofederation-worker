@@ -613,7 +613,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "PDUs and EDUs per second",
-      "description": "",
+      "description": "Broken down by EDU type, matching Synapse's own synapse_federation_client_sent_edus_by_type_total. The breakdown is what makes the total readable: presence was 99.6% of what the Python senders on this homeserver sent, so a change in the total says almost nothing about whether any particular EDU is being routed at all.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -643,6 +643,16 @@
           "expr": "sum(rate(gofed_transaction_edus_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "gofed: EDUs",
           "refId": "B",
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (type) (rate(gofed_transaction_edus_by_type_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{type}}",
+          "refId": "C",
           "instant": false
         }
       ],

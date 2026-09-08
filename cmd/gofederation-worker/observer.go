@@ -96,3 +96,15 @@ func (o *observer) OnEventLag(receivedTS int64, at time.Time) {
 	}
 	metrics.EventProcessingLag.Observe(lag.Seconds())
 }
+
+// countEDUTypes records a transaction's EDU breakdown.
+//
+// Synapse counts its own EDUs by type, and without the same breakdown the two
+// are not comparable in the way that matters: presence was 99.6% of what the
+// Python senders on this homeserver sent, so a difference in the TOTAL says
+// almost nothing about whether any particular EDU is being routed at all.
+func countEDUTypes(byType map[string]int) {
+	for t, n := range byType {
+		metrics.TransactionEDUsByType.WithLabelValues(t).Add(float64(n))
+	}
+}

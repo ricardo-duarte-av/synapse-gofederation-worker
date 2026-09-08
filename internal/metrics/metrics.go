@@ -175,6 +175,22 @@ var (
 		Help: "PDUs placed in transactions.",
 	})
 
+	// TransactionEDUsByType counts EDUs placed in transactions, by edu_type.
+	//
+	// The counterpart to Synapse's
+	// synapse_federation_client_sent_edus_by_type_total, and it exists because
+	// the unlabelled total could not answer the first real question asked of
+	// it. Comparing this worker against the Python senders it replaced, the
+	// EDU rate was 4.4x lower -- and with one number there was no way to tell
+	// whether that was less presence, which is a tuning difference, or no
+	// typing at all, which is a feature silently missing. Synapse's own
+	// breakdown showed presence to be 99.6% of its traffic; ours had no
+	// breakdown to show.
+	TransactionEDUsByType = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gofed_transaction_edus_by_type_total",
+		Help: "EDUs placed in transactions, by EDU type.",
+	}, []string{"type"})
+
 	// TransactionEDUs counts EDUs placed in transactions.
 	TransactionEDUs = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "gofed_transaction_edus_total",
@@ -197,7 +213,8 @@ func All() []prometheus.Collector {
 		EventsProcessed, EventsSkipped, EventsRouted, DestinationsPerEvent,
 		ApproximateRoutes, BatchDuration,
 		QueuedDestinations, QueuedPDUs, QueuedEDUs, KnownDestinations,
-		Transactions, TransactionPDUs, TransactionEDUs, TransactionBytes,
+		Transactions, TransactionPDUs, TransactionEDUs, TransactionEDUsByType,
+		TransactionBytes,
 		EventProcessingLag, StageDuration, FanOutDuration, SendDuration,
 		InFlightSends, DestinationGoroutines, WriteOps, DestinationsBackingOff,
 	}

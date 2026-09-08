@@ -272,6 +272,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 	// on the send allowlist goes, including in live mode.
 	dry := sink.NewDryRun(log)
 	dry.SetOnSent(w.countTransaction)
+	dry.SetOnEDUTypes(countEDUTypes)
 	if w.capture != nil {
 		dry.SetCapture(w.capture)
 	}
@@ -286,6 +287,7 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 			MaxDelay:  cfg.Synapse.MaxLongRetryDelay,
 		})
 		live.SetOnSent(w.countTransaction)
+		live.SetOnEDUTypes(countEDUTypes)
 		live.SetObservers(
 			func(outcome string, took time.Duration) {
 				metrics.SendDuration.WithLabelValues(outcome).Observe(took.Seconds())

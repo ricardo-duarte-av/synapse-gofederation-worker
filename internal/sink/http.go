@@ -39,7 +39,10 @@ type HTTP struct {
 	maxDelay time.Duration
 	timeout  time.Duration
 	onSent   func(pdus, edus, bytes int)
-	capture  Capturer
+	// onEDUTypes reports the EDU type breakdown of each transaction, which the
+	// unlabelled counts cannot answer questions about. See countEDUTypes.
+	onEDUTypes func(byType map[string]int)
+	capture    Capturer
 
 	// observe reports one attempt's duration and outcome, and inFlight tracks
 	// concurrency. Hooks rather than an import of the metrics package, so this
@@ -137,6 +140,10 @@ func NewHTTP(cfg HTTPConfig) *HTTP {
 
 // SetOnSent registers a callback invoked for every delivered transaction.
 func (h *HTTP) SetOnSent(f func(pdus, edus, bytes int)) { h.onSent = f }
+
+// SetOnEDUTypes registers a callback for the EDU type breakdown of each
+// transaction.
+func (h *HTTP) SetOnEDUTypes(f func(byType map[string]int)) { h.onEDUTypes = f }
 
 // SetCapture registers a full-request recorder.
 func (h *HTTP) SetCapture(c Capturer) { h.capture = c }
@@ -258,6 +265,9 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 
 	h.observed("ok", started)
 	pdus, edus := countUnits(req.Body)
+	if h.onEDUTypes != nil {
+		h.onEDUTypes(countEDUTypes(req.Body))
+	}
 	if h.onSent != nil {
 		h.onSent(pdus, edus, len(req.Body))
 	}
