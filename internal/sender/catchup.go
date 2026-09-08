@@ -2,6 +2,7 @@ package sender
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -246,6 +247,19 @@ func (c *CatchUp) Destination(ctx context.Context, destination string) error {
 			if err := d.SendCatchUp(ctx, queue.PDU{
 				EventID: e.EventID, StreamOrdering: e.StreamOrdering, JSON: body,
 			}); err != nil {
+				if errors.Is(err, queue.ErrBusy) {
+					// The live loop is sending to this destination. Stop here
+					// and let the next sweep pick up where the cursor left off:
+					// what is owed is durable in destination_rooms, so nothing
+					// is lost by waiting.
+					//
+					// Deliberately NOT an error. Reporting it as one would grow
+					// this destination's backoff because of our own scheduling,
+					// and the cap on this deployment is a year.
+					c.log.Debug().Str("destination", destination).
+						Msg("destination is busy; leaving catch-up for the next sweep")
+					return nil
+				}
 				return err
 			}
 			// Advanced to the ORIGINAL event's ordering: this is a cursor into

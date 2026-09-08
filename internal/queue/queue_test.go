@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -798,4 +799,109 @@ func TestBatchingDisabledSendsImmediately(t *testing.T) {
 	d.EnqueuePresence(presenceOf("@a:x").Presence["@a:x"])
 	d.Attempt(context.Background())
 	waitFor(t, "the send", func() bool { return len(s.sent()) == 1 })
+}
+
+// Exactly one transaction per destination at a time, INCLUDING catch-up.
+//
+// Catch-up runs on its own goroutine and used to call send directly, so it went
+// out alongside the live transmission loop. That puts PDUs on the wire out of
+// order and makes a remote answer 429 "still processing another transaction
+// from this origin" -- which was then recorded as a delivery failure, so this
+// worker grew a live server's backoff because it was talking over itself.
+func TestCatchUpDoesNotSendAlongsideTheLoop(t *testing.T) {
+	s := &recordingSink{block: make(chan struct{})}
+	d := testDestination(t, s, Limits{})
+
+	// Occupy the destination with a live send.
+	d.EnqueuePDU(pdu("$live", 1))
+	d.Attempt(context.Background())
+	waitFor(t, "the live send to start", func() bool { return s.inFlight.Load() == 1 })
+
+	// Catch-up must refuse rather than send alongside.
+	//
+	// Bounded, because the failure mode without the claim is not a wrong
+	// answer: SendCatchUp calls straight through to the blocked sink and hangs.
+	// A test that hangs in CI is worse than one that fails, so the deadline
+	// turns it back into a failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := d.SendCatchUp(ctx, pdu("$catchup", 2))
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("SendCatchUp = %v, want ErrBusy while the loop is sending "+
+			"(a context error here means it sent alongside and blocked)", err)
+	}
+	if got := s.maxInFlight.Load(); got > 1 {
+		t.Errorf("%d transactions in flight at once, want at most 1", got)
+	}
+
+	close(s.block)
+	waitFor(t, "the loop to finish", func() bool { return !d.isRunning() })
+
+	// And once the loop is done, catch-up may proceed.
+	if err := d.SendCatchUp(context.Background(), pdu("$catchup", 2)); err != nil {
+		t.Errorf("SendCatchUp after the loop finished = %v", err)
+	}
+}
+
+// ErrBusy must not be reported as a delivery failure, or this worker grows a
+// destination's backoff because of its own scheduling -- capped at a year on
+// this deployment.
+func TestBusyCatchUpIsNotAFailure(t *testing.T) {
+	s := &recordingSink{block: make(chan struct{})}
+	var outcomes []bool
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		OnOutcome: func(_ string, ok bool) { outcomes = append(outcomes, ok) },
+	})
+
+	d.EnqueuePDU(pdu("$live", 1))
+	d.Attempt(context.Background())
+	waitFor(t, "the live send to start", func() bool { return s.inFlight.Load() == 1 })
+
+	busyCtx, busyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer busyCancel()
+	if err := d.SendCatchUp(busyCtx, pdu("$catchup", 2)); !errors.Is(err, ErrBusy) {
+		t.Fatalf("SendCatchUp = %v, want ErrBusy", err)
+	}
+	for _, ok := range outcomes {
+		if !ok {
+			t.Error("a busy destination was reported as a delivery failure")
+		}
+	}
+	close(s.block)
+	waitFor(t, "the loop to finish", func() bool { return !d.isRunning() })
+}
+
+// Work queued while catch-up holds the claim must still be sent. Wake gives up
+// when the destination is claimed and relies on the running LOOP to go round
+// again -- and catch-up is not that loop.
+func TestWorkQueuedDuringCatchUpIsNotStranded(t *testing.T) {
+	s := &recordingSink{}
+	d := testDestination(t, s, Limits{})
+	woken := make(chan struct{}, 1)
+	d.wake = func() {
+		select {
+		case woken <- struct{}{}:
+		default:
+		}
+	}
+
+	// Claim it as catch-up does, queue live work, then release.
+	if !d.claim() {
+		t.Fatal("could not claim an idle destination")
+	}
+	d.EnqueuePDU(pdu("$live", 1))
+	d.TryStart() // what Wake does: fails, sets newData
+	d.releaseClaim()
+
+	select {
+	case <-woken:
+	default:
+		t.Error("work queued during catch-up did not re-wake the destination")
+	}
 }

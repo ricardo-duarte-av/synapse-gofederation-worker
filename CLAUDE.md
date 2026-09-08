@@ -111,6 +111,14 @@ Breaking one of these should fail a test, not a deployment.
   inside a bucket from two or three samples. A stage whose p95 across its whole
   history was 24ms was reported as **4.20 s**. Always read a quantile next to
   its sample count.
+- **Catch-up must take the same one-transaction-at-a-time claim as the live
+  loop.** It runs on its own goroutine and originally called `send` directly, so
+  it went out ALONGSIDE the transmission loop: PDUs on the wire out of order,
+  and the remote answering 429 "still processing another transaction from this
+  origin". Those 429s were then recorded as delivery failures, so this worker
+  grew a live server's backoff because it was talking over itself --
+  `nexy7574.co.uk` reached 231 minutes that way. `queue.ErrBusy` is not a
+  failure and must never be reported as one.
 - **Presence per destination is too sparse here to batch.** Merging and holding
   are both implemented and both inert on this homeserver: a `presence_federation`
   row is `(destination, user)`, so a destination sees roughly one state every

@@ -16,6 +16,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -312,6 +313,49 @@ func (d *Destination) TryStart() bool {
 	}
 	d.running = true
 	return true
+}
+
+// ErrBusy means the destination is already sending, so the caller must come
+// back later rather than send alongside.
+//
+// NOT a delivery failure, and callers must not treat it as one. Recording it as
+// a failure would grow the destination's backoff because of our own scheduling,
+// and on this deployment the backoff is capped at a year.
+var ErrBusy = errors.New("queue: destination is already sending")
+
+// claim takes the one-transaction-at-a-time claim without marking new data.
+//
+// Distinct from TryStart, which sets newData on failure so the running loop
+// goes round again. A caller that merely wants to know whether it may send --
+// catch-up -- has no new data to announce, and saying otherwise would make the
+// running loop do an extra empty pass.
+func (d *Destination) claim() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.running {
+		return false
+	}
+	d.running = true
+	return true
+}
+
+// releaseClaim drops the claim and re-wakes the loop if work arrived while it
+// was held.
+//
+// The re-wake is not optional. Wake sets newData and gives up when the
+// destination is claimed, relying on the running LOOP to go round again -- and
+// catch-up is not that loop. Without this, live traffic queued during a
+// catch-up send would sit until something else happened to wake the
+// destination.
+func (d *Destination) releaseClaim() {
+	d.mu.Lock()
+	pending := d.newData
+	d.running = false
+	d.mu.Unlock()
+
+	if pending && d.wake != nil {
+		d.wake()
+	}
 }
 
 // Attempt starts the loop in its own goroutine if one is not already running.
@@ -703,6 +747,18 @@ func (d *Destination) TakeCatchUpSkipped() int64 {
 // being brought forward room by room and a failure should cost one room's
 // progress rather than fifty.
 func (d *Destination) SendCatchUp(ctx context.Context, p PDU) error {
+	// The same one-transaction-at-a-time claim the live loop takes. Catch-up
+	// runs on its own goroutine, so without this it sends ALONGSIDE the
+	// transmission loop -- which puts PDUs on the wire out of order and makes
+	// the remote answer 429 "still processing another transaction from this
+	// origin". Observed doing exactly that, and the resulting 429s were
+	// recorded as delivery failures, so this worker was growing a live server's
+	// backoff because it was talking over itself.
+	if !d.claim() {
+		return ErrBusy
+	}
+	defer d.releaseClaim()
+
 	// Catch-up carries no EDUs at all, so there is nothing here that another
 	// goroutine could be mutating; the batch is built from one event.
 	if err := d.send(ctx, taken{pdus: []PDU{p}}); err != nil {
