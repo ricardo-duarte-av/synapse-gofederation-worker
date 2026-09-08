@@ -3,7 +3,6 @@ package sender
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/rs/zerolog"
 
@@ -23,7 +22,6 @@ type DeviceStore interface {
 	GetCrossSigningKeys(ctx context.Context, userIDs []string) ([]store.CrossSigningKey, error)
 	MaxDeviceOutboxStreamID(ctx context.Context) (int64, error)
 	MaxDeviceListOutboundStreamID(ctx context.Context) (int64, error)
-	GetDestinationRetryTimings(ctx context.Context, destinations []string) (map[string]store.RetryTimings, error)
 }
 
 // Devices moves to-device messages and device list updates into destination
@@ -46,6 +44,10 @@ type Devices struct {
 	log     zerolog.Logger
 
 	shouldHandle func(destination string) bool
+	// dueWithin reports whether a destination is due now or within the hour.
+	// Synapse applies it in the same expression as the shard filter
+	// (federation/sender/__init__.py:1063), so ourShare applies both.
+	dueWithin func(destination string) bool
 	// allowDeviceNameLookup mirrors Synapse's
 	// allow_device_name_lookup_over_federation.
 	allowDeviceNameLookup bool
@@ -63,7 +65,10 @@ type DevicesConfig struct {
 	Queues       *queue.Manager
 	Log          zerolog.Logger
 	ShouldHandle func(destination string) bool
-	EDUsPerRead  int
+	// DueWithin reports whether a destination is due now or within the hour.
+	// Nil treats every destination as due.
+	DueWithin   func(destination string) bool
+	EDUsPerRead int
 	// AllowDeviceNameLookup comes from Synapse's config, not ours.
 	AllowDeviceNameLookup bool
 }
@@ -78,7 +83,8 @@ func NewDevices(cfg DevicesConfig) *Devices {
 	}
 	return &Devices{
 		store: cfg.Store, cursors: cfg.Cursors, queues: cfg.Queues, log: cfg.Log,
-		shouldHandle: cfg.ShouldHandle, edusPerRead: n,
+		shouldHandle: cfg.ShouldHandle,
+		dueWithin:    cfg.DueWithin, edusPerRead: n,
 		allowDeviceNameLookup: cfg.AllowDeviceNameLookup,
 	}
 }
@@ -227,25 +233,32 @@ func (d *Devices) deviceListsFor(ctx context.Context, server string, current int
 
 // ourShare keeps the destinations belonging to this worker's shard, dropping
 // any that are backing off.
+// ourShare keeps the destinations this worker should act on: in our shard, and
+// worth acting on at all.
+//
+// Both filters together, because Synapse applies them together in
+// send_device_messages (federation/sender/__init__.py:1063): the shard check
+// inline, the retry check around it with an hour of slack. Doing the retry half
+// HERE rather than after the database read is the point -- a device poke for a
+// server that has been down for a week costs a query over
+// device_federation_outbox and an EDU built to be dropped.
 func (d *Devices) ourShare(servers []string) []string {
 	out := make([]string, 0, len(servers))
 	for _, s := range servers {
-		if d.shouldHandle == nil || d.shouldHandle(s) {
-			out = append(out, s)
+		if d.shouldHandle != nil && !d.shouldHandle(s) {
+			continue
 		}
+		if d.dueWithin != nil && !d.dueWithin(s) {
+			continue
+		}
+		out = append(out, s)
 	}
 	return out
 }
 
-// FilterDue drops destinations in a long backoff, matching send_device_messages
-// (federation/sender/__init__.py:1061).
-func (d *Devices) FilterDue(ctx context.Context, servers []string) ([]string, error) {
-	if len(servers) == 0 {
-		return nil, nil
-	}
-	timings, err := d.store.GetDestinationRetryTimings(ctx, servers)
-	if err != nil {
-		return nil, err
-	}
-	return store.FilterDestinationsByRetryLimiter(servers, timings, time.Now(), catchupRetryInterval), nil
-}
+// The retry filter used to live here as a FilterDue method that nothing ever
+// called. It read Synapse's `destinations` table, which this worker stopped
+// writing when the backoff moved to its own schema (see
+// internal/state.SetRetryTimings), so by the end it would also have been
+// reading the wrong source. The filter is in ourShare now, where both call
+// sites already go.

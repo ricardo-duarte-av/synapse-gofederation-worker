@@ -391,6 +391,13 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		Queues:                w.queues,
 		ShouldHandle:          cfg.ShouldHandle,
 		AllowDeviceNameLookup: cfg.Synapse.AllowDeviceNameLookup,
+		// The fourth of Synapse's retry-filtered senders, with the same hour of
+		// slack as the rest (federation/sender/__init__.py:1074).
+		DueWithin: func(destination string) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return w.limiter.DueWithin(ctx, destination, queue.CatchUpRetryInterval)
+		},
 	})
 
 	w.ephemeral = sender.NewEphemeral(sender.EphemeralConfig{

@@ -33,6 +33,14 @@ type fakeDeviceStore struct {
 	crossSigning map[string][]store.CrossSigningKey
 }
 
+// readCount is how many times the to-device outbox was read for a destination,
+// which is what "the work was skipped" looks like from outside.
+func (f *fakeDeviceStore) readCount(dest string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads[dest]
+}
+
 func newDeviceStore() *fakeDeviceStore {
 	return &fakeDeviceStore{
 		outbox:         map[string][]store.ToDeviceMessage{},
@@ -447,19 +455,28 @@ func TestDisplayNameRespectsSynapsesConfig(t *testing.T) {
 	}
 }
 
-func TestFilterDueDropsBackedOffDestinations(t *testing.T) {
+// A destination in a long backoff must be dropped BEFORE the outbox is read and
+// an EDU built, as Synapse does in send_device_messages
+// (federation/sender/__init__.py:1063).
+//
+// This replaces a test of a FilterDue method that did the same thing and was
+// never called from anywhere -- which is why this path went unfiltered while
+// looking covered. The assertion is now on the behaviour rather than on the
+// helper, so it fails if the filter is ever unwired again.
+func TestDeviceMessagesSkipBackingOffDestinations(t *testing.T) {
 	st := newDeviceStore()
-	st.timings = map[string]store.RetryTimings{
-		"down.example": {RetryLastTS: nowMS(), RetryInterval: 30 * 24 * 60 * 60 * 1000},
-	}
 	d, _, _ := newDevices(t, st, nil)
+	d.dueWithin = func(dest string) bool { return dest != "down.example" }
 
-	got, err := d.FilterDue(context.Background(), []string{"down.example", "up.example"})
-	if err != nil {
+	if err := d.HandleToDevice(context.Background(),
+		[]string{"down.example", "up.example"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "up.example" {
-		t.Errorf("FilterDue = %v, want [up.example]", got)
+	if st.readCount("down.example") != 0 {
+		t.Error("read the to-device outbox for a destination that is backing off")
+	}
+	if st.readCount("up.example") == 0 {
+		t.Error("skipped a reachable destination")
 	}
 }
 
