@@ -758,9 +758,10 @@ func (d *Destination) send(ctx context.Context, batch taken) error {
 //
 // Two things make this less direct than a map lookup:
 //
-//   - A remote may echo the event id in the OTHER base64 alphabet.
-//     hashtags.nonamesoft.xyz answers with `-` and `_` where we sent `+` and
-//     `/`, for the same event, in the same second as other servers echoing it
+//   - A remote may echo the event id in the OTHER base64 alphabet. Event ids
+//     are URL-safe base64 from room version 4 on, so `-` and `_` is what we
+//     send and what the database holds; hrt.sh answered with `+` and `/` for
+//     the same event, in the same second as another server echoing it
 //     unchanged. Matching literally silently finds nothing for those.
 //   - A remote may not name the event at all. m.matrix-api.kdns.fr reports
 //     the key "unknown" along with a D1_TYPE_ERROR from its own database
