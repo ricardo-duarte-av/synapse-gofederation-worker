@@ -23,6 +23,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/destinations"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/difflog"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/logfmt"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/queue"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/replication"
@@ -107,7 +108,7 @@ func newLogger(cfg *config.Config) zerolog.Logger {
 	}
 	var l zerolog.Logger
 	if cfg.Log.Pretty {
-		l = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+		l = zerolog.New(logfmt.New(os.Stderr))
 	} else {
 		l = zerolog.New(os.Stderr)
 	}

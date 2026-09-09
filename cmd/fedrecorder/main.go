@@ -39,6 +39,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/capture"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/logfmt"
 )
 
 var (
@@ -155,7 +156,7 @@ func newProxy(target *url.URL, log zerolog.Logger) *httputil.ReverseProxy {
 func newLogger(pretty bool) zerolog.Logger {
 	var l zerolog.Logger
 	if pretty {
-		l = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+		l = zerolog.New(logfmt.New(os.Stderr))
 	} else {
 		l = zerolog.New(os.Stderr)
 	}
