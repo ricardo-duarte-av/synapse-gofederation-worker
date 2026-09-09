@@ -59,11 +59,17 @@ type HTTPConfig struct {
 	// operator looking at their logs should be able to tell which of our
 	// senders they are talking to.
 	UserAgent string
-	// Timeout bounds one attempt. Synapse's federation.client_timeout, 10s on
-	// this deployment.
+	// Timeout bounds one attempt. Synapse's federation.client_timeout.
 	Timeout time.Duration
 	// Retries and MaxDelay mirror Synapse's max_long_retries and
-	// max_long_retry_delay for /send (2 and 10s here).
+	// max_long_retry_delay for /send.
+	//
+	// These multiply. The delay is 4^attempt capped at MaxDelay, so at
+	// Synapse's defaults (60s, 10, 60s) one transaction to a black hole spends
+	// 500s waiting plus 11 timeouts -- around twenty minutes holding that
+	// destination's claim, during which its live traffic waits. The
+	// per-destination backoff is the better place to do that waiting, so a
+	// smaller max_long_retries is usually the right call for a sender.
 	Retries  int
 	MaxDelay time.Duration
 }
