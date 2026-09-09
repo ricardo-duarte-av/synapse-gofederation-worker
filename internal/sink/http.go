@@ -327,10 +327,22 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 // The jitter is not decoration. Without it every queue that failed at the same
 // moment retries at the same moment, and a remote coming back up is met by the
 // whole backlog at once.
+// maxBackoffAttempt is the last attempt whose 4^attempt seconds still fits in
+// a time.Duration. 4^17 seconds is about 1.7e10, and a Duration tops out near
+// 9.2e9 -- so from there the shift wraps NEGATIVE, the cap below never applies
+// because a negative delay is not greater than maxDelay, and time.After fires
+// immediately. The retry loop would become a hot loop against a remote that is
+// already failing. Reachable with max_long_retries: 17 or more, which is a
+// plausible thing to configure. Synapse cannot hit this because Python ints do
+// not overflow.
+const maxBackoffAttempt = 16
+
 func (h *HTTP) backoff(attempt int) time.Duration {
-	delay := time.Duration(1<<uint(2*attempt)) * time.Second
-	if delay > h.maxDelay {
-		delay = h.maxDelay
+	delay := h.maxDelay
+	if attempt <= maxBackoffAttempt {
+		if d := time.Duration(1<<uint(2*attempt)) * time.Second; d < delay {
+			delay = d
+		}
 	}
 	jitter := 0.8 + rand.Float64()*0.6
 	return time.Duration(float64(delay) * jitter)

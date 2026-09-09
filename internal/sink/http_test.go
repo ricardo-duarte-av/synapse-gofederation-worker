@@ -121,3 +121,22 @@ func TestRetryAfterIsHonoured(t *testing.T) {
 		})
 	}
 }
+
+// TestBackoffNeverGoesBackwards guards the overflow in the 4^attempt schedule.
+//
+// A Duration cannot hold 4^17 seconds, so the shift wraps negative and the cap
+// silently stops applying -- turning the retry loop into a hot loop precisely
+// when a remote is already failing. max_long_retries of 17 or more reaches it.
+func TestBackoffNeverGoesBackwards(t *testing.T) {
+	h := &HTTP{maxDelay: 60 * time.Second}
+	for attempt := 0; attempt <= 64; attempt++ {
+		got := h.backoff(attempt)
+		if got <= 0 {
+			t.Fatalf("attempt %d: delay %v is not positive", attempt, got)
+		}
+		// Jitter tops out at 1.4, so nothing may exceed the cap by more.
+		if max := time.Duration(float64(h.maxDelay) * 1.4); got > max {
+			t.Fatalf("attempt %d: delay %v exceeds capped maximum %v", attempt, got, max)
+		}
+	}
+}
