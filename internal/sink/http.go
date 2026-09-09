@@ -3,6 +3,7 @@ package sink
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -175,9 +176,35 @@ func (h *HTTP) Send(ctx context.Context, req *txn.Request) (Result, error) {
 	}
 
 	var lastErr error
+	rateLimitedAttempts := 0
 	for attempt := 0; attempt <= h.retries; attempt++ {
 		if attempt > 0 {
 			delay := h.backoff(attempt)
+			// A 429 is the remote asking us to stop, so the ordinary backoff is
+			// the wrong schedule for it.
+			//
+			// This worker manufactures these. client_timeout is 10s on this
+			// deployment, so a transaction the remote takes longer than that to
+			// process becomes a timeout on our side while it is still being
+			// worked on -- and the retry is then a SECOND transaction from the
+			// same origin, which is exactly what the remote refuses with
+			// "still processing another transaction from this origin". Ten more
+			// attempts cannot help; only waiting can.
+			//
+			// So: honour retry_after_ms when the remote sends one, and give up
+			// after maxRateLimitedAttempts rather than spending the full budget
+			// hammering a server that has already answered. Giving up here
+			// costs nothing extra -- the per-destination backoff grows on a 429
+			// either way, which is Synapse's policy too (retryutils.py:258,
+			// "429 is us being aggressively rate limited, so lets rate limit
+			// ourselves") -- and it saves the remote eight requests it has
+			// already declined.
+			var ok bool
+			if delay, ok = rateLimitDelay(delay, lastErr, &rateLimitedAttempts); !ok {
+				return Result{}, fmt.Errorf(
+					"sink: %s: rate limited, not retrying further: %w",
+					req.Destination, lastErr)
+			}
 			h.log.Debug().
 				Str("destination", req.Destination).Str("txn_id", req.TransactionID).
 				Int("attempt", attempt).Dur("delay", delay).
@@ -246,8 +273,15 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 		// (matrixfederationclient.py:833). A 400 means the remote has made a
 		// decision about this transaction and will make the same one again.
 		retryable := resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
-		return Result{}, retryable, fmt.Errorf("sink: %s: %s: %s",
+		err := fmt.Errorf("sink: %s: %s: %s",
 			req.Destination, resp.Status, truncate(body, 512))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return Result{}, retryable, &rateLimited{
+				err:   err,
+				after: retryAfter(resp, body),
+			}
+		}
+		return Result{}, retryable, err
 	}
 
 	result := Result{Delivered: true, StatusCode: resp.StatusCode}
@@ -307,4 +341,69 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// rateLimitDelay adjusts the retry schedule for a rate-limited attempt.
+//
+// Returns the delay to wait and whether to retry at all. For anything that is
+// not a 429 it returns the ordinary backoff unchanged, so the schedule for a
+// 5xx or a connection failure is untouched.
+func rateLimitDelay(base time.Duration, lastErr error, seen *int) (time.Duration, bool) {
+	var limited *rateLimited
+	if !errors.As(lastErr, &limited) {
+		return base, true
+	}
+	if *seen++; *seen >= maxRateLimitedAttempts {
+		return 0, false
+	}
+	if limited.after > 0 {
+		return limited.after, true
+	}
+	return base, true
+}
+
+// maxRateLimitedAttempts is how many times a 429 is retried before giving up.
+//
+// Small on purpose. A remote that answers 429 has received the request and
+// declined it; repeating it up to max_long_retries times is eleven requests to
+// tell one server the same thing. The per-destination backoff is the mechanism
+// that actually waits, and it grows on a 429 regardless.
+const maxRateLimitedAttempts = 2
+
+// rateLimited carries a 429's retry-after hint alongside its error.
+type rateLimited struct {
+	err   error
+	after time.Duration
+}
+
+func (e *rateLimited) Error() string { return e.err.Error() }
+func (e *rateLimited) Unwrap() error { return e.err }
+
+// retryAfter reads how long the remote asked us to wait.
+//
+// Two spellings, because both are in the wild: the HTTP Retry-After header in
+// seconds, and retry_after_ms in an M_LIMIT_EXCEEDED body, which is the one the
+// Matrix spec defines. Either may be absent -- the server that prompted this
+// sends "retry_after: None" -- in which case the ordinary backoff stands.
+//
+// Capped, because this is a number a remote server chooses and a transaction
+// must not be parked for an hour because somebody sent a silly one.
+func retryAfter(resp *http.Response, body []byte) time.Duration {
+	if ms := gjson.GetBytes(body, "retry_after_ms"); ms.Exists() && ms.Int() > 0 {
+		return capRetryAfter(time.Duration(ms.Int()) * time.Millisecond)
+	}
+	if h := resp.Header.Get("Retry-After"); h != "" {
+		if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
+			return capRetryAfter(time.Duration(secs) * time.Second)
+		}
+	}
+	return 0
+}
+
+func capRetryAfter(d time.Duration) time.Duration {
+	const max = 60 * time.Second
+	if d > max {
+		return max
+	}
+	return d
 }

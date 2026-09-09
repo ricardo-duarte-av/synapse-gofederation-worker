@@ -119,6 +119,14 @@ Breaking one of these should fail a test, not a deployment.
   grew a live server's backoff because it was talking over itself --
   `nexy7574.co.uk` reached 231 minutes that way. `queue.ErrBusy` is not a
   failure and must never be reported as one.
+- **This worker manufactured its own 429s.** `client_timeout` is 10s here, so a
+  transaction the remote takes longer than that to process times out on our side
+  while it is still being worked on -- and the retry is a SECOND transaction
+  from the same origin, which is what "still processing another transaction from
+  this origin" means. Failed sends average ~8.9s against that 10s timeout, so
+  timeouts are the common failure. A 429 is now retried at most twice and
+  honours `retry_after_ms`; the per-destination backoff does the waiting.
+  Backing off on a 429 is correct and matches Synapse (`retryutils.py:258`).
 - **Presence per destination is too sparse here to batch.** Merging and holding
   are both implemented and both inert on this homeserver: a `presence_federation`
   row is `(destination, user)`, so a destination sees roughly one state every
