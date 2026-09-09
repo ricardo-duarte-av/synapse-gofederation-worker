@@ -347,13 +347,45 @@ func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true)
 	if err := dec.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("config: %w", err)
+		return nil, fmt.Errorf("config: %w%s", err, hintFor(err))
 	}
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// hintFor turns an unknown-key error into an answer where we have one.
+//
+// KnownFields reports the type it failed to find the key on, which is accurate
+// and unhelpful: "field federation not found in type config.ShadowConfig" is
+// what you get for putting Synapse's federation tuning in this file, indented
+// one level too far. The keys below are all ones that belong in SYNAPSE's
+// homeserver.yaml, and every one of them is an easy mistake to make because
+// this worker reads them -- just from the other file.
+func hintFor(err error) string {
+	elsewhere := map[string]string{
+		"federation":                     "Synapse's homeserver.yaml",
+		"client_timeout":                 "the `federation:` block of Synapse's homeserver.yaml",
+		"max_long_retries":               "the `federation:` block of Synapse's homeserver.yaml",
+		"max_long_retry_delay":           "the `federation:` block of Synapse's homeserver.yaml",
+		"destination_min_retry_interval": "the `federation:` block of Synapse's homeserver.yaml",
+		"destination_retry_multiplier":   "the `federation:` block of Synapse's homeserver.yaml",
+		"destination_max_retry_interval": "the `federation:` block of Synapse's homeserver.yaml",
+		"redis":                          "Synapse's homeserver.yaml",
+		"federation_sender_instances":    "Synapse's homeserver.yaml",
+		"server_name":                    "Synapse's homeserver.yaml",
+	}
+	msg := err.Error()
+	for key, where := range elsewhere {
+		if strings.Contains(msg, "field "+key+" not found") {
+			return fmt.Sprintf("\n\nhint: `%s` is not a setting of this file. "+
+				"It is read from %s, named by synapse_config, so that this worker "+
+				"and Synapse cannot disagree about it.", key, where)
+		}
+	}
+	return ""
 }
 
 // ShadowEnabled reports whether the worker is in dry-run mode.

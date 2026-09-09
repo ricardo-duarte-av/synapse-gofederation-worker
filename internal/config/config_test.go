@@ -319,3 +319,23 @@ func TestHostCacheEntriesMustBePositive(t *testing.T) {
 		t.Errorf("absent host_cache_entries gave %d", cfg.Resolution.HostCacheEntries)
 	}
 }
+
+// "field federation not found in type config.ShadowConfig" is what you get for
+// putting Synapse's federation tuning in this file, indented one level too far.
+// It is accurate and tells you nothing about what to do, and it happened.
+func TestSettingsThatLiveInSynapsesConfigSaySo(t *testing.T) {
+	_, err := Parse([]byte(minimal + `
+  federation:
+    client_timeout: 180s
+    max_long_retries: 20
+`))
+	if err == nil {
+		t.Fatal("a federation block in this file was accepted")
+	}
+	if !strings.Contains(err.Error(), "homeserver.yaml") {
+		t.Errorf("error does not say where the setting belongs: %v", err)
+	}
+	if !strings.Contains(err.Error(), "synapse_config") {
+		t.Errorf("error does not name the setting that points at that file: %v", err)
+	}
+}

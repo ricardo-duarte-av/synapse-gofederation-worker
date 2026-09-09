@@ -82,20 +82,31 @@ shadow:
   # traffic by deleting a line. Cannot be combined with send_only_to.
   # send_to_all: false
 
-# Backoff, transaction timeouts and per-request retries all come from the
-# `federation:` block of the homeserver.yaml above, not from here -- both
-# senders should behave the same way towards the same destinations. For
-# reference, this deployment's testing server uses:
+# NOTE: there is no `federation:` block in THIS file, and adding one is a
+# startup error.
 #
-#   federation:
-#     client_timeout: 180s
-#     max_short_retry_delay: 7s          # unused here: only /send is called
-#     max_long_retry_delay: 100s
-#     max_short_retries: 5               # unused here
-#     max_long_retries: 20
-#     destination_min_retry_interval: 30s
-#     destination_retry_multiplier: 5
-#     destination_max_retry_interval: 12h
+# Backoff, transaction timeouts and per-request retries are read from the
+# `federation:` block of SYNAPSE'S homeserver.yaml, named by synapse_config
+# above -- both senders must behave the same way towards the same destinations,
+# so there is one place to set it and this is not that place.
+#
+# Uncommenting a reference block here lands it inside `shadow:` and fails with
+# "field federation not found in type config.ShadowConfig", which is this file
+# telling you to go and edit the other one. What to put THERE, in
+# homeserver.yaml:
+#
+#     client_timeout                  how long ONE request may take. Too low and
+#                                     a slow remote is abandoned mid-transaction
+#                                     and retried, which the remote sees as a
+#                                     second transaction from us and answers 429.
+#     max_long_retries                attempts per transaction, minus one.
+#     max_long_retry_delay            cap on the 4^n delay between them.
+#     destination_min_retry_interval  first backoff after a destination fails.
+#     destination_retry_multiplier    how fast that grows.
+#     destination_max_retry_interval  and its cap. This one bites: with a x5
+#                                     multiplier a destination reaches the cap
+#                                     after ~8 failures, so a cap of 365d makes
+#                                     every backoff mistake close to permanent.
 
 resolution:
   # How many state groups' joined-host sets to remember.
