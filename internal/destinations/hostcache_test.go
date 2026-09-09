@@ -14,6 +14,11 @@ type countingHosts struct {
 	err   error
 }
 
+// Not a partial state room unless a test says otherwise.
+func (c *countingHosts) PartialStateServersAtJoin(context.Context, string) ([]string, bool, error) {
+	return nil, false, nil
+}
+
 func (c *countingHosts) CurrentJoinedHosts(context.Context, string) ([]string, error) {
 	return []string{"current.example"}, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,6 +31,7 @@ const (
 // EphemeralStore is the database access the ephemeral EDU paths need.
 type EphemeralStore interface {
 	CurrentJoinedHosts(ctx context.Context, roomID string) ([]string, error)
+	PartialStateServersAtJoin(ctx context.Context, roomID string) ([]string, bool, error)
 	GetPresenceStates(ctx context.Context, userIDs []string) (map[string]store.PresenceState, error)
 }
 
@@ -108,7 +110,7 @@ func (e *Ephemeral) HandleReceipt(ctx context.Context, r ReceiptUpdate) error {
 		return nil
 	}
 
-	hosts, err := e.store.CurrentJoinedHosts(ctx, r.RoomID)
+	hosts, err := e.roomHosts(ctx, r.RoomID)
 	if err != nil {
 		return err
 	}
@@ -137,6 +139,45 @@ func (e *Ephemeral) HandleReceipt(ctx context.Context, r ReceiptUpdate) error {
 	e.log.Debug().Str("room", r.RoomID).Str("user", r.UserID).
 		Int("destinations", sent).Msg("receipt routed")
 	return nil
+}
+
+// roomHosts is Synapse's
+// get_current_hosts_in_room_or_partial_state_approximation
+// (storage/controllers/state.py:757).
+//
+// For a fully-stated room this is just the current hosts. For one still being
+// joined it is the UNION of the servers recorded at join and the hosts we can
+// see, which is a different rule from the PDU path -- that one REPLACES the
+// computed set (federation/sender/__init__.py:614). Both err toward sending to
+// a server that has since left rather than missing one that is still there,
+// which for a receipt costs nothing and for silence costs a read marker.
+//
+// Synapse reads the join list FIRST, to avoid racing a room that stops being
+// partial midway; doing it in the other order could miss both lists.
+func (e *Ephemeral) roomHosts(ctx context.Context, roomID string) ([]string, error) {
+	atJoin, partial, err := e.store.PartialStateServersAtJoin(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	current, err := e.store.CurrentJoinedHosts(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	if !partial {
+		return current, nil
+	}
+
+	seen := make(map[string]bool, len(atJoin)+len(current))
+	out := make([]string, 0, len(atJoin)+len(current))
+	for _, h := range append(atJoin, current...) {
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // due reports whether a destination is worth building an EDU for. A nil hook

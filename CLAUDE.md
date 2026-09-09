@@ -119,6 +119,13 @@ Breaking one of these should fail a test, not a deployment.
   grew a live server's backoff because it was talking over itself --
   `nexy7574.co.uk` reached 231 minutes that way. `queue.ErrBusy` is not a
   failure and must never be reported as one.
+- **Partial state rooms (faster joins) need the join-time server list.** While a
+  room is being joined there is no state to resolve, so hosts computed from it
+  under-count and our own events silently never reach servers that are in the
+  room. PDUs REPLACE the computed set with `partial_state_rooms_servers`
+  (`federation/sender/__init__.py:614`); receipts take the UNION
+  (`storage/controllers/state.py:757`). Dormant on this homeserver -- there are
+  no partial rooms right now -- so it is untested in production.
 - **Fill Synapse's tables the way a Python sender would.** Synapse has readers
   and triggers that are not enumerated anywhere, so deviating breaks things
   nobody predicted. Learned by leaving `destinations.retry_last_ts` unwritten:

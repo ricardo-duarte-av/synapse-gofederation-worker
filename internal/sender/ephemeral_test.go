@@ -34,8 +34,16 @@ func ephemeralQueues(t *testing.T) *queue.Manager {
 // a test can assert that work was skipped rather than merely discarded.
 type fakeEphemeralStore struct {
 	hosts         []string
+	partialAtJoin []string
 	presence      map[string]store.PresenceState
 	presenceReads int
+}
+
+// partialAtJoin, when set, makes this a room still being joined.
+func (f *fakeEphemeralStore) PartialStateServersAtJoin(
+	context.Context, string,
+) ([]string, bool, error) {
+	return f.partialAtJoin, len(f.partialAtJoin) > 0, nil
 }
 
 func (f *fakeEphemeralStore) CurrentJoinedHosts(context.Context, string) ([]string, error) {
@@ -232,5 +240,39 @@ func TestPresenceNotSentWhenTheHomeserverDisablesIt(t *testing.T) {
 	}
 	if _, edus := m.Get("remote.example").Pending(); edus != 0 {
 		t.Errorf("queued %d presence EDUs although the homeserver has it disabled", edus)
+	}
+}
+
+// A room still being joined has no state to compute hosts from, so a receipt
+// must go to the union of what we can see and what the join told us. Under-
+// counting means a read marker silently never arrives; over-counting costs a
+// receipt to a server that has left, which Synapse accepts explicitly
+// (storage/controllers/state.py:765).
+func TestReceiptsUsePartialStateApproximation(t *testing.T) {
+	st := &fakeEphemeralStore{
+		hosts:         []string{"seen.example", "example.com"},
+		partialAtJoin: []string{"atjoin.example", "seen.example"},
+	}
+	m := ephemeralQueues(t)
+	e := NewEphemeral(EphemeralConfig{
+		Store: st, Queues: m, Log: zerolog.Nop(), ServerName: "example.com",
+		ShouldHandle: func(string) bool { return true }, TrackPresence: true,
+	})
+
+	err := e.HandleReceipt(context.Background(), ReceiptUpdate{
+		RoomID: "!r:example.com", ReceiptType: "m.read", UserID: "@alice:example.com",
+		EventID: "$e", Data: []byte(`{"ts":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both the join-time server and the one we can see, and never ourselves.
+	for _, want := range []string{"atjoin.example", "seen.example"} {
+		if _, edus := m.Get(want).Pending(); edus != 1 {
+			t.Errorf("%s got %d receipt EDUs, want 1", want, edus)
+		}
+	}
+	if _, edus := m.Get("example.com").Pending(); edus != 0 {
+		t.Error("queued a receipt for our own server")
 	}
 }

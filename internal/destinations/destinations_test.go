@@ -78,6 +78,8 @@ func TestDomainOf(t *testing.T) {
 }
 
 type fakeHosts struct {
+	// partial is the servers recorded at join, for a room still being joined.
+	partial []string
 	// hosts is the CURRENT state answer, used only when we fall back.
 	hosts []string
 	err   error
@@ -88,6 +90,12 @@ type fakeHosts struct {
 	// exactCalls counts state-group resolutions, so a test can assert the
 	// exact path was taken rather than inferring it from the answer.
 	exactCalls *int
+}
+
+// partial, when set, makes this a partial state room, which replaces the
+// state-derived destinations with the servers recorded at join.
+func (f fakeHosts) PartialStateServersAtJoin(context.Context, string) ([]string, bool, error) {
+	return f.partial, len(f.partial) > 0, nil
 }
 
 func (f fakeHosts) CurrentJoinedHosts(context.Context, string) ([]string, error) {
@@ -244,5 +252,66 @@ func TestResolvePropagatesErrors(t *testing.T) {
 	r := NewResolver(fakeHosts{err: errors.New("boom")}, "a.example", nil)
 	if _, err := r.Resolve(context.Background(), []byte(messageEvent), nil); err == nil {
 		t.Fatal("expected the host lookup error to propagate")
+	}
+}
+
+// A room still being joined has no state to resolve against, so the servers
+// recorded at join REPLACE the computed set -- Synapse checks this first, before
+// its caches and before resolving (federation/sender/__init__.py:614).
+//
+// Under-counting is the failure that matters: during a faster join we hold only
+// part of the room's membership, so computing hosts from it means our own
+// events silently never reach servers that are in the room.
+func TestPartialStateRoomUsesTheServersRecordedAtJoin(t *testing.T) {
+	r := NewResolver(fakeHosts{
+		// What we can see is incomplete during a partial join, and must not win.
+		hosts:   []string{"seen.example"},
+		partial: []string{"atjoin.example", "other.example", "example.com"},
+	}, "example.com", nil)
+
+	res, err := r.Resolve(context.Background(), []byte(`{
+		"room_id":"!r:example.com","type":"m.room.message","sender":"@a:example.com",
+		"prev_events":["$p"]}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"atjoin.example", "other.example"}
+	if len(res.Destinations) != len(want) {
+		t.Fatalf("destinations = %v, want %v", res.Destinations, want)
+	}
+	for i, d := range want {
+		if res.Destinations[i] != d {
+			t.Errorf("destinations = %v, want %v", res.Destinations, want)
+			break
+		}
+	}
+	// Recorded as approximate, with a cause of its own: this is not a shortcut
+	// we chose, there was no state to resolve.
+	if !res.Approximate {
+		t.Error("a partial state room was not marked approximate")
+	}
+	if res.Fallback != FallbackPartialState {
+		t.Errorf("fallback = %q, want %q", res.Fallback, FallbackPartialState)
+	}
+}
+
+// A fully-stated room must be unaffected: the partial list is empty, so state
+// resolution runs exactly as before.
+func TestFullStateRoomIsUnaffectedByThePartialCheck(t *testing.T) {
+	r := NewResolver(fakeHosts{hosts: []string{"seen.example", "example.com"}},
+		"example.com", nil)
+
+	res, err := r.Resolve(context.Background(), []byte(`{
+		"room_id":"!r:example.com","type":"m.room.message","sender":"@a:example.com",
+		"prev_events":["$p"]}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Destinations) != 1 || res.Destinations[0] != "seen.example" {
+		t.Errorf("destinations = %v, want [seen.example]", res.Destinations)
+	}
+	if res.Fallback == FallbackPartialState {
+		t.Error("a fully-stated room was treated as partial")
 	}
 }

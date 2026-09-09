@@ -20,6 +20,13 @@ const (
 	// FallbackNoStateGroup means a prev event has no state group, which means
 	// it is an outlier -- we have the event but not the state around it.
 	FallbackNoStateGroup FallbackReason = "prev event has no state group"
+	// FallbackPartialState means the room was still being joined, so the
+	// servers recorded at join were used instead of resolving state. Counted as
+	// approximate for the same reason as the others -- it is a set that may
+	// include servers that have left and miss servers that arrived -- but it is
+	// not a shortcut we chose: during a partial join there is no state to
+	// resolve, and Synapse does the same (federation/sender/__init__.py:614).
+	FallbackPartialState FallbackReason = "partial state room"
 )
 
 // hostsBeforeEvent resolves who was in the room immediately before an event.

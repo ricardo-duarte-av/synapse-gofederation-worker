@@ -81,6 +81,11 @@ func (f *fakeStore) GetDestinationRetryTimings(_ context.Context, dests []string
 	return f.timings, nil
 }
 
+// Not a partial state room unless a test says otherwise.
+func (f *fakeStore) PartialStateServersAtJoin(context.Context, string) ([]string, bool, error) {
+	return nil, false, nil
+}
+
 func (f *fakeStore) CurrentJoinedHosts(_ context.Context, roomID string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -16,6 +16,9 @@ import (
 // which is what Synapse actually uses.
 type RoomHosts interface {
 	CurrentJoinedHosts(ctx context.Context, roomID string) ([]string, error)
+	// PartialStateServersAtJoin returns the servers recorded at join for a room
+	// still in partial state, and whether the room is partial at all.
+	PartialStateServersAtJoin(ctx context.Context, roomID string) ([]string, bool, error)
 	GetStateGroupsForEvents(ctx context.Context, eventIDs []string) (map[string]int64, error)
 	JoinedHostsAtStateGroup(ctx context.Context, group int64) ([]string, error)
 }
@@ -86,10 +89,32 @@ func (r *Resolver) Resolve(ctx context.Context, eventJSON []byte, authEvents fun
 		return Result{}, nil
 	}
 
-	prevIDs := prevEventIDs(ev)
-	hosts, approximate, fallback, err := r.hostsBeforeEvent(ctx, roomID, prevIDs)
+	// A room still in partial state has no state to resolve against, so the
+	// servers recorded at join REPLACE the computed set -- Synapse checks this
+	// first too, before the caches and before resolving
+	// (federation/sender/__init__.py:614).
+	//
+	// Under-counting here is the failure that matters: during a faster join we
+	// hold only some of the room's membership, so computing hosts from it means
+	// our own events silently never reach servers that are in the room. Synapse
+	// takes the opposite error deliberately -- a server that has since left
+	// receives events it should not, which leaks only our own traffic.
+	partial, isPartial, err := r.hosts.PartialStateServersAtJoin(ctx, roomID)
 	if err != nil {
-		return Result{}, err
+		return Result{}, fmt.Errorf("destinations: %s: %w", roomID, err)
+	}
+
+	var hosts []string
+	var approximate bool
+	var fallback FallbackReason
+	if isPartial {
+		hosts, approximate, fallback = partial, true, FallbackPartialState
+	} else {
+		prevIDs := prevEventIDs(ev)
+		hosts, approximate, fallback, err = r.hostsBeforeEvent(ctx, roomID, prevIDs)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	set := make(map[string]bool, len(hosts))

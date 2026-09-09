@@ -207,6 +207,28 @@ day turns a brief `.well-known` outage into a day of failed delivery.
 mautrix caches every resolution for 24h regardless (`resolution.go:59`), so
 `internal/sink.resolveCache` applies the table above instead.
 
+### Partial state rooms (faster joins)
+
+While a room is being joined its state is incomplete, so hosts computed from it
+are WRONG -- and wrong in the direction that loses traffic. Synapse uses the
+`servers_in_room` list from the /send_join response instead, and the two paths
+use it differently:
+
+| path | rule | source |
+|---|---|---|
+| PDUs | the join list REPLACES the computed set | `federation/sender/__init__.py:614` |
+| receipts | the UNION of the join list and current hosts | `storage/controllers/state.py:757` |
+
+Both err toward sending to a server that has since left rather than missing one
+that is still there. Synapse says why in a comment: it "is only our own events
+that we leak and not other server's ones".
+
+The join list is read FIRST in the union case, to avoid racing a room that stops
+being partial midway -- the other order can miss both lists.
+
+Read via `partial_state_rooms_servers`; an empty result means the room is fully
+stated (`storage/databases/main/room.py:1794`).
+
 ## 7. Tables
 
 | Table | Columns we care about |

@@ -216,3 +216,44 @@ func (s *Store) GetFederationOutPos(ctx context.Context, typ, instanceName strin
 	}
 	return pos, nil
 }
+
+// PartialStateServersAtJoin returns the servers recorded when we joined a room
+// that is still in partial state, and whether the room is partial at all.
+//
+// Synapse's get_partial_state_servers_at_join (storage/databases/main/room.py:1781),
+// which returns None for a fully-stated room. The rows come from the
+// `servers_in_room` field of the /send_join response, so they are a remote
+// server's word about who was in the room -- "may not be accurate or complete",
+// as Synapse's own docstring puts it.
+//
+// The point is that during a faster room join we do not HAVE the room's state,
+// so computing hosts from it under-counts, and under-counting means our own
+// events silently fail to reach servers that are in the room. Synapse prefers
+// the opposite error and says so: sending to a server that has since left leaks
+// only our own events, which it considers acceptable.
+func (s *Store) PartialStateServersAtJoin(ctx context.Context, roomID string) ([]string, bool, error) {
+	ctx = dbtrace.WithQueryName(ctx, "partial_state_servers_at_join")
+	const q = `
+		SELECT server_name FROM partial_state_rooms_servers WHERE room_id = $1`
+
+	rows, err := s.pool.Query(ctx, q, roomID)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: partial state servers for %s: %w", roomID, err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var server string
+		if err := rows.Scan(&server); err != nil {
+			return nil, false, fmt.Errorf("store: partial state servers for %s: %w", roomID, err)
+		}
+		out = append(out, server)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("store: partial state servers for %s: %w", roomID, err)
+	}
+	// Synapse treats an empty list as "not a partial state room" rather than as
+	// a partial room with nobody in it (room.py:1794).
+	return out, len(out) > 0, nil
+}
