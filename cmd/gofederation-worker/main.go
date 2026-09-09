@@ -362,11 +362,12 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		},
 		// A 429 throttles US; it does not condemn the host. See
 		// retry.Limiter.RateLimited.
-		OnRateLimited: func(destination string, after time.Duration) {
+		OnRateLimited: func(destination string, after time.Duration) time.Duration {
 			metrics.RateLimited.WithLabelValues(destination).Inc()
 			wait := w.limiter.RateLimited(destination, after)
 			log.Info().Str("destination", destination).Dur("wait", wait).
 				Msg("destination asked us to slow down; backing our own rate off, not the destination")
+			return wait
 		},
 	})
 

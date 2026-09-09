@@ -142,6 +142,13 @@ Breaking one of these should fail a test, not a deployment.
   running worker therefore does nothing for any destination already seeded, and
   the next failure persists the stale in-memory value back over the delete. The
   table looks clean either way, which is how this hides.
+- **A 429 must schedule its own retry.** The units stay queued after one, but
+  the queue is otherwise only re-run when the next event arrives for that
+  destination -- unbounded on a quiet one, and indistinguishable from delivery
+  working. `continuwuity.rocks` exposed this by answering "still processing
+  another transaction from this origin": the right response is to wait, not to
+  retry harder, so the persistence belongs at the cooldown in the queue and NOT
+  in the sink's attempt loop.
 - **A 429 throttles US; it does not condemn the host.** The three cases to tell
   apart: no answer before the timeout means the host has problems; an HTTP error
   that is not a 429 means the host cannot accept this; a 429 means the host is

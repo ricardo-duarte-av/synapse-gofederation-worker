@@ -40,7 +40,7 @@ type Manager struct {
 	batch         BatchConfig
 	longBackoff   func(destination string) bool
 	onEDUsDropped func(destination string, n int)
-	onRateLimited func(destination string, after time.Duration)
+	onRateLimited func(destination string, after time.Duration) time.Duration
 
 	mu    sync.RWMutex
 	dests map[string]*Destination
@@ -79,7 +79,7 @@ type ManagerConfig struct {
 	OnEDUsDropped func(destination string, n int)
 	// OnRateLimited reports a destination asking us to slow down; see
 	// Config.OnRateLimited.
-	OnRateLimited func(destination string, after time.Duration)
+	OnRateLimited func(destination string, after time.Duration) time.Duration
 }
 
 // NewManager builds a Manager.

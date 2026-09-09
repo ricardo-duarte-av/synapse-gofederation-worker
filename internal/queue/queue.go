@@ -149,8 +149,10 @@ type Destination struct {
 	longBackoff func(destination string) bool
 	// onEDUsDropped reports what a long outage cost.
 	onEDUsDropped func(destination string, n int)
-	// onRateLimited reports a destination asking us to slow down.
-	onRateLimited func(destination string, after time.Duration)
+	// onRateLimited reports a destination asking us to slow down, and returns
+	// how long the limiter decided to wait, so the queue can schedule its own
+	// retry for that moment.
+	onRateLimited func(destination string, after time.Duration) time.Duration
 	// outageLogged keeps one outage to one log line. Guarded by the loop, which
 	// is single-threaded per destination.
 	outageLogged bool
@@ -195,7 +197,7 @@ type Config struct {
 	// the answer is to slow down rather than to write it off. Reporting it as a
 	// failure grows a backoff built for dead servers, which on this deployment
 	// multiplies to a year.
-	OnRateLimited func(destination string, after time.Duration)
+	OnRateLimited func(destination string, after time.Duration) time.Duration
 	// Batch holds presence back so it can accumulate. Zero disables it.
 	Batch BatchConfig
 	// Wake re-runs this destination's loop, used when a hold expires. Set by
@@ -481,11 +483,31 @@ func (d *Destination) Run(ctx context.Context) {
 		}
 
 		err = d.send(ctx, batch)
-		d.reportOutcome(err)
+		wait, limited := d.reportOutcome(err)
 		if err != nil {
-			// The units stay queued: nothing was dequeued, because takeLocked
-			// only copies. Synapse gets the same result from __aexit__ bailing
-			// on an exception. The loop exits and a later Attempt retries.
+			// The units stay queued either way: nothing was dequeued, because
+			// takeLocked only copies. Synapse gets the same result from
+			// __aexit__ bailing on an exception.
+			if limited {
+				// Not a failure, and it must not be logged as one. The remote
+				// is up and has asked us to slow down, so the only useful
+				// response is to wait -- especially for "still processing
+				// another transaction from this origin", which says our own
+				// previous transaction is still being worked on.
+				//
+				// Schedule the retry rather than waiting for the next event to
+				// wake us. Without this a quiet destination holds its units
+				// until traffic happens to arrive, which is arbitrarily long
+				// and looks exactly like delivery working.
+				d.mu.Lock()
+				d.scheduleFlushLocked(wait)
+				d.mu.Unlock()
+				d.log.Info().
+					Int("pdus", len(pdus)).Int("edus", len(edus)).
+					Dur("retry_in", wait).
+					Msg("rate limited; units stay queued and the queue will retry")
+				return
+			}
 			d.log.Warn().Err(err).
 				Int("pdus", len(pdus)).Int("edus", len(edus)).
 				Msg("transaction failed; units remain queued")
@@ -668,18 +690,24 @@ func (d *Destination) scheduleFlushLocked(wait time.Duration) {
 // answering but cannot accept this; and a 429, which means the host is
 // perfectly fine and we are being too aggressive. Only the first two are the
 // destination's fault, and only they should back it off.
-func (d *Destination) reportOutcome(err error) {
+// It returns how long to wait before trying this destination again, and
+// whether the error was a rate limit at all. The caller schedules that retry:
+// a 429 that is never retried until the next event arrives leaves units queued
+// for an unbounded time on a quiet destination.
+func (d *Destination) reportOutcome(err error) (time.Duration, bool) {
 	if err != nil {
 		if after, limited := sink.IsRateLimited(err); limited {
+			var wait time.Duration
 			if d.onRateLimited != nil {
-				d.onRateLimited(d.name, after)
+				wait = d.onRateLimited(d.name, after)
 			}
-			return
+			return wait, true
 		}
 	}
 	if d.onOutcome != nil {
 		d.onOutcome(d.name, err == nil)
 	}
+	return 0, false
 }
 
 func (d *Destination) dequeue(pdus, edus int) {

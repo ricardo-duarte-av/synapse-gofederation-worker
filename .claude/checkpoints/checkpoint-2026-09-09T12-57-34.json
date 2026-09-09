@@ -1,0 +1,83 @@
+{
+  "timestamp": "2026-09-09T12:57:34.353Z",
+  "projectRoot": "/home/daedric/synapse-gofederation-worker",
+  "instincts": {
+    "instincts": [
+      {
+        "id": "coroutine-structured",
+        "type": "pattern",
+        "description": "Structured concurrency with viewModelScope",
+        "context": "coroutines-patterns",
+        "confidence": 1,
+        "createdAt": "2026-07-10T21:01:04.424Z",
+        "lastUsed": "2026-09-08T20:35:48.961Z",
+        "usageCount": 1017
+      },
+      {
+        "id": "sealed-interface-state",
+        "type": "pattern",
+        "description": "Sealed interface for UI state",
+        "context": "mvi-architecture",
+        "confidence": 1,
+        "createdAt": "2026-07-10T21:01:04.429Z",
+        "lastUsed": "2026-08-07T22:38:42.361Z",
+        "usageCount": 149
+      },
+      {
+        "id": "compose-state-hoisting",
+        "type": "pattern",
+        "description": "State hoisting with collectAsStateWithLifecycle",
+        "context": "jetpack-compose",
+        "confidence": 1,
+        "createdAt": "2026-07-10T21:01:04.430Z",
+        "lastUsed": "2026-09-07T08:51:19.743Z",
+        "usageCount": 1004
+      },
+      {
+        "id": "compose-lazy-key",
+        "type": "pattern",
+        "description": "LazyColumn/LazyRow with stable keys",
+        "context": "jetpack-compose",
+        "confidence": 1,
+        "createdAt": "2026-07-10T21:01:04.430Z",
+        "lastUsed": "2026-09-07T08:51:19.746Z",
+        "usageCount": 454
+      },
+      {
+        "id": "immutable-data-class",
+        "type": "pattern",
+        "description": "Immutable data class for Compose stability",
+        "context": "jetpack-compose",
+        "confidence": 1,
+        "createdAt": "2026-07-20T11:27:24.820Z",
+        "lastUsed": "2026-08-31T18:53:37.904Z",
+        "usageCount": 162
+      }
+    ],
+    "version": "1.0",
+    "lastUpdated": "2026-09-08T20:35:48.961Z"
+  },
+  "gitBranch": "main",
+  "lastFiles": [
+    "CLAUDE.md",
+    "cmd/gofederation-worker/main.go",
+    "cmd/gofederation-worker/writer.go",
+    "deploy/gofederation-worker.example.yaml",
+    "docs/synapse-reference.md",
+    "internal/config/config.go",
+    "internal/config/config_test.go",
+    "internal/destinations/before.go",
+    "internal/destinations/destinations_test.go",
+    "internal/destinations/hostcache_test.go",
+    "internal/destinations/resolve.go",
+    "internal/metrics/metrics.go",
+    "internal/queue/manager.go",
+    "internal/queue/queue.go",
+    "internal/queue/queue_test.go",
+    "internal/retry/retry.go",
+    "internal/retry/retry_test.go",
+    "internal/sender/ephemeral.go",
+    "internal/sender/ephemeral_test.go",
+    "internal/sender/sender_test.go"
+  ]
+}

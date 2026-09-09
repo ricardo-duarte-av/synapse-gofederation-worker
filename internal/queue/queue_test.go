@@ -936,8 +936,12 @@ func TestRateLimitIsNotReportedAsAFailure(t *testing.T) {
 	d := NewDestination(Config{
 		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
 		Sink: s, Log: zerolog.New(io.Discard),
-		OnOutcome:     func(_ string, ok bool) { outcomes = append(outcomes, ok) },
-		OnRateLimited: func(_ string, after time.Duration) { limitedCount++; limitedAfter = after },
+		OnOutcome: func(_ string, ok bool) { outcomes = append(outcomes, ok) },
+		OnRateLimited: func(_ string, after time.Duration) time.Duration {
+			limitedCount++
+			limitedAfter = after
+			return 0
+		},
 	})
 
 	d.EnqueuePDU(pdu("$a", 1))
@@ -977,7 +981,7 @@ func TestOrdinaryFailuresStillBackOff(t *testing.T) {
 		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
 		Sink: s, Log: zerolog.New(io.Discard),
 		OnOutcome:     func(_ string, ok bool) { sawFailure = sawFailure || !ok },
-		OnRateLimited: func(string, time.Duration) { limited++ },
+		OnRateLimited: func(string, time.Duration) time.Duration { limited++; return 0 },
 	})
 
 	d.EnqueuePDU(pdu("$a", 1))
@@ -990,4 +994,37 @@ func TestOrdinaryFailuresStillBackOff(t *testing.T) {
 	if limited != 0 {
 		t.Error("an ordinary failure was reported as rate limiting")
 	}
+}
+
+// A 429 must schedule its own retry.
+//
+// The units stay queued either way, but without a scheduled wake the queue
+// only runs again when the next event happens to arrive for that destination
+// -- which on a quiet destination is unbounded, and looks exactly like
+// delivery working. Observed against continuwuity.rocks, which answered "still
+// processing another transaction from this origin".
+func TestRateLimitSchedulesItsOwnRetry(t *testing.T) {
+	s := &recordingSink{err: &fakeRateLimit{}}
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var woken atomic.Int32
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		Wake: func() { woken.Add(1) },
+		// What the limiter decided to wait, short enough to observe.
+		OnRateLimited: func(string, time.Duration) time.Duration { return 10 * time.Millisecond },
+	})
+
+	d.EnqueuePDU(pdu("$a", 1))
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+
+	if p, _ := d.Pending(); p != 1 {
+		t.Errorf("%d pdus queued after a rate limit, want the one still there", p)
+	}
+	waitFor(t, "the scheduled retry", func() bool { return woken.Load() > 0 })
 }
