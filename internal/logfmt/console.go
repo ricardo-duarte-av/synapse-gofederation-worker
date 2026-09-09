@@ -8,17 +8,34 @@
 // (destination, event id, counts) to a different column on every line, which
 // is exactly what makes a log unscannable.
 //
-// Here the long text goes last and the fixed fields keep their columns.
+// Here the long text goes last and the fixed fields keep their columns. The
+// colours are zerolog's own, so the output still reads the way its does:
+// dark-grey timestamp, coloured level, bold message, cyan field names, and a
+// bold red error value.
 package logfmt
 
 import (
 	"bytes"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/tidwall/gjson"
+)
+
+// ANSI codes, matching zerolog's (console.go:20). Colour is on unless NO_COLOR
+// is set, which is also zerolog's rule -- it does not test for a terminal, and
+// these logs are read through `docker logs` rather than from a tty.
+const (
+	colorRed      = 31
+	colorGreen    = 32
+	colorYellow   = 33
+	colorBlue     = 34
+	colorCyan     = 36
+	colorBold     = 1
+	colorDarkGray = 90
 )
 
 // trailing are rendered after everything else, in this order. They are the
@@ -29,13 +46,25 @@ var trailing = []string{"error"}
 // order they were logged, with the unbounded ones last.
 type Console struct {
 	Out io.Writer
+	// NoColor strips the ANSI codes. Set from NO_COLOR by New.
+	NoColor bool
 
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
 
 // New builds a Console writing to out.
-func New(out io.Writer) *Console { return &Console{Out: out} }
+func New(out io.Writer) *Console {
+	return &Console{Out: out, NoColor: os.Getenv("NO_COLOR") != ""}
+}
+
+// colorize wraps s in an ANSI code, or returns it unchanged.
+func (c *Console) colorize(s string, code int) string {
+	if c.NoColor || code == 0 {
+		return s
+	}
+	return "\x1b[" + strconv.Itoa(code) + "m" + s + "\x1b[0m"
+}
 
 func (c *Console) Write(p []byte) (int, error) {
 	if !gjson.ValidBytes(p) {
@@ -47,11 +76,17 @@ func (c *Console) Write(p []byte) (int, error) {
 	defer c.mu.Unlock()
 	c.buf.Reset()
 
-	c.buf.WriteString(gjson.GetBytes(p, "time").String())
+	lvl := gjson.GetBytes(p, "level").String()
+	c.buf.WriteString(c.colorize(gjson.GetBytes(p, "time").String(), colorDarkGray))
 	c.buf.WriteByte(' ')
-	c.buf.WriteString(level(gjson.GetBytes(p, "level").String()))
+	c.buf.WriteString(c.colorize(level(lvl), levelColor(lvl)))
 	if msg := gjson.GetBytes(p, "message").String(); msg != "" {
 		c.buf.WriteByte(' ')
+		// Bold only from info up, as zerolog does: a debug line should not
+		// shout louder than the warning above it.
+		if levelColor(lvl) != 0 && lvl != "debug" {
+			msg = c.colorize(msg, colorBold)
+		}
 		c.buf.WriteString(msg)
 	}
 
@@ -88,9 +123,12 @@ func (c *Console) Write(p []byte) (int, error) {
 
 func (c *Console) field(key string, v gjson.Result) {
 	c.buf.WriteByte(' ')
-	c.buf.WriteString(key)
-	c.buf.WriteByte('=')
-	c.buf.WriteString(quote(v.String()))
+	c.buf.WriteString(c.colorize(key+"=", colorCyan))
+	value := quote(v.String())
+	if key == "error" {
+		value = c.colorize(c.colorize(value, colorBold), colorRed)
+	}
+	c.buf.WriteString(value)
 }
 
 func isTrailing(key string) bool {
@@ -129,6 +167,22 @@ func level(l string) string {
 		return "???"
 	}
 	return strings.ToUpper(l)
+}
+
+// levelColor is zerolog's LevelColors (globals.go:147). Debug is deliberately
+// uncoloured there, and 0 means "leave it alone".
+func levelColor(l string) int {
+	switch l {
+	case "trace":
+		return colorBlue
+	case "info":
+		return colorGreen
+	case "warn":
+		return colorYellow
+	case "error", "fatal", "panic":
+		return colorRed
+	}
+	return 0
 }
 
 func quote(s string) string {
