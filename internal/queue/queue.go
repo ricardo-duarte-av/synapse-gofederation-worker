@@ -17,10 +17,12 @@ package queue
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sink"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/txn"
@@ -739,10 +741,51 @@ func (d *Destination) send(ctx context.Context, batch taken) error {
 		// Synapse logs these and never retries them
 		// (transaction_manager.py:197): the remote has made a decision about
 		// that event, and sending it again would get the same answer.
-		d.log.Warn().Str("event_id", eventID).Str("error", msg).
+		//
+		// The room is the useful half. "This server is not participating in
+		// that room" is only actionable if you can go and look at the room, and
+		// the event id alone does not get you there -- it has to be looked up
+		// in the database, by hand, after the fact.
+		d.log.Warn().Str("event_id", eventID).
+			Str("room_id", roomOf(batch.pdus, eventID)).
+			Str("error", msg).
 			Msg("remote rejected a PDU")
 	}
 	return nil
+}
+
+// roomOf finds the room of a rejected event among the PDUs we just sent.
+//
+// Two things make this less direct than a map lookup:
+//
+//   - A remote may echo the event id in the OTHER base64 alphabet.
+//     hashtags.nonamesoft.xyz answers with `-` and `_` where we sent `+` and
+//     `/`, for the same event, in the same second as other servers echoing it
+//     unchanged. Matching literally silently finds nothing for those.
+//   - A remote may not name the event at all. m.matrix-api.kdns.fr reports
+//     the key "unknown" along with a D1_TYPE_ERROR from its own database
+//     layer, having failed before it could identify the event.
+//
+// When the transaction carried exactly one PDU there is no ambiguity, so an
+// unmatched id still resolves. Otherwise the room is reported as unknown
+// rather than guessed.
+func roomOf(pdus []PDU, eventID string) string {
+	for _, p := range pdus {
+		if p.EventID == eventID || sameEventID(p.EventID, eventID) {
+			return gjson.GetBytes(p.JSON, "room_id").String()
+		}
+	}
+	if len(pdus) == 1 {
+		return gjson.GetBytes(pdus[0].JSON, "room_id").String()
+	}
+	return "unknown"
+}
+
+// sameEventID compares two event ids across the standard and URL-safe base64
+// alphabets, which are the same bytes written differently.
+func sameEventID(a, b string) bool {
+	return strings.NewReplacer("-", "+", "_", "/").Replace(a) ==
+		strings.NewReplacer("-", "+", "_", "/").Replace(b)
 }
 
 // LastSuccessfulStreamOrdering is our copy of the destinations table column.

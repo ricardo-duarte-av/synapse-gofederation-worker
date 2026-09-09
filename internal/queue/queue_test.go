@@ -1028,3 +1028,37 @@ func TestRateLimitSchedulesItsOwnRetry(t *testing.T) {
 	}
 	waitFor(t, "the scheduled retry", func() bool { return woken.Load() > 0 })
 }
+
+// A rejected PDU must be reported with its room.
+//
+// The event id alone is not actionable: "This server is not participating in
+// that room" can only be looked into if you know which room. The lookup has to
+// survive two things remotes actually do -- echoing the id in the URL-safe
+// base64 alphabet, and not naming the event at all.
+func TestRoomOfARejectedPDU(t *testing.T) {
+	inRoom := func(id, room string) PDU {
+		return PDU{EventID: id, JSON: []byte(`{"event_id":"` + id + `","room_id":"` + room + `"}`)}
+	}
+	sent := []PDU{
+		inRoom("$hE43+VTAG34dp9EZ/SXkhe", "!first:a.example"),
+		inRoom("$other", "!second:a.example"),
+	}
+
+	for _, tc := range []struct {
+		name, reported string
+		pdus           []PDU
+		want           string
+	}{
+		{"echoed as sent", "$hE43+VTAG34dp9EZ/SXkhe", sent, "!first:a.example"},
+		{"echoed url-safe", "$hE43-VTAG34dp9EZ_SXkhe", sent, "!first:a.example"},
+		{"another event", "$other", sent, "!second:a.example"},
+		{"unnamed, one pdu", "unknown", sent[:1], "!first:a.example"},
+		{"unnamed, ambiguous", "unknown", sent, "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := roomOf(tc.pdus, tc.reported); got != tc.want {
+				t.Errorf("roomOf(%q) = %q, want %q", tc.reported, got, tc.want)
+			}
+		})
+	}
+}
