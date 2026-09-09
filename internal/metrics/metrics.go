@@ -61,6 +61,17 @@ var (
 		Help: "Joined-host lookups by state group, by cache result.",
 	}, []string{"result"})
 
+	// RateLimited counts destinations asking us to slow down.
+	//
+	// Worth its own counter rather than being folded into failures, because it
+	// means the opposite: the server is up and answering. A rising line here is
+	// this worker being too aggressive, which is fixed by sending less often,
+	// not by waiting for a host to come back.
+	RateLimited = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gofed_rate_limited_total",
+		Help: "Transactions refused with 429 by a destination, by destination.",
+	}, []string{"destination"})
+
 	// EDUsDropped counts ephemeral EDUs abandoned because their destination is
 	// in a long outage.
 	//
@@ -277,7 +288,7 @@ var (
 func All() []prometheus.Collector {
 	return []prometheus.Collector{
 		BuildInfo, ShadowMode, DatabaseReadOnly,
-		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped, StateGroupCache, StateGroupCacheEntries,
+		ReplicationLive, ReplicationRows, StreamPosition, EDUsDropped, RateLimited, StateGroupCache, StateGroupCacheEntries,
 		EventsProcessed, EventsSkipped, EventsRouted, DestinationsPerEvent,
 		ApproximateRoutes, BatchDuration,
 		DBQueryDuration, DBQueries, DBPoolConns,

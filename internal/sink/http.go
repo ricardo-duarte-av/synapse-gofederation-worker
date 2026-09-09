@@ -362,6 +362,31 @@ func rateLimitDelay(base time.Duration, lastErr error, seen *int) (time.Duration
 	return base, true
 }
 
+// RateLimitedError is an error meaning the remote asked us to slow down.
+//
+// An interface rather than a concrete type so the concept is expressible
+// outside this package -- by another sink, or by a test that needs to produce
+// one without reaching into this package's internals. A contract only this file
+// can satisfy is a contract only this file can be tested against.
+type RateLimitedError interface {
+	error
+	// RetryAfter is how long the remote asked for, or zero if it gave no hint.
+	RetryAfter() time.Duration
+}
+
+// IsRateLimited reports whether err is a remote asking us to slow down, and how
+// long it asked for.
+//
+// The distinction matters: a 429 means the server is UP and talking to us,
+// which is the opposite of what the per-destination backoff is for.
+func IsRateLimited(err error) (time.Duration, bool) {
+	var limited RateLimitedError
+	if errors.As(err, &limited) {
+		return limited.RetryAfter(), true
+	}
+	return 0, false
+}
+
 // maxRateLimitedAttempts is how many times a 429 is retried before giving up.
 //
 // Small on purpose. A remote that answers 429 has received the request and
@@ -376,8 +401,9 @@ type rateLimited struct {
 	after time.Duration
 }
 
-func (e *rateLimited) Error() string { return e.err.Error() }
-func (e *rateLimited) Unwrap() error { return e.err }
+func (e *rateLimited) Error() string             { return e.err.Error() }
+func (e *rateLimited) RetryAfter() time.Duration { return e.after }
+func (e *rateLimited) Unwrap() error             { return e.err }
 
 // retryAfter reads how long the remote asked us to wait.
 //

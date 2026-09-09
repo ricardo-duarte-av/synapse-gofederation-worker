@@ -149,6 +149,8 @@ type Destination struct {
 	longBackoff func(destination string) bool
 	// onEDUsDropped reports what a long outage cost.
 	onEDUsDropped func(destination string, n int)
+	// onRateLimited reports a destination asking us to slow down.
+	onRateLimited func(destination string, after time.Duration)
 	// outageLogged keeps one outage to one log line. Guarded by the loop, which
 	// is single-threaded per destination.
 	outageLogged bool
@@ -185,6 +187,15 @@ type Config struct {
 	// is in a long outage, so the count is visible rather than inferred from a
 	// queue that stopped growing.
 	OnEDUsDropped func(destination string, n int)
+	// OnRateLimited reports a destination that answered 429, with the delay it
+	// asked for if it gave one.
+	//
+	// Separate from OnOutcome because a 429 is not a failed destination. The
+	// server received the request, understood it and declined it: it is up, and
+	// the answer is to slow down rather than to write it off. Reporting it as a
+	// failure grows a backoff built for dead servers, which on this deployment
+	// multiplies to a year.
+	OnRateLimited func(destination string, after time.Duration)
 	// Batch holds presence back so it can accumulate. Zero disables it.
 	Batch BatchConfig
 	// Wake re-runs this destination's loop, used when a hold expires. Set by
@@ -238,6 +249,7 @@ func NewDestination(cfg Config) *Destination {
 		sink:          cfg.Sink,
 		longBackoff:   cfg.LongBackoff,
 		onEDUsDropped: cfg.OnEDUsDropped,
+		onRateLimited: cfg.OnRateLimited,
 		log:           cfg.Log.With().Str("destination", cfg.Name).Logger(),
 		onSuccess:     cfg.OnSuccess,
 		onEDUsSent:    cfg.OnEDUsSent,
@@ -469,9 +481,7 @@ func (d *Destination) Run(ctx context.Context) {
 		}
 
 		err = d.send(ctx, batch)
-		if d.onOutcome != nil {
-			d.onOutcome(d.name, err == nil)
-		}
+		d.reportOutcome(err)
 		if err != nil {
 			// The units stay queued: nothing was dequeued, because takeLocked
 			// only copies. Synapse gets the same result from __aexit__ bailing
@@ -649,6 +659,29 @@ func (d *Destination) scheduleFlushLocked(wait time.Duration) {
 	})
 }
 
+// reportOutcome tells the caller what happened, distinguishing a rate limit
+// from a failure.
+//
+// A 429 is deliberately NOT reported through onOutcome. The three cases the
+// sender has to tell apart are: no answer before the timeout, which means the
+// host has problems; an HTTP error that is not a 429, which means the host is
+// answering but cannot accept this; and a 429, which means the host is
+// perfectly fine and we are being too aggressive. Only the first two are the
+// destination's fault, and only they should back it off.
+func (d *Destination) reportOutcome(err error) {
+	if err != nil {
+		if after, limited := sink.IsRateLimited(err); limited {
+			if d.onRateLimited != nil {
+				d.onRateLimited(d.name, after)
+			}
+			return
+		}
+	}
+	if d.onOutcome != nil {
+		d.onOutcome(d.name, err == nil)
+	}
+}
+
 func (d *Destination) dequeue(pdus, edus int) {
 	d.mu.Lock()
 	d.pendingPDUs = d.pendingPDUs[pdus:]
@@ -762,14 +795,10 @@ func (d *Destination) SendCatchUp(ctx context.Context, p PDU) error {
 	// Catch-up carries no EDUs at all, so there is nothing here that another
 	// goroutine could be mutating; the batch is built from one event.
 	if err := d.send(ctx, taken{pdus: []PDU{p}}); err != nil {
-		if d.onOutcome != nil {
-			d.onOutcome(d.name, false)
-		}
+		d.reportOutcome(err)
 		return err
 	}
-	if d.onOutcome != nil {
-		d.onOutcome(d.name, true)
-	}
+	d.reportOutcome(nil)
 	d.mu.Lock()
 	if p.StreamOrdering > d.lastSuccessfulStreamOrdering {
 		d.lastSuccessfulStreamOrdering = p.StreamOrdering

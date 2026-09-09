@@ -232,21 +232,79 @@ func (w *Writer) UpdateFederationOutPos(ctx context.Context, typ, instanceName s
 	return nil
 }
 
-// Synapse's `destinations` retry columns are deliberately NOT written here.
+// SetDestinationRetryTimings and ClearDestinationRetryTimings write Synapse's
+// own `destinations` retry columns, exactly as a Python sender does.
 //
-// A Python sender writes them through set_destination_retry_timings
-// (transactions.py:265), which also invalidates a cache
-// (get_destination_retry_timings, transactions.py:169) and streams that
-// invalidation to every other Synapse process. A write from out here does the
-// first half and cannot do the second, so every process goes on serving what it
-// cached -- and a backoff we CLEARED would keep Synapse from talking to a server
-// that is back up, for as long as the cached interval says.
+// These were removed once and had to come back, and the reason is worth
+// keeping. Synapse caches these timings (transactions.py:169) and invalidates
+// the cache only from its own write path, so writing them from out here leaves
+// every Synapse process serving what it cached. That is a real cost -- but the
+// cost of NOT writing them turned out to be larger and was measured: Synapse's
+// inbound path resets a destination's backoff when that server contacts us, and
+// it decides whether to bother by reading THIS column
+// (transport/server/_base.py:143). With the column left at zero the reset never
+// fires, so a server that came back and talked to us could not clear its
+// backoff -- 62 of 140 backing-off destinations were stuck that way, against a
+// cap of a year.
 //
-// So this worker keeps its own backoff in its own schema; see
-// internal/state.SetRetryTimings, which also explains why publishing the
-// invalidation on the caches stream would be a worse trade than a stale read.
-// The writer keeps last_successful_stream_ordering and destination_rooms below,
-// which are read straight from the database and cached nowhere.
+// The general rule this taught, and the reason to prefer writing: Synapse has
+// readers and triggers that are not enumerated anywhere, so a primary sender
+// should fill its tables the way a Python sender would and keep its own copy
+// only where it needs a different answer. internal/state.SetRetryTimings holds
+// the copy this worker's own sending decisions are made from, so a stale cache
+// on Synapse's side cannot affect what WE send.
+//
+// The staleness also has a cure built into the same trigger: when the server
+// contacts us, the inbound path calls Synapse's own setter, which invalidates
+// the cache properly everywhere.
+
+// SetDestinationRetryTimings is Synapse's set_destination_retry_timings
+// (transactions.py:265).
+//
+// The WHERE clause is the whole point and is copied deliberately. Several
+// senders and several requests race on the same destination, so the upsert only
+// takes effect when the new value is a reset (interval or last_ts zero), when
+// there was no interval before, or when it is a LONGER backoff or a LATER
+// attempt than what is already recorded.
+//
+// Without it, two concurrent failures can leave the shorter backoff winning and
+// a dead server gets hammered; and a success racing a failure can clear a
+// backoff that should have stood.
+func (w *Writer) SetDestinationRetryTimings(ctx context.Context, destination string, failureTS, retryLastTS, retryInterval int64) error {
+	ctx = dbtrace.WithQueryName(ctx, "set_destination_retry_timings")
+	const q = `
+		INSERT INTO destinations (destination, failure_ts, retry_last_ts, retry_interval)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (destination) DO UPDATE SET
+			failure_ts = EXCLUDED.failure_ts,
+			retry_last_ts = EXCLUDED.retry_last_ts,
+			retry_interval = EXCLUDED.retry_interval
+		WHERE EXCLUDED.retry_interval = 0
+		   OR EXCLUDED.retry_last_ts = 0
+		   OR destinations.retry_interval IS NULL
+		   OR destinations.retry_interval < EXCLUDED.retry_interval
+		   OR destinations.retry_last_ts < EXCLUDED.retry_last_ts`
+
+	var failure any
+	if failureTS != 0 {
+		failure = failureTS
+	}
+	if _, err := w.pool.Exec(ctx, q, destination, failure, retryLastTS, retryInterval); err != nil {
+		return fmt.Errorf("store: retry timings for %s: %w", destination, err)
+	}
+	return nil
+}
+
+// ClearDestinationRetryTimings records a destination as healthy again.
+//
+// Synapse's success path sets failure_ts NULL and both retry columns to zero
+// (retryutils.py:226). Separate from the failure path because the reset must go
+// through even when a concurrent failure has just written a longer backoff --
+// which is exactly what the WHERE clause above lets through on
+// `EXCLUDED.retry_interval = 0`.
+func (w *Writer) ClearDestinationRetryTimings(ctx context.Context, destination string) error {
+	return w.SetDestinationRetryTimings(ctx, destination, 0, 0, 0)
+}
 
 // Stat reports the connection pool's saturation.
 //

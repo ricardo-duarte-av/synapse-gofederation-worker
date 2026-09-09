@@ -81,6 +81,15 @@ type Limiter struct {
 	// first attempt after a restart does not treat a backing-off server as new.
 	loaded map[string]bool
 
+	// cooldown is when a destination that asked us to slow down may be tried
+	// again. Deliberately separate from state: a 429 is not a failure and must
+	// not touch the backoff that state holds.
+	cooldown map[string]time.Time
+	// cooldownFor is how long each destination's current cooldown is, so
+	// repeated rate limiting lengthens it without ever compounding into the
+	// backoff.
+	cooldownFor map[string]time.Duration
+
 	// onUp is called when a destination recovers, so a caller can wake its
 	// queue and tell the rest of the cluster.
 	onUp func(destination string)
@@ -100,6 +109,7 @@ func New(cfg Config, load Loader, persist Persister) *Limiter {
 	return &Limiter{
 		cfg: cfg, load: load, persist: persist,
 		state: map[string]Timings{}, loaded: map[string]bool{},
+		cooldown: map[string]time.Time{}, cooldownFor: map[string]time.Duration{},
 	}
 }
 
@@ -110,6 +120,49 @@ func (l *Limiter) SetOnRecovered(f func(destination string)) { l.onUp = f }
 // state the first time it is asked about one.
 func (l *Limiter) Due(ctx context.Context, destination string) bool {
 	return l.DueWithin(ctx, destination, 0)
+}
+
+// Rate-limit cooldowns. Nothing like the destination backoff: this is for a
+// server that is UP and asking us to be quieter, so it is measured in seconds,
+// grows gently, is capped low, and is never persisted -- a cooldown that
+// survived a restart would be a backoff by another name.
+const (
+	rateLimitBaseCooldown = 5 * time.Second
+	rateLimitMaxCooldown  = 5 * time.Minute
+)
+
+// RateLimited records that a destination answered 429.
+//
+// It does NOT touch the backoff. The three failure cases a sender must tell
+// apart are: no answer before the timeout, which means the host has problems;
+// an HTTP error that is not a 429, which means the host cannot accept this; and
+// a 429, which means the host is fine and we are being too aggressive. Only the
+// first two are the destination's fault. Backing off on a 429 -- which is what
+// Synapse does (retryutils.py:258), and what this worker used to do -- takes a
+// server that is talking to us and, over a few collisions, writes it off for as
+// long as the cap allows. On this deployment that cap is a year.
+//
+// after is the remote's own hint when it sent one, which is always preferred:
+// it knows how busy it is and we do not.
+func (l *Limiter) RateLimited(destination string, after time.Duration) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	wait := after
+	if wait <= 0 {
+		// No hint, so grow our own: repeated rate limiting means the last
+		// interval was still too fast.
+		wait = l.cooldownFor[destination] * 2
+		if wait <= 0 {
+			wait = rateLimitBaseCooldown
+		}
+	}
+	if wait > rateLimitMaxCooldown {
+		wait = rateLimitMaxCooldown
+	}
+	l.cooldownFor[destination] = wait
+	l.cooldown[destination] = time.Now().Add(wait)
+	return wait
 }
 
 // DueWithin reports whether a destination is due now or becomes due within the
@@ -131,9 +184,25 @@ func (l *Limiter) DueWithin(ctx context.Context, destination string, within time
 	if !seeded {
 		t = l.seed(ctx, destination)
 	} else if !known {
-		return true
+		return l.offCooldown(destination)
 	}
-	return t.Due(time.Now().UnixMilli() + within.Milliseconds())
+	if !t.Due(time.Now().UnixMilli() + within.Milliseconds()) {
+		return false
+	}
+	return l.offCooldown(destination)
+}
+
+// offCooldown reports whether a rate-limit cooldown has passed.
+//
+// The slack that DueWithin applies to the backoff is deliberately NOT applied
+// here. That slack exists so a destination about to come back is included in a
+// batch rather than deferred; a cooldown is a promise to a server that is
+// already up, and reaching for work a few minutes early would break it.
+func (l *Limiter) offCooldown(destination string) bool {
+	l.mu.RLock()
+	until, ok := l.cooldown[destination]
+	l.mu.RUnlock()
+	return !ok || !time.Now().Before(until)
 }
 
 // seed reads a destination's persisted timings once.
@@ -178,6 +247,9 @@ func (l *Limiter) Success(ctx context.Context, destination string) {
 	previous := l.state[destination]
 	l.state[destination] = Timings{}
 	l.loaded[destination] = true
+	// A delivered transaction means the pace is acceptable again.
+	delete(l.cooldown, destination)
+	delete(l.cooldownFor, destination)
 	l.mu.Unlock()
 
 	// Only act on an actual transition. Clearing an already-clear destination

@@ -150,9 +150,27 @@ func (w *worker) persistTimings(ctx context.Context, destination string, t retry
 	if w.writer == nil || w.cursors == nil {
 		return nil
 	}
+	// Ours is the authority for what THIS sender does, so it is written first
+	// and its failure is the one that matters.
 	err := w.cursors.SetRetryTimings(ctx, destination, state.RetryTimings{
 		FailureTS: t.FailureTS, RetryLastTS: t.RetryLastTS, RetryInterval: t.RetryInterval,
 	})
+
+	// Synapse's own column as well, exactly as a Python sender writes it.
+	//
+	// Not for our benefit: Synapse's inbound path decides whether to reset a
+	// destination -- and to broadcast REMOTE_SERVER_UP -- by reading this
+	// column (transport/server/_base.py:143). Leaving it at zero silently broke
+	// the only way a backoff clears when a server comes back and talks to us.
+	// The admin API's reset_connection reads it too.
+	//
+	// Its failure is logged and not returned. This is Synapse's bookkeeping,
+	// and losing a write to it must not fail the send or stall our own cursor.
+	if synErr := w.writeSynapseTimings(ctx, destination, t); synErr != nil {
+		w.log.Warn().Err(synErr).Str("destination", destination).
+			Msg("failed to mirror the backoff into Synapse's destinations table")
+	}
+
 	if err != nil {
 		metrics.WriteOps.WithLabelValues("retry_timings", "error").Inc()
 		w.log.Error().Err(err).Str("destination", destination).Msg("failed to persist a backoff")
@@ -199,4 +217,21 @@ func (w *worker) loadTimings(ctx context.Context, dests []string) (map[string]re
 		}
 	}
 	return out, nil
+}
+
+// writeSynapseTimings mirrors a backoff into Synapse's `destinations` table.
+//
+// A zero backoff is a RESET and goes through the clear path, which Synapse
+// writes with failure_ts NULL: its conditional upsert only lets a shorter
+// interval through when the new one is a reset, so a clear written as an
+// ordinary set would be silently dropped.
+func (w *worker) writeSynapseTimings(ctx context.Context, destination string, t retry.Timings) error {
+	if w.writer == nil {
+		return nil
+	}
+	if t.RetryInterval == 0 && t.RetryLastTS == 0 {
+		return w.writer.ClearDestinationRetryTimings(ctx, destination)
+	}
+	return w.writer.SetDestinationRetryTimings(
+		ctx, destination, t.FailureTS, t.RetryLastTS, t.RetryInterval)
 }

@@ -226,3 +226,96 @@ func TestDueWithinLookahead(t *testing.T) {
 		t.Error("an unknown destination was treated as backing off")
 	}
 }
+
+// The three cases a sender must tell apart: no answer before the timeout means
+// the host has problems; an HTTP error that is not a 429 means the host cannot
+// accept this; a 429 means the host is FINE and we are being too aggressive.
+// Only the first two are the destination's fault.
+//
+// Backing off on a 429 is what Synapse does (retryutils.py:258) and what this
+// worker used to do, and it took nexy7574.co.uk -- a server that was up and
+// answering -- to a 1352-minute backoff.
+func TestRateLimitedDoesNotTouchTheBackoff(t *testing.T) {
+	ctx := context.Background()
+	var persisted int
+	l := New(Config{MinInterval: 10 * time.Minute, Multiplier: 5, MaxInterval: 365 * 24 * time.Hour},
+		nil, func(context.Context, string, Timings) error { persisted++; return nil })
+
+	for i := 0; i < 5; i++ {
+		l.RateLimited("busy.example", 0)
+	}
+
+	if got := l.Timings("busy.example"); got != (Timings{}) {
+		t.Errorf("timings = %+v, want the backoff untouched by a 429", got)
+	}
+	if persisted != 0 {
+		t.Errorf("persisted %d times; a 429 must not be written as a failure", persisted)
+	}
+	// And it is not counted as a backing-off destination.
+	if n := l.Backoff(); n != 0 {
+		t.Errorf("Backoff() = %d, want 0", n)
+	}
+	_ = ctx
+}
+
+// It still throttles us: the destination is not due until the cooldown passes.
+func TestRateLimitedHoldsTheDestinationBack(t *testing.T) {
+	ctx := context.Background()
+	l := limiter(t)
+
+	if !l.Due(ctx, "busy.example") {
+		t.Fatal("precondition: a fresh destination is due")
+	}
+	l.RateLimited("busy.example", 50*time.Millisecond)
+	if l.Due(ctx, "busy.example") {
+		t.Error("still due immediately after being asked to slow down")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !l.Due(ctx, "busy.example") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !l.Due(ctx, "busy.example") {
+		t.Error("still held back well after the cooldown passed")
+	}
+}
+
+// The remote's own hint wins: it knows how busy it is and we do not.
+func TestRateLimitedPrefersTheRemotesHint(t *testing.T) {
+	l := limiter(t)
+	if got := l.RateLimited("busy.example", 2*time.Second); got != 2*time.Second {
+		t.Errorf("wait = %v, want the remote's 2s hint", got)
+	}
+}
+
+// With no hint the cooldown grows -- repeated rate limiting means the last
+// interval was still too fast -- but it is capped low, because this is a server
+// that is up and we want to keep talking to it.
+func TestRateLimitedGrowsAndIsCapped(t *testing.T) {
+	l := limiter(t)
+	first := l.RateLimited("busy.example", 0)
+	second := l.RateLimited("busy.example", 0)
+	if second <= first {
+		t.Errorf("cooldown did not grow: %v then %v", first, second)
+	}
+	for i := 0; i < 20; i++ {
+		l.RateLimited("busy.example", 0)
+	}
+	if got := l.RateLimited("busy.example", 0); got != rateLimitMaxCooldown {
+		t.Errorf("cooldown = %v, want it capped at %v", got, rateLimitMaxCooldown)
+	}
+}
+
+// A delivered transaction means the pace is acceptable again.
+func TestSuccessClearsTheCooldown(t *testing.T) {
+	ctx := context.Background()
+	l := limiter(t)
+	l.RateLimited("busy.example", time.Hour)
+	if l.Due(ctx, "busy.example") {
+		t.Fatal("precondition: should be cooling down")
+	}
+	l.Success(ctx, "busy.example")
+	if !l.Due(ctx, "busy.example") {
+		t.Error("a successful send did not clear the cooldown")
+	}
+}

@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -39,6 +40,7 @@ type Manager struct {
 	batch         BatchConfig
 	longBackoff   func(destination string) bool
 	onEDUsDropped func(destination string, n int)
+	onRateLimited func(destination string, after time.Duration)
 
 	mu    sync.RWMutex
 	dests map[string]*Destination
@@ -75,6 +77,9 @@ type ManagerConfig struct {
 	LongBackoff func(destination string) bool
 	// OnEDUsDropped reports what such an outage cost.
 	OnEDUsDropped func(destination string, n int)
+	// OnRateLimited reports a destination asking us to slow down; see
+	// Config.OnRateLimited.
+	OnRateLimited func(destination string, after time.Duration)
 }
 
 // NewManager builds a Manager.
@@ -97,6 +102,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		batch:         cfg.Batch,
 		longBackoff:   cfg.LongBackoff,
 		onEDUsDropped: cfg.OnEDUsDropped,
+		onRateLimited: cfg.OnRateLimited,
 		dests:         map[string]*Destination{},
 		base:          context.Background(),
 	}
@@ -146,6 +152,7 @@ func (m *Manager) Get(name string) *Destination {
 		Due:           m.due,
 		LongBackoff:   m.longBackoff,
 		OnEDUsDropped: m.onEDUsDropped,
+		OnRateLimited: m.onRateLimited,
 	})
 	// The destination needs to be able to re-run its own loop when a batching
 	// hold expires, and the Manager owns the concurrency bound, so the hook is

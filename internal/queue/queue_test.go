@@ -32,7 +32,17 @@ type recordingSink struct {
 
 	fail  atomic.Bool
 	block chan struct{}
+	// err, when set, is returned instead of succeeding. Used to inject a rate
+	// limit, which the queue must classify differently from a failure.
+	err error
 }
+
+// fakeRateLimit stands in for what the sink returns on a 429. The queue asks
+// sink.IsRateLimited about it, so it has to satisfy that check.
+type fakeRateLimit struct{ after time.Duration }
+
+func (e *fakeRateLimit) Error() string             { return "429 Too Many Requests" }
+func (e *fakeRateLimit) RetryAfter() time.Duration { return e.after }
 
 func (r *recordingSink) Mode() string { return "test" }
 
@@ -52,6 +62,9 @@ func (r *recordingSink) Send(ctx context.Context, req *txn.Request) (sink.Result
 		case <-ctx.Done():
 			return sink.Result{}, ctx.Err()
 		}
+	}
+	if r.err != nil {
+		return sink.Result{}, r.err
 	}
 	if r.fail.Load() {
 		return sink.Result{Delivered: false}, nil
@@ -903,5 +916,78 @@ func TestWorkQueuedDuringCatchUpIsNotStranded(t *testing.T) {
 	case <-woken:
 	default:
 		t.Error("work queued during catch-up did not re-wake the destination")
+	}
+}
+
+// A 429 must reach OnRateLimited, not OnOutcome. The distinction is the whole
+// policy: the host is up and answering, so throttle ourselves rather than write
+// the destination off.
+func TestRateLimitIsNotReportedAsAFailure(t *testing.T) {
+	s := &recordingSink{}
+	s.err = &fakeRateLimit{after: 1500 * time.Millisecond}
+
+	var outcomes []bool
+	var limitedAfter time.Duration
+	var limitedCount int
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		OnOutcome:     func(_ string, ok bool) { outcomes = append(outcomes, ok) },
+		OnRateLimited: func(_ string, after time.Duration) { limitedCount++; limitedAfter = after },
+	})
+
+	d.EnqueuePDU(pdu("$a", 1))
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+
+	if limitedCount == 0 {
+		t.Error("a 429 was not reported as rate limiting")
+	}
+	if limitedAfter != 1500*time.Millisecond {
+		t.Errorf("after = %v, want the remote's hint carried through", limitedAfter)
+	}
+	for _, ok := range outcomes {
+		if !ok {
+			t.Error("a 429 was ALSO reported as a delivery failure; it would back off the host")
+		}
+	}
+	// And nothing was dequeued, so the transaction is retried later.
+	if p, _ := d.Pending(); p != 1 {
+		t.Errorf("%d PDUs pending, want the transaction still queued", p)
+	}
+}
+
+// Everything that is not a 429 still reports a failure, so a host with problems
+// is still backed off.
+func TestOrdinaryFailuresStillBackOff(t *testing.T) {
+	s := &recordingSink{}
+	s.fail.Store(true)
+
+	var sawFailure bool
+	var limited int
+	signer, err := txn.NewSigner("a.example", testKeyLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDestination(Config{
+		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
+		Sink: s, Log: zerolog.New(io.Discard),
+		OnOutcome:     func(_ string, ok bool) { sawFailure = sawFailure || !ok },
+		OnRateLimited: func(string, time.Duration) { limited++ },
+	})
+
+	d.EnqueuePDU(pdu("$a", 1))
+	d.Attempt(context.Background())
+	waitFor(t, "the loop to give up", func() bool { return !d.isRunning() })
+
+	if !sawFailure {
+		t.Error("an ordinary failure was not reported as one")
+	}
+	if limited != 0 {
+		t.Error("an ordinary failure was reported as rate limiting")
 	}
 }

@@ -119,6 +119,24 @@ Breaking one of these should fail a test, not a deployment.
   grew a live server's backoff because it was talking over itself --
   `nexy7574.co.uk` reached 231 minutes that way. `queue.ErrBusy` is not a
   failure and must never be reported as one.
+- **Fill Synapse's tables the way a Python sender would.** Synapse has readers
+  and triggers that are not enumerated anywhere, so deviating breaks things
+  nobody predicted. Learned by leaving `destinations.retry_last_ts` unwritten:
+  Synapse's inbound path decides whether to reset a backoff, and broadcast
+  REMOTE_SERVER_UP, by reading that column (`transport/server/_base.py:143`), so
+  a server that came back and talked to us could not clear its backoff. 62 of
+  140 destinations were stuck that way. We write it again, and keep
+  `gofederation.destination_retry` as the authority for our OWN sending, so
+  Synapse's cache staleness cannot affect what we send.
+- **A 429 throttles US; it does not condemn the host.** The three cases to tell
+  apart: no answer before the timeout means the host has problems; an HTTP error
+  that is not a 429 means the host cannot accept this; a 429 means the host is
+  fine and we are too aggressive. Only the first two back the destination off. A
+  429 sets a short in-memory cooldown instead (`retry.Limiter.RateLimited`),
+  capped at five minutes and never persisted. This DIVERGES from Synapse, which
+  backs off on 429 (`retryutils.py:258`) -- deliberately, because that backoff
+  multiplies to a year here and it took `nexy7574.co.uk`, a server that was up
+  and answering, to 1352 minutes.
 - **This worker manufactured its own 429s.** `client_timeout` is 10s here, so a
   transaction the remote takes longer than that to process times out on our side
   while it is still being worked on -- and the retry is a SECOND transaction
