@@ -135,6 +135,13 @@ Breaking one of these should fail a test, not a deployment.
   140 destinations were stuck that way. We write it again, and keep
   `gofederation.destination_retry` as the authority for our OWN sending, so
   Synapse's cache staleness cannot affect what we send.
+- **Clearing a backoff by hand means DELETE first, restart second.**
+  `retry.Limiter` seeds a destination from `gofederation.destination_retry`
+  ONCE and then never reads it again -- the in-memory map is the authority for
+  the life of the process (`internal/retry/retry.go`). A `DELETE` against a
+  running worker therefore does nothing for any destination already seeded, and
+  the next failure persists the stale in-memory value back over the delete. The
+  table looks clean either way, which is how this hides.
 - **A 429 throttles US; it does not condemn the host.** The three cases to tell
   apart: no answer before the timeout means the host has problems; an HTTP error
   that is not a 429 means the host cannot accept this; a 429 means the host is
