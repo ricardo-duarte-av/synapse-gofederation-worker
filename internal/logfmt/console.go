@@ -77,17 +77,19 @@ func (c *Console) Write(p []byte) (int, error) {
 	c.buf.Reset()
 
 	lvl := gjson.GetBytes(p, "level").String()
-	c.buf.WriteString(c.colorize(gjson.GetBytes(p, "time").String(), colorDarkGray))
-	c.buf.WriteByte(' ')
-	c.buf.WriteString(c.colorize(level(lvl), levelColor(lvl)))
+	// Each part is separated from the last only if there was a last one, so a
+	// logger with no timestamp does not produce a leading space on every line.
+	if ts := gjson.GetBytes(p, "time").String(); ts != "" {
+		c.part(c.colorize(ts, colorDarkGray))
+	}
+	c.part(c.colorize(level(lvl), levelColor(lvl)))
 	if msg := gjson.GetBytes(p, "message").String(); msg != "" {
-		c.buf.WriteByte(' ')
 		// Bold only from info up, as zerolog does: a debug line should not
 		// shout louder than the warning above it.
 		if levelColor(lvl) != 0 && lvl != "debug" {
 			msg = c.colorize(msg, colorBold)
 		}
-		c.buf.WriteString(msg)
+		c.part(msg)
 	}
 
 	var deferred []string
@@ -121,9 +123,16 @@ func (c *Console) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// part appends one space-separated piece of the line.
+func (c *Console) part(s string) {
+	if c.buf.Len() > 0 {
+		c.buf.WriteByte(' ')
+	}
+	c.buf.WriteString(s)
+}
+
 func (c *Console) field(key string, v gjson.Result) {
-	c.buf.WriteByte(' ')
-	c.buf.WriteString(c.colorize(key+"=", colorCyan))
+	c.part(c.colorize(key+"=", colorCyan))
 	value := quote(v.String())
 	if key == "error" {
 		value = c.colorize(c.colorize(value, colorBold), colorRed)
