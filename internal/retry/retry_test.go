@@ -190,6 +190,83 @@ func TestRecoveredPersistsTheClear(t *testing.T) {
 	}
 }
 
+// The itcalc.eu loop. A host that answers our /send with an error is alive --
+// the answer said so -- and REMOTE_SERVER_UP tells us nothing more. Synapse
+// broadcasts it whenever that host sends us anything while we have a backoff
+// recorded, so clearing on it kept a refusing host at the base interval for as
+// long as it kept talking to us: 139 attempts a day, each one a 403.
+func TestRecoveredDoesNotClearARefusal(t *testing.T) {
+	ctx := context.Background()
+	l := limiter(t)
+	var woken bool
+	l.SetOnRecovered(func(string) { woken = true })
+
+	l.Refused(ctx, "itcalc.example")
+	l.Recovered(ctx, "itcalc.example")
+
+	if l.Due(ctx, "itcalc.example") {
+		t.Error("REMOTE_SERVER_UP cleared the backoff of a host that is refusing us")
+	}
+	if woken {
+		t.Error("a destination that is still backing off was reported as recovered")
+	}
+}
+
+// But a host we KNOW is up must not drift into the year-long cap either, or
+// fixing whatever refuses us would go unnoticed for a year. Liveness caps the
+// backoff at an hour, persisted like any other change to it.
+func TestRecoveredCapsARefusalAtAnHour(t *testing.T) {
+	ctx := context.Background()
+	written := map[string]Timings{}
+	l := New(Config{MinInterval: 2 * time.Hour, Multiplier: 5, MaxInterval: 365 * 24 * time.Hour},
+		nil,
+		func(_ context.Context, d string, timings Timings) error {
+			written[d] = timings
+			return nil
+		})
+
+	before := l.Refused(ctx, "itcalc.example")
+	l.Recovered(ctx, "itcalc.example")
+
+	got := l.Timings("itcalc.example")
+	if got.RetryInterval != time.Hour.Milliseconds() {
+		t.Errorf("interval = %v, want capped at an hour",
+			time.Duration(got.RetryInterval)*time.Millisecond)
+	}
+	if got.RetryLastTS != before.RetryLastTS || got.FailureTS != before.FailureTS {
+		t.Error("capping rewrote when the destination was last tried or started failing")
+	}
+	if written["itcalc.example"] != got {
+		t.Errorf("persisted %+v, want the capped %+v", written["itcalc.example"], got)
+	}
+}
+
+// What decides is the LATEST failure. A host that refused us and has since gone
+// silent is unreachable now, and REMOTE_SERVER_UP is news about it again.
+func TestRecoveredClearsAHostThatStoppedAnswering(t *testing.T) {
+	ctx := context.Background()
+	l := limiter(t)
+	l.Refused(ctx, "flaky.example")
+	l.Failure(ctx, "flaky.example")
+	l.Recovered(ctx, "flaky.example")
+	if !l.Due(ctx, "flaky.example") {
+		t.Error("a host that stopped answering was not cleared by REMOTE_SERVER_UP")
+	}
+}
+
+// A delivery forgets the refusal, so the next outage starts from scratch.
+func TestSuccessForgetsARefusal(t *testing.T) {
+	ctx := context.Background()
+	l := limiter(t)
+	l.Refused(ctx, "fixed.example")
+	l.Success(ctx, "fixed.example")
+	l.Failure(ctx, "fixed.example")
+	l.Recovered(ctx, "fixed.example")
+	if !l.Due(ctx, "fixed.example") {
+		t.Error("a refusal from before a successful delivery still held the backoff")
+	}
+}
+
 func TestBackoffCount(t *testing.T) {
 	ctx := context.Background()
 	l := limiter(t)

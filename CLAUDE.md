@@ -164,8 +164,19 @@ Breaking one of these should fail a test, not a deployment.
   from the same origin, which is what "still processing another transaction from
   this origin" means. Failed sends average ~8.9s against that 10s timeout, so
   timeouts are the common failure. A 429 is now retried at most twice and
-  honours `retry_after_ms`; the per-destination backoff does the waiting.
-  Backing off on a 429 is correct and matches Synapse (`retryutils.py:258`).
+  honours `retry_after_ms`; the queue's rate-limit cooldown (above) does the
+  waiting, never the per-destination backoff.
+- **REMOTE_SERVER_UP must not clear a host that ANSWERED.** Synapse resets
+  `destinations.retry_last_ts` and broadcasts it whenever a host with a backoff
+  sends us anything (`transport/server/_base.py:143`). For a host we could not
+  reach that is news; for one that answered our `/send` with a 403, 404 or 5xx
+  it is not, and clearing on it kept `itcalc.eu` (Apache 403) and `thicket.au`
+  (404 `M_UNRECOGNIZED`) at the base interval for as long as they talked to us:
+  139 and 123 attempts a day, each log line preceded by "destination recovered".
+  A refusal is now recorded as such (`retry.Limiter.Refused`, via
+  `sink.Answered`), and REMOTE_SERVER_UP caps its backoff at an hour instead of
+  clearing it -- capped, because a host known to be alive must not reach the
+  one-year ceiling.
 - **Presence per destination is too sparse here to batch.** Merging and holding
   are both implemented and both inert on this homeserver: a `presence_federation`
   row is `(destination, user)`, so a destination sees roughly one state every

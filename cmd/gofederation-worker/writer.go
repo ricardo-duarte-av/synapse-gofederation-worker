@@ -7,6 +7,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/retry"
+	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/sink"
 	"github.com/ricardo-duarte-av/synapse-gofederation-worker/internal/state"
 )
 
@@ -120,15 +121,25 @@ func (w *worker) recordPosition(ctx context.Context, streamID int64) error {
 // the state written to the database. Two implementations of a backoff is one
 // too many: they would disagree under exactly the conditions that make a
 // backoff matter.
-func (w *worker) onSendOutcome(destination string, delivered bool) {
+//
+// A host that answered with an error is recorded as refusing rather than
+// unreachable, so REMOTE_SERVER_UP -- which only tells us it is alive, which
+// its answer already did -- does not reset it to the base interval. See
+// retry.Limiter.Recovered.
+func (w *worker) onSendOutcome(destination string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
 	defer cancel()
 
-	if delivered {
+	if err == nil {
 		w.limiter.Success(ctx, destination)
 		return
 	}
-	t := w.limiter.Failure(ctx, destination)
+	var t retry.Timings
+	if sink.Answered(err) {
+		t = w.limiter.Refused(ctx, destination)
+	} else {
+		t = w.limiter.Failure(ctx, destination)
+	}
 	w.log.Debug().
 		Str("destination", destination).
 		Dur("retry_in", time.Duration(t.RetryInterval)*time.Millisecond).

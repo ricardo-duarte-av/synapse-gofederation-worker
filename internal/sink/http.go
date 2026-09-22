@@ -200,11 +200,9 @@ func (h *HTTP) Send(ctx context.Context, req *txn.Request) (Result, error) {
 			// So: honour retry_after_ms when the remote sends one, and give up
 			// after maxRateLimitedAttempts rather than spending the full budget
 			// hammering a server that has already answered. Giving up here
-			// costs nothing extra -- the per-destination backoff grows on a 429
-			// either way, which is Synapse's policy too (retryutils.py:258,
-			// "429 is us being aggressively rate limited, so lets rate limit
-			// ourselves") -- and it saves the remote eight requests it has
-			// already declined.
+			// loses nothing: the units stay queued and the queue retries them
+			// after a cooldown (retry.Limiter.RateLimited), and it saves the
+			// remote eight requests it has already declined.
 			var ok bool
 			if delay, ok = rateLimitDelay(delay, lastErr, &rateLimitedAttempts); !ok {
 				return Result{}, fmt.Errorf(
@@ -279,8 +277,8 @@ func (h *HTTP) attempt(ctx context.Context, req *txn.Request) (Result, bool, err
 		// (matrixfederationclient.py:833). A 400 means the remote has made a
 		// decision about this transaction and will make the same one again.
 		retryable := resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
-		err := fmt.Errorf("sink: %s: %s: %s",
-			req.Destination, resp.Status, truncate(body, 512))
+		err := &StatusError{Code: resp.StatusCode, err: fmt.Errorf("sink: %s: %s: %s",
+			req.Destination, resp.Status, truncate(body, 512))}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return Result{}, retryable, &rateLimited{
 				err:   err,
@@ -405,12 +403,33 @@ func IsRateLimited(err error) (time.Duration, bool) {
 	return 0, false
 }
 
+// StatusError is a remote -- or something in front of it -- answering with an
+// HTTP error. The host is reachable; it declined.
+type StatusError struct {
+	Code int
+	err  error
+}
+
+func (e *StatusError) Error() string { return e.err.Error() }
+
+// Answered reports whether err is the remote answering with an HTTP status, as
+// opposed to not answering at all: a timeout, a refused connection, a failed
+// lookup. After a run of retries it is the LAST attempt that decides, since it
+// is the one wrapped into the error.
+//
+// The distinction decides what REMOTE_SERVER_UP may do to the backoff; see
+// retry.Limiter.Recovered.
+func Answered(err error) bool {
+	var status *StatusError
+	return errors.As(err, &status)
+}
+
 // maxRateLimitedAttempts is how many times a 429 is retried before giving up.
 //
 // Small on purpose. A remote that answers 429 has received the request and
 // declined it; repeating it up to max_long_retries times is eleven requests to
-// tell one server the same thing. The per-destination backoff is the mechanism
-// that actually waits, and it grows on a 429 regardless.
+// tell one server the same thing. The queue's rate-limit cooldown is the
+// mechanism that actually waits.
 const maxRateLimitedAttempts = 2
 
 // rateLimited carries a 429's retry-after hint alongside its error.

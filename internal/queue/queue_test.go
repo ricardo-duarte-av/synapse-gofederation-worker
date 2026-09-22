@@ -869,7 +869,7 @@ func TestBusyCatchUpIsNotAFailure(t *testing.T) {
 	d := NewDestination(Config{
 		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
 		Sink: s, Log: zerolog.New(io.Discard),
-		OnOutcome: func(_ string, ok bool) { outcomes = append(outcomes, ok) },
+		OnOutcome: func(_ string, err error) { outcomes = append(outcomes, err == nil) },
 	})
 
 	d.EnqueuePDU(pdu("$live", 1))
@@ -936,7 +936,7 @@ func TestRateLimitIsNotReportedAsAFailure(t *testing.T) {
 	d := NewDestination(Config{
 		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
 		Sink: s, Log: zerolog.New(io.Discard),
-		OnOutcome: func(_ string, ok bool) { outcomes = append(outcomes, ok) },
+		OnOutcome: func(_ string, err error) { outcomes = append(outcomes, err == nil) },
 		OnRateLimited: func(_ string, after time.Duration) time.Duration {
 			limitedCount++
 			limitedAfter = after
@@ -980,7 +980,7 @@ func TestOrdinaryFailuresStillBackOff(t *testing.T) {
 	d := NewDestination(Config{
 		Name: "b.example", Signer: signer, IDs: txn.NewIDGenerator(txn.DefaultIDPrefix),
 		Sink: s, Log: zerolog.New(io.Discard),
-		OnOutcome:     func(_ string, ok bool) { sawFailure = sawFailure || !ok },
+		OnOutcome:     func(_ string, err error) { sawFailure = sawFailure || err != nil },
 		OnRateLimited: func(string, time.Duration) time.Duration { limited++; return 0 },
 	})
 

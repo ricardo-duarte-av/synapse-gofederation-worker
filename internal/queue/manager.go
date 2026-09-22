@@ -35,7 +35,7 @@ type Manager struct {
 
 	onSuccess     func(destination string, streamOrdering int64)
 	onEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
-	onOutcome     func(destination string, delivered bool)
+	onOutcome     func(destination string, err error)
 	due           func(destination string) bool
 	batch         BatchConfig
 	longBackoff   func(destination string) bool
@@ -67,7 +67,7 @@ type ManagerConfig struct {
 	MaxConcurrent int
 	OnSuccess     func(destination string, streamOrdering int64)
 	OnEDUsSent    func(destination string, toDeviceUpTo, deviceListUpTo int64)
-	OnOutcome     func(destination string, delivered bool)
+	OnOutcome     func(destination string, err error)
 	Due           func(destination string) bool
 	// Batch holds presence back so it can accumulate; see queue.BatchConfig.
 	Batch BatchConfig

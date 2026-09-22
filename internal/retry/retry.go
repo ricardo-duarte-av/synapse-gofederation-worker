@@ -90,6 +90,12 @@ type Limiter struct {
 	// backoff.
 	cooldownFor map[string]time.Duration
 
+	// refused marks destinations whose latest failure was an HTTP answer rather
+	// than silence. See Refused. In memory only: after a restart the first
+	// REMOTE_SERVER_UP clears such a destination outright, costing one attempt,
+	// which is not worth a column.
+	refused map[string]bool
+
 	// onUp is called when a destination recovers, so a caller can wake its
 	// queue and tell the rest of the cluster.
 	onUp func(destination string)
@@ -110,6 +116,7 @@ func New(cfg Config, load Loader, persist Persister) *Limiter {
 		cfg: cfg, load: load, persist: persist,
 		state: map[string]Timings{}, loaded: map[string]bool{},
 		cooldown: map[string]time.Time{}, cooldownFor: map[string]time.Duration{},
+		refused: map[string]bool{},
 	}
 }
 
@@ -250,6 +257,7 @@ func (l *Limiter) Success(ctx context.Context, destination string) {
 	// A delivered transaction means the pace is acceptable again.
 	delete(l.cooldown, destination)
 	delete(l.cooldownFor, destination)
+	delete(l.refused, destination)
 	l.mu.Unlock()
 
 	// Only act on an actual transition. Clearing an already-clear destination
@@ -266,11 +274,32 @@ func (l *Limiter) Success(ctx context.Context, destination string) {
 	}
 }
 
-// Failure grows a destination's backoff and returns the new timings.
+// Failure grows a destination's backoff after it could not be reached -- a
+// timeout, a refused connection, a name that does not resolve -- and returns
+// the new timings.
 func (l *Limiter) Failure(ctx context.Context, destination string) Timings {
+	return l.fail(ctx, destination, false)
+}
+
+// Refused grows a destination's backoff after it ANSWERED with an error: a 403
+// from a proxy, a 404 from a server that does not route /send, a 502 from a
+// reverse proxy whose backend is gone. The growth is the same as Failure's;
+// the difference is what REMOTE_SERVER_UP may do to it afterwards (Recovered).
+//
+// A 429 is neither. See RateLimited.
+func (l *Limiter) Refused(ctx context.Context, destination string) Timings {
+	return l.fail(ctx, destination, true)
+}
+
+func (l *Limiter) fail(ctx context.Context, destination string, refused bool) Timings {
 	now := time.Now().UnixMilli()
 
 	l.mu.Lock()
+	if refused {
+		l.refused[destination] = true
+	} else {
+		delete(l.refused, destination)
+	}
 	t := l.state[destination]
 	if t.RetryInterval > 0 {
 		// The jitter is applied to the GROWTH, as Synapse does, so two
@@ -299,16 +328,45 @@ func (l *Limiter) Failure(ctx context.Context, destination string) Timings {
 	return t
 }
 
-// Recovered clears a destination because somebody else saw it working.
+// refusedMaxInterval is the longest a destination that is answering us is left
+// alone, once somebody else has seen it working. Synapse's
+// CATCHUP_RETRY_INTERVAL, the same hour the rest of the sender treats as the
+// line between a blip and an outage.
+const refusedMaxInterval = time.Hour
+
+// Recovered handles REMOTE_SERVER_UP: another worker received a signed request
+// from the destination, so it is alive.
 //
-// Synapse's REMOTE_SERVER_UP: another worker got a response, so our backoff is
-// stale. It is not evidence WE can reach it, but retrying once and failing is
-// cheap next to leaving a working server unreachable for hours.
+// For a destination we could not REACH, that is new information and the
+// backoff is dropped: retrying once and failing is cheap next to leaving a
+// working server unreachable for hours.
+//
+// For a destination that ANSWERED us with an error it is not new information:
+// we already knew it was alive, because it replied. Clearing on it is what kept
+// itcalc.eu (a 403 from Apache in front of /send) and thicket.au (404
+// M_UNRECOGNIZED) at the one-minute base forever: every request they sent us
+// made Synapse reset retry_last_ts and broadcast this command
+// (transport/server/_base.py:143), about as often as we failed. So the backoff
+// is kept, but capped at refusedMaxInterval: a host we know is up must not
+// drift into this deployment's year-long cap, or fixing its proxy would go
+// unnoticed for a year. Hourly is how long that fix goes unnoticed instead.
 func (l *Limiter) Recovered(ctx context.Context, destination string) {
 	l.mu.Lock()
 	t := l.state[destination]
 	if t.RetryInterval == 0 && t.RetryLastTS == 0 {
 		l.mu.Unlock()
+		return
+	}
+	if l.refused[destination] {
+		capped := t.RetryInterval > refusedMaxInterval.Milliseconds()
+		if capped {
+			t.RetryInterval = refusedMaxInterval.Milliseconds()
+			l.state[destination] = t
+		}
+		l.mu.Unlock()
+		if capped && l.persist != nil {
+			_ = l.persist(ctx, destination, t)
+		}
 		return
 	}
 	l.state[destination] = Timings{}

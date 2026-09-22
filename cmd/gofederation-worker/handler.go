@@ -257,15 +257,21 @@ func (h *handler) OnPosition(stream, _ string, position int64) {
 }
 
 func (h *handler) OnRemoteServerUp(server string) {
-	// A destination somebody else has seen working. Our backoff for it is now
-	// stale: that is not proof WE can reach it, but retrying once and failing
-	// is cheap next to leaving a working server unreachable for hours.
+	// A destination somebody else has seen working. If we could not reach it,
+	// our backoff is now stale: that is not proof WE can reach it, but retrying
+	// once and failing is cheap next to leaving a working server unreachable
+	// for hours. If it answered us with an error, the backoff stands (capped);
+	// see retry.Limiter.Recovered.
 	if !h.worker.cfg.ShouldHandle(server) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), bookkeepingTimeout)
 	defer cancel()
 	h.worker.limiter.Recovered(ctx, server)
+	if !h.worker.limiter.Due(ctx, server) {
+		// Still backing off, so a wake would only reach the gate and stop.
+		return
+	}
 	q := h.worker.queues.Get(server)
 	if pdus, edus := q.Pending(); pdus == 0 && edus == 0 {
 		return

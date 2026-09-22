@@ -139,8 +139,10 @@ type Destination struct {
 	// onOutcome is called after every attempt, delivered or not, so a primary
 	// can keep the destination's persistent backoff. Called for failures too,
 	// which is the half that matters: without it a dead server is retried on
-	// every event forever.
-	onOutcome func(destination string, delivered bool)
+	// every event forever. err is nil on delivery; otherwise it is what the
+	// sink returned, so the caller can tell a host that answered from one that
+	// did not (sink.Answered).
+	onOutcome func(destination string, err error)
 	// due gates the loop. Synapse checks its retry limiter at the TOP of the
 	// transmission loop and abandons the run entirely when the destination is
 	// backing off (per_destination_queue.py:351). Without that gate the
@@ -181,7 +183,7 @@ type Config struct {
 	Log        zerolog.Logger
 	OnSuccess  func(destination string, streamOrdering int64)
 	OnEDUsSent func(destination string, toDeviceUpTo, deviceListUpTo int64)
-	OnOutcome  func(destination string, delivered bool)
+	OnOutcome  func(destination string, err error)
 	Due        func(destination string) bool
 	// LongBackoff reports whether a destination's backoff has grown past
 	// CatchUpRetryInterval -- i.e. that it will not be tried again for at least
@@ -707,7 +709,7 @@ func (d *Destination) reportOutcome(err error) (time.Duration, bool) {
 		}
 	}
 	if d.onOutcome != nil {
-		d.onOutcome(d.name, err == nil)
+		d.onOutcome(d.name, err)
 	}
 	return 0, false
 }
