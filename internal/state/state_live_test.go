@@ -2,13 +2,15 @@ package state
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 )
 
 // These run against a real PostgreSQL and skip without one. Any throwaway
-// database will do -- they never touch Synapse's schema:
+// database will do -- they never touch Synapse's schema -- except for the two
+// about creating tables, which need Synapse's tables to be present:
 //
 //	docker run -d --rm --name pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb \
 //	  -p 55432:5432 postgres:16-alpine
@@ -150,19 +152,35 @@ func TestLiveGetAllAndPerDestinationCursors(t *testing.T) {
 	}
 }
 
-// Pointing the state role at a database with no schema must fail at startup,
-// not on the first write hours later.
-func TestLiveOpenRejectsMissingTable(t *testing.T) {
+// A missing table is created only where Synapse lives. Pointing state.dsn at
+// some other database must fail at startup, not quietly grow empty tables and
+// start from zero. A search_path without Synapse's tables stands in for that
+// database here; the table is schema-qualified, so it is unaffected.
+func TestLiveOpenRefusesToCreateOutsideSynapse(t *testing.T) {
 	dsn := os.Getenv("STATE_DSN")
 	if dsn == "" {
 		t.Skip("set STATE_DSN")
 	}
 	ctx := context.Background()
+	schema := fmt.Sprintf("test_gofed_%d", time.Now().UnixNano())
 	_, err := Open(ctx, Config{
-		DSN: dsn, Table: "gofederation.no_such_table", InstanceName: "x",
+		DSN:          dsn + " search_path=pg_catalog",
+		Table:        schema + ".stream_positions",
+		InstanceName: "test-" + t.Name(),
 	})
 	if err == nil {
-		t.Fatal("Open succeeded against a table that does not exist")
+		t.Fatal("Open created a table in a database without Synapse's tables")
+	}
+
+	// And nothing was left behind.
+	s := liveState(t, "test-"+t.Name())
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regnamespace($1) IS NOT NULL`, schema).
+		Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Errorf("schema %s was created; drop it by hand", schema)
 	}
 }
 
@@ -264,5 +282,65 @@ func TestLiveRetryTimingsDisabled(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("got %v, want nothing", got)
+	}
+}
+
+// Open creates missing tables on first start. Uses a throwaway schema so it
+// never touches the real ones, and needs a database with Synapse's tables,
+// since it refuses to create anywhere else.
+func TestLiveOpenCreatesMissingTables(t *testing.T) {
+	dsn := os.Getenv("STATE_DSN")
+	if dsn == "" {
+		t.Skip("set STATE_DSN to run against a real PostgreSQL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	schema := fmt.Sprintf("test_gofed_%d", time.Now().UnixNano())
+	cfg := Config{
+		DSN:            dsn,
+		Table:          schema + ".stream_positions",
+		RoutesTable:    schema + ".destination_rooms",
+		RetryTable:     schema + ".destination_retry",
+		InstanceName:   "test-" + t.Name(),
+		MaxConns:       2,
+		ConnectTimeout: 10 * time.Second,
+	}
+	s, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.pool.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Errorf("drop %s: %v", schema, err)
+		}
+		s.Close()
+	})
+	if got := s.Created(); len(got) != 3 {
+		t.Fatalf("created %v, want all three tables", got)
+	}
+
+	// The tables are usable, not merely present.
+	if err := s.Set(ctx, CursorEvents, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordRoutes(ctx, []RoutedRoom{{Destination: "example.org", RoomID: "!r:example.org", StreamOrdering: 7}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRetryTimings(ctx, "example.org", RetryTimings{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second start finds them and creates nothing.
+	again, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if got := again.Created(); len(got) != 0 {
+		t.Fatalf("second start created %v", got)
+	}
+	if pos, ok, err := again.Get(ctx, CursorEvents); err != nil || !ok || pos != 7 {
+		t.Fatalf("cursor after reopen = %d, %v, %v", pos, ok, err)
 	}
 }

@@ -125,17 +125,14 @@ psql -h /var/sockets -U synapse -d synapse-db -f deploy/state-role.sql
 ```
 
 `state-role.sql` also creates the three tables the worker keeps its cursors,
-routing record and per-destination backoff in. **They are not created at runtime** — a missing one is a
-startup failure naming the file to run, because a worker that can create tables
-is a worker that can create them in the wrong database on the day somebody
-points it at the wrong one. Where the worker connects as *Synapse's* role
-rather than one of its own — which is what happens when `database.dsn` and
-`state.dsn` are left to `homeserver.yaml` — there is no role to create and no
-grant to make, so run `deploy/state-tables.sql` instead:
-
-```sh
-psql -h matrix-postgres -U testingsynapse -d testingsynapse -f deploy/state-tables.sql
-```
+routing record and per-destination backoff in. Where the worker connects as
+*Synapse's* role rather than one of its own — which is what happens when
+`database.dsn` and `state.dsn` are left to `homeserver.yaml` — there is no role
+to create and nothing to run: the worker creates the tables on first start and
+logs `created this worker's state tables`. It only does that in a database that
+has Synapse's tables, so a `state.dsn` pointed at the wrong database is still a
+startup failure. `deploy/state-tables.sql` is the same DDL, for creating them
+ahead of time by hand.
 
 Naming that read-only role in `database.dsn` is what makes the guarantee real,
 and `require_read_only: true` then turns a role with write access to Synapse's

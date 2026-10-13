@@ -229,6 +229,9 @@ func newWorker(ctx context.Context, cfg *config.Resolved, log zerolog.Logger) (*
 		w.close()
 		return nil, err
 	}
+	if created := w.cursors.Created(); len(created) > 0 {
+		log.Info().Strs("tables", created).Msg("created this worker's state tables")
+	}
 
 	if cfg.ShadowEnabled() {
 		if w.diff, err = difflog.Open(difflog.Config{

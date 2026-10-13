@@ -14,14 +14,13 @@
 -- Run as the database owner, against the database homeserver.yaml names:
 --   psql -h matrix-postgres -U testingsynapse -d testingsynapse -f state-tables.sql
 --
--- The worker does NOT create these itself, and that is deliberate. Creating a
--- table means holding CREATE on the database at runtime, every run, to do
--- something that happens exactly once -- and this worker's whole shape is that
--- the smallest possible set of grants is the guarantee, not the intention. A
--- missing table is a clear startup failure with a file to run; a worker that
--- can create tables is a worker that can create them by accident, in the wrong
--- database, under the wrong search_path, on the day somebody points it at
--- production by mistake.
+-- The worker creates these itself on first start when they are missing, so
+-- running this file is optional. It still has two uses: creating them ahead of
+-- time under a role that will not have CREATE at runtime, and reading what the
+-- columns mean. The worker refuses to create them in a database that has no
+-- Synapse tables, so a state.dsn pointed at the wrong database is still a
+-- startup failure rather than a worker quietly starting from zero
+-- (internal/state/schema.go).
 --
 -- To undo:  DROP SCHEMA gofederation CASCADE;
 

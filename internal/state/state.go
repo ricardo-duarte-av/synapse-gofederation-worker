@@ -14,8 +14,9 @@
 //     pass, forever.
 //
 // The table lives in its own schema under its own role, which can reach nothing
-// else, and nothing in Synapse reads it. See deploy/state-role.sql and
-// docs/shadow-safety.md.
+// else, and nothing in Synapse reads it. Open creates the tables on first start
+// (see ensureTables); deploy/state-role.sql creates them together with that
+// role. See docs/shadow-safety.md.
 package state
 
 import (
@@ -47,6 +48,8 @@ type Store struct {
 	// instance is the sender we impersonate, so two shadows of two different
 	// senders can share a database without overwriting each other.
 	instance string
+	// created names the tables Open had to create, for the startup log.
+	created []string
 }
 
 // Config describes how to reach the cursor table.
@@ -70,7 +73,8 @@ type Config struct {
 	OnQuery dbtrace.Observer
 }
 
-// Open connects and verifies the table is reachable and writable.
+// Open connects, creates any of the configured tables that are missing, and
+// verifies the cursor table is reachable.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.Table == "" {
 		return nil, fmt.Errorf("state: no table configured")
@@ -106,6 +110,11 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	s := &Store{pool: pool, table: cfg.Table, routesTable: cfg.RoutesTable,
 		retryTable: cfg.RetryTable, instance: cfg.InstanceName}
 
+	if s.created, err = ensureTables(ctx, pool, cfg); err != nil {
+		pool.Close()
+		return nil, err
+	}
+
 	// Read one row rather than merely pinging. The failure this catches is the
 	// state role being pointed at a database where the schema was never
 	// created, which otherwise surfaces as the worker restarting from zero on
@@ -116,6 +125,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	return s, nil
 }
+
+// Created names the tables Open created because they did not exist yet. Empty
+// on every start but the first.
+func (s *Store) Created() []string { return s.created }
 
 // Close releases the pool.
 func (s *Store) Close() {
